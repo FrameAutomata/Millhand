@@ -1,4 +1,4 @@
-# Job-search-pipeline setup (Windows / PowerShell).
+# Millhand setup (Windows / PowerShell).
 # Creates Python venv, installs deps, clones career-ops, copies example configs.
 
 $ErrorActionPreference = "Stop"

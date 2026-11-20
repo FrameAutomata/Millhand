@@ -1,4 +1,4 @@
-# job-search-pipeline
+# Millhand
 
 Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed via **JobSpy** (the only two supported boards — see the scrape-sites note under Configuration), scores results against a resume using YAKE keyword extraction, optionally screens for liveness, then bridges surviving jobs into **career-ops** for AI-powered evaluation. Supports interactive evaluation via any agent CLI (`--batch`) or synchronous parallel API evaluation across any LLM provider (`--evaluate-batch`).
 

@@ -1,4 +1,4 @@
-# job-search-pipeline
+# Millhand
 
 > ## ⚠️ Privacy notice — read first
 >
@@ -121,7 +121,7 @@ Evaluation has two paths, pick whichever fits:
 ```powershell
 # Windows
 git clone <this repo>
-cd job-search-pipeline
+cd Millhand
 .\setup.ps1                  # creates venv, installs deps (incl. UI), clones career-ops, copies example configs
 node setup-profile.mjs       # generate your profile from your resume (or use the UI wizard — see below)
 # setup-profile.mjs writes config\search.yml; tweak it if you like, then pick an evaluation mode:
@@ -132,7 +132,7 @@ node setup-profile.mjs       # generate your profile from your resume (or use th
 ```bash
 # macOS / Linux
 git clone <this repo>
-cd job-search-pipeline
+cd Millhand
 ./setup.sh
 node setup-profile.mjs
 ./run.sh --evaluate-batch

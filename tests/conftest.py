@@ -1,4 +1,4 @@
-"""Shared fixtures for job-search-pipeline tests."""
+"""Shared fixtures for Millhand tests."""
 
 import json
 import sys

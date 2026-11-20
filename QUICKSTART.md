@@ -1,4 +1,4 @@
-# Quick Start — Job Search Pipeline
+# Quick Start — Millhand
 
 > **Privacy note:** if you plan to run this in the cloud via GitHub Actions, see the [Using this template](README.md#using-this-template) section in the README first. The short version: clone this template into your own **private** repo before enabling Actions. Local execution has no such concern — everything stays on your machine.
 
@@ -458,7 +458,7 @@ paid agent CLI is better at long application forms. None is required.
 ## Key files
 
 ```
-job-search-pipeline/
+Millhand/
 ├── config/search.yml            # Search terms, filter rules, screen settings
 ├── .env                         # Paths and model/provider overrides
 ├── output/

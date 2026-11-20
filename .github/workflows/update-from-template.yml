@@ -31,7 +31,7 @@ jobs:
     # Never self-update the upstream template repository; and a SCHEDULED run
     # proceeds only when the copy opted in (a dispatch always does).
     if: >-
-      github.repository != 'FrameAutomata/job-search-pipeline'
+      github.repository != 'FrameAutomata/Millhand'
       && (github.event_name == 'workflow_dispatch' || vars.AUTO_UPDATE_FROM_TEMPLATE == 'true')
     runs-on: ubuntu-latest
     # Bounded so a hang bills 30 minutes, not GitHub's 360-minute default, against
@@ -46,7 +46,7 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote add template https://github.com/FrameAutomata/job-search-pipeline.git
+          git remote add template https://github.com/FrameAutomata/Millhand.git
           git fetch template main
           # --allow-unrelated-histories is required, not defensive: copies are
           # made with "Use this template", which starts a fresh root commit, so
