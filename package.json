@@ -1,5 +1,5 @@
 {
-  "name": "job-search-pipeline",
+  "name": "millhand",
   "version": "1.0.0",
   "type": "module",
   "description": "Automated job search pipeline with AI-powered evaluation",

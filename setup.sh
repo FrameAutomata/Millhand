@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Job-search-pipeline setup (macOS / Linux).
+# Millhand setup (macOS / Linux).
 # Creates Python venv, installs deps, clones career-ops, copies example configs.
 
 set -euo pipefail

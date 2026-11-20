@@ -76,7 +76,7 @@ def test_scheduled_runs_are_var_gated():
     assert [s["cron"] for s in triggers["schedule"]] == ["0 4 * * 1"]
 
     cond = " ".join(str(doc["jobs"]["update"]["if"]).split())
-    assert "github.repository != 'FrameAutomata/job-search-pipeline'" in cond
+    assert "github.repository != 'FrameAutomata/Millhand'" in cond
     assert re.search(r"github\.event_name\s*==\s*'workflow_dispatch'\s*\|\|\s*"
                      r"vars\.AUTO_UPDATE_FROM_TEMPLATE\s*==\s*'true'", cond), cond
     # The gate is AND-ed with the self-skip, so a dispatch on the template

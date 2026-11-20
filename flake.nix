@@ -1,5 +1,5 @@
 {
-  description = "job-search-pipeline — Python 3.12 dev shell (NixOS)";
+  description = "Millhand — Python 3.12 dev shell (NixOS)";
 
   # A NixOS release branch rather than nixpkgs-unstable: this shell only wants
   # a stable python312, and matching the branch the host already tracks means
@@ -84,7 +84,7 @@
           );
           ui =
             pkgs.writeShellApplication {
-              name = "job-search-ui";
+              name = "millhand-ui";
               runtimeInputs = [
                 py
                 pkgs.gh
@@ -228,9 +228,9 @@
             if [ -x "$root/.venv/bin/python" ]; then
               export VIRTUAL_ENV="$root/.venv"
               export PATH="$root/.venv/bin:$PATH"
-              echo "job-search-pipeline — $(python --version 2>&1) (.venv)"
+              echo "Millhand — $(python --version 2>&1) (.venv)"
             else
-              echo "job-search-pipeline — no .venv yet, run ./setup.sh"
+              echo "Millhand — no .venv yet, run ./setup.sh"
             fi
           '';
         };

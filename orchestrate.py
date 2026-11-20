@@ -123,7 +123,7 @@ def main() -> int:
         print("hint: copy config/search.example.yml -> config/search.yml and edit", file=sys.stderr)
         return 1
 
-    notify.notify("Job Search Pipeline", "Starting scrape stage...")
+    notify.notify("Millhand", "Starting scrape stage...")
 
     if not args.skip_scrape:
         notify.notify("Pipeline", "Scraping job boards...")

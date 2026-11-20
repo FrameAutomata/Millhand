@@ -594,7 +594,7 @@ def _post(webhook: str, payload: dict, attachment: tuple[str, str] | None,
         # read a scheme from, and this function promises never to raise.
         req = urllib.request.Request(
             webhook, data=body, method="POST",
-            headers={"Content-Type": ctype, "User-Agent": "job-search-pipeline digest"})
+            headers={"Content-Type": ctype, "User-Agent": "Millhand digest"})
         with urlopen(req, timeout=HTTP_TIMEOUT) as resp:
             status = getattr(resp, "status", 200)
             if 200 <= int(status) < 300:

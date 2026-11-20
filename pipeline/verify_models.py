@@ -31,7 +31,7 @@ from pipeline.stdio import line_buffer_stdout
 
 ROOT = Path(__file__).resolve().parent.parent
 _TIMEOUT = 40
-_UA = "job-search-pipeline/verify-models"  # some catalogs reject a UA-less request
+_UA = "Millhand/verify-models"  # some catalogs reject a UA-less request
 _DEFAULT_OPENAI_BASE = "https://api.openai.com/v1"
 _CHAIN_VARS = ("BATCH_MODEL", "TAILOR_MODEL", "COVER_MODEL")
 

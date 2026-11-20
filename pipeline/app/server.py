@@ -167,7 +167,7 @@ def _refuse_during_local_run() -> None:
 # without this `./run-ui.sh > ui.log` buffers those lines for 8KB.
 line_buffer_stdout()
 
-app = FastAPI(title="job-search-pipeline UI")
+app = FastAPI(title="Millhand UI")
 
 # ── Cross-origin guard ───────────────────────────────────────────────────────
 # This server binds to localhost, but "localhost" is reachable from any web page
@@ -239,7 +239,7 @@ UI_PASSWORD_ENV = "UI_PASSWORD"
 UI_ALLOWED_HOSTS_ENV = "UI_ALLOWED_HOSTS"
 LAN_ENV_VARS = (UI_LAN_ENV, UI_PASSWORD_ENV, UI_ALLOWED_HOSTS_ENV)
 _LAN_MUTABLE = frozenset({"/api/status", "/api/push-status", "/api/refresh"})
-_AUTH_CHALLENGE = 'Basic realm="job-search-pipeline"'
+_AUTH_CHALLENGE = 'Basic realm="Millhand"'
 _TRUTHY = ("1", "true", "yes", "on")
 
 

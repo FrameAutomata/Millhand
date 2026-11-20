@@ -16,7 +16,7 @@ from pathlib import Path
 
 from pipeline.app import gh
 
-TEMPLATE_REPO = "FrameAutomata/job-search-pipeline"
+TEMPLATE_REPO = "FrameAutomata/Millhand"
 TEMPLATE_URL = f"https://github.com/{TEMPLATE_REPO}.git"
 
 

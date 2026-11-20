@@ -91,7 +91,7 @@ jobs:
     # Skip entirely in the upstream template repo so scheduled triggers consume
     # zero Actions minutes there. Forks/template-uses have a different
     # github.repository and proceed normally.
-    if: github.repository != 'FrameAutomata/job-search-pipeline'
+    if: github.repository != 'FrameAutomata/Millhand'
     runs-on: ubuntu-latest
     # Two `gh api` calls; a hang here would otherwise bill GitHub's 360-minute
     # default against the account's 2,000 free minutes a month.
