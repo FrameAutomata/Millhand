@@ -2346,7 +2346,27 @@ def profile_master_for_prompt(path) -> str:
     return redact_profile_master(read_text(path))
 
 
-def build_system_prompt(cv: str, profile_yml: str, profile_md: str = "", article_digest: str = "", *, profile_master: str = "") -> str:
+def _target_roles_block(target_roles) -> str:
+    """The candidate's own role families (handoff.target_roles), for archetype
+    detection and North Star; they replaced career-ops' six AI-engineering
+    archetypes (#209). Names and `fit` only: the `level` setup-profile.mjs writes
+    is one guess for every role, read off an engineering ladder ("Outreach Lead"
+    becomes staff/principal), so stating it here would put a wrong seniority in
+    front of the model."""
+    roles = list(target_roles or ())
+    if not roles:
+        return ("The candidate profile above states their target roles; if it names none, "
+                "take them from the work their experience points to.\n")
+    legend = (" (fit: primary = the role they most want, secondary = a good fit, "
+              "adjacent = a stretch)") if any(r["fit"] for r in roles) else ""
+    lines = [f"- {r['name']}" + (f" ({r['fit']})" if r["fit"] else "") for r in roles]
+    return (f"The candidate's target roles, as they named them at setup{legend}:\n"
+            + "\n".join(lines) + "\n"
+            + "If the candidate profile above names different target roles, it is newer: use those.\n")
+
+
+def build_system_prompt(cv: str, profile_yml: str, profile_md: str = "", article_digest: str = "", *,
+                        profile_master: str = "", target_roles: list[dict] | None = None) -> str:
     # PROFILE.md (Commit 4), when present, is the candidate's living master and
     # supersedes the 4 seed fragments: it already folds in the CV, profile,
     # positioning, and proof points, and the browser agent grows it as it learns.
@@ -2382,9 +2402,8 @@ You have no file system access, cannot generate PDFs, and cannot run real-time w
 
 Work through blocks A-G in order. Rules in _profile.md override system defaults for scoring.
 
-**Archetype Detection** - classify the role as one of:
-AI Platform/LLMOps Engineer | Agentic Workflows/Automation | Technical AI Product Manager |
-AI Solutions Architect | AI Forward Deployed Engineer | AI Transformation Lead
+**Archetype Detection** - name the candidate's target role this posting is closest to.
+{_target_roles_block(target_roles)}Use that role's name, or a hybrid of two. When none fits, write "Outside target roles (<the role's actual function, in a few words>)" - that is a finding, not a failure, and it is what North Star Alignment scores.
 
 **Block A - Role Summary**
 Table: Archetype, Domain, Function, Seniority, Remote policy, Team size, TL;DR.
@@ -2413,7 +2432,7 @@ Table of top 5 CV changes + top 5 LinkedIn changes.
 Analyze JD quality signals. Mark posting freshness "unverified (batch mode)".
 Assess: High Confidence | Proceed with Caution | Suspicious.
 
-**Global Score** table: CV Match, North Star Alignment, Comp, Cultural Signals, Red Flags penalty, Global (all X/5).
+**Global Score** table: CV Match, North Star Alignment (how close the role is to the candidate's target roles), Comp, Cultural Signals, Red Flags penalty, Global (all X/5).
 
 **Hard stops** - `hard_stops` is what makes the candidate unable to HOLD the role, not what they merely lack. Anything they could learn, be trained on, or argue around is a soft gap. Name every hard stop you find and cap `final_decision` at "Consider" when there is one.
 Geography is the one most often missed. A role requiring recurring physical presence - on-site OR hybrid, however few the office days - in a metro the candidate has not said they can work in is a hard stop, whatever the fit. Read the candidate's own stated locations from the profile above. Do not invent flexibility the posting does not state: "may offer remote", "could relocate" and "remote coordination may be possible" are not in the JD. Work that is inherently local - community-based, field, in-home, canvassing, site-based - requires presence even where the posting also uses the word remote.
@@ -2424,7 +2443,7 @@ company: "name"
 role: "title"
 score: X.X
 legitimacy_tier: "High Confidence | Proceed with Caution | Suspicious"
-archetype: "detected"
+archetype: "closest target role, or Outside target roles (<function>)"
 final_decision: "Apply | Consider | Research first | Skip"
 work_location:
   mode: "onsite | hybrid | remote"
@@ -2521,13 +2540,18 @@ def eval_system_prompt(career_ops: Path) -> str:
     (authoritative), else the cv.md / profile.yml / _profile.md / article-digest.md
     seeds."""
     # Lazy import: handoff imports this module at load, so a top-level import of
-    # it here would cycle.
-    from pipeline.handoff import resolve_profile_md
+    # it here would cycle. It also owns the YAML reading this module, stdlib-only,
+    # cannot do. The target roles come from profile.yml even when PROFILE.md
+    # supersedes it as the candidate profile: a master is never overwritten, and
+    # one seeded before #209 names only the first two.
+    from pipeline.handoff import _parse_yaml_or_empty, resolve_profile_md, target_roles
     career_ops = Path(career_ops)
+    profile_yml = read_text(career_ops / "config" / "profile.yml")
     return build_system_prompt(
         read_text(career_ops / "cv.md"),
-        read_text(career_ops / "config" / "profile.yml"),
+        profile_yml,
         read_text(career_ops / "modes" / "_profile.md"),
         read_text(career_ops / "article-digest.md"),
         profile_master=resolve_profile_md(career_ops),
+        target_roles=target_roles(_parse_yaml_or_empty(profile_yml)),
     )

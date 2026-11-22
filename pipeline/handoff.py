@@ -1501,6 +1501,26 @@ def _slist(v) -> list[str]:
     return [str(x).strip() for x in items if x is not None and str(x).strip()]
 
 
+def target_roles(profile: dict) -> list[dict]:
+    """The role families the candidate is targeting, in the order they named them,
+    as `{"name", "fit"}` (fit "" when absent).
+
+    `target_roles.archetypes` is the list to read: setup-profile.mjs writes one
+    entry per role the user typed, verbatim, while `primary` is the same list
+    truncated to two. career-ops' own example gives each entry a `fit` (primary =
+    dream role, secondary = good fit, adjacent = stretch). A hand-written profile
+    may list bare names, or only `primary`; both are read."""
+    roles = _dsect(profile, "target_roles")
+    out = []
+    archetypes = roles.get("archetypes")
+    for a in archetypes if isinstance(archetypes, list) else []:
+        entry = a if isinstance(a, dict) else {"name": a}
+        name = _slist(entry.get("name"))
+        if name:
+            out.append({"name": name[0], "fit": " ".join(_slist(entry.get("fit")))})
+    return out or [{"name": n, "fit": ""} for n in _slist(roles.get("primary"))]
+
+
 def _as_bool(v):
     """A YAML bool-ish value as True/False, or None when it's genuinely unknown.
     Tolerates a quoted "false"/"no" (which YAML leaves a truthy string) so a
@@ -1615,7 +1635,7 @@ def render_profile_md(*, cv_md: str = "", profile: dict | None = None,
     profile = profile or {}
     cand = _dsect(profile, "candidate")
     narr = _dsect(profile, "narrative")
-    targets = _slist(_dsect(profile, "target_roles").get("primary"))
+    targets = [r["name"] for r in target_roles(profile)]
 
     contact = " · ".join(str(v).strip() for v in (
         cand.get("email"), cand.get("phone"), cand.get("location"),
@@ -1711,14 +1731,24 @@ def _read_or_empty(path) -> str:
         return ""
 
 
+def _parse_yaml_or_empty(text: str) -> dict:
+    """YAML text as a dict; malformed YAML or a non-mapping document → {}.
+
+    ValueError too: PyYAML raises a plain one, not a YAMLError, for a value
+    shaped like a date that is not one (`2026-02-30`), and the evaluation prompt
+    builder parses profile.yml through here, so a hand-edited typo must not stop
+    every evaluation."""
+    try:
+        data = yaml.safe_load(text)
+    except (yaml.YAMLError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _load_yaml_or_empty(path) -> dict:
     """Parse a YAML file to a dict, tolerating a missing/unreadable file or
     malformed YAML (all of which just mean "no profile data yet")."""
-    try:
-        data = yaml.safe_load(_read_or_empty(path))
-    except yaml.YAMLError:
-        return {}
-    return data if isinstance(data, dict) else {}
+    return _parse_yaml_or_empty(_read_or_empty(path))
 
 
 def _load_profile_sources(career_ops=None) -> dict:
