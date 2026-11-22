@@ -196,7 +196,7 @@ class TestLoadState:
 class TestMaxReportNum:
     def test_returns_zero_for_missing_dir(self, tmp_path):
         state = {"jobs": {}}
-        assert max_report_num(tmp_path / "reports", state) == 0
+        assert max_report_num(tmp_path / "reports", state, tmp_path / "none.md") == 0
 
     def test_reads_highest_from_filenames(self, tmp_path):
         reports = tmp_path / "reports"
@@ -204,21 +204,76 @@ class TestMaxReportNum:
         (reports / "001-acme-2026-01-01.md").write_text("x")
         (reports / "005-globex-2026-01-02.md").write_text("x")
         (reports / "003-initech-2026-01-03.md").write_text("x")
-        assert max_report_num(reports, {"jobs": {}}) == 5
+        assert max_report_num(reports, {"jobs": {}}, tmp_path / "none.md") == 5
 
     def test_reads_from_state_when_higher(self, tmp_path):
         reports = tmp_path / "reports"
         reports.mkdir()
         (reports / "003-acme-2026-01-01.md").write_text("x")
         state = {"jobs": {"j1": {"report_num": "010"}}}
-        assert max_report_num(reports, state) == 10
+        assert max_report_num(reports, state, tmp_path / "none.md") == 10
 
     def test_ignores_non_numeric_prefixes(self, tmp_path):
         reports = tmp_path / "reports"
         reports.mkdir()
         (reports / "no-number.md").write_text("x")
         (reports / "abc-company-2026.md").write_text("x")
-        assert max_report_num(reports, {"jobs": {}}) == 0
+        assert max_report_num(reports, {"jobs": {}}, tmp_path / "none.md") == 0
+
+
+    # The tracker is the one record that survives a cache eviction (#203).
+    def _tracker(self, tmp_path, rows, header=None):
+        apps = tmp_path / "applications.md"
+        apps.write_text((header or _APPS_HEADER) + "".join(rows), encoding="utf-8")
+        return apps
+
+    def test_tracker_links_count_when_files_and_state_are_gone(self, tmp_path):
+        """A tracker-only restore: reports/ and the batch state are empty, the
+        tracker links up to 3200. The next number must be 3201, not 001."""
+        apps = self._tracker(tmp_path, [_apps_row(1, "Evaluated", "0001", "-"),
+                                        _apps_row(2, "Applied", "3200", "-")])
+        assert max_report_num(tmp_path / "reports", {"jobs": {}}, apps) == 3200
+
+    def test_the_highest_source_wins(self, tmp_path):
+        reports = tmp_path / "reports"
+        reports.mkdir()
+        (reports / "040-acme-2026-01-01.md").write_text("x")
+        apps = self._tracker(tmp_path, [_apps_row(1, "Evaluated", "12", "-")])
+        assert max_report_num(reports, {"jobs": {"j": {"report_num": "007"}}}, apps) == 40
+
+    def test_a_report_link_in_notes_counts(self, tmp_path):
+        """merge-tracker puts the link in Notes for a tracker with no Report
+        column, and row_report_num reads it there; numbering must agree."""
+        apps = self._tracker(tmp_path, [
+            "| 1 | 2026-01-01 | Acme | Eng | 4.0 | Evaluated | see [57](reports/057-acme.md) |\n"],
+            header="| # | Date | Company | Role | Score | Status | Notes |\n|---|---|---|---|---|---|---|\n")
+        assert max_report_num(tmp_path / "reports", {}, apps) == 57
+
+    def test_the_via_layout_is_read_by_name(self, tmp_path):
+        apps = self._tracker(tmp_path, [
+            "| 1 | 2026-01-01 | Acme | Hays | Eng | 4.0/5 | Evaluated | | [88](reports/088-acme.md) | |\n"],
+            header="| # | Date | Company | Via | Role | Score | Status | PDF | Report | Notes |\n"
+                   "|---|---|---|---|---|---|---|---|---|---|\n")
+        assert max_report_num(tmp_path / "reports", {}, apps) == 88
+
+    def test_a_000_link_claims_nothing(self, tmp_path):
+        """`[000]` is what write_job_result writes with no number at all."""
+        apps = self._tracker(tmp_path, [_apps_row(1, "Evaluated", "000", "-")])
+        assert max_report_num(tmp_path / "reports", {}, apps) == 0
+
+    def test_every_link_in_notes_counts_not_just_the_first(self, tmp_path):
+        """A re-evaluated row in a tracker with no Report column carries its old
+        and new links in Notes, oldest first; numbering must see the newest."""
+        apps = self._tracker(tmp_path, [
+            "| 1 | 2026-01-01 | Acme | Eng | 4.0 | Evaluated | see [57](reports/057-acme.md)"
+            " — Re-eval 2026-02-01 (4.0→4.2): [3201](reports/3201-acme.md) |\n"],
+            header="| # | Date | Company | Role | Score | Status | Notes |\n|---|---|---|---|---|---|---|\n")
+        assert max_report_num(tmp_path / "reports", {}, apps) == 3201
+
+    def test_a_posting_url_in_notes_is_not_a_report_number(self, tmp_path):
+        apps = self._tracker(tmp_path, [
+            "| 1 | 2026-01-01 | Acme | Eng | 4.0/5 | Evaluated | | | [9999](https://example.com/jobs/9999) |\n"])
+        assert max_report_num(tmp_path / "reports", {}, apps) == 0
 
 
 class TestMaxTrackerNum:
@@ -1361,7 +1416,7 @@ class TestMaxReportNumCountsLocks:
         reports.mkdir()
         (reports / "004-acme-2026-01-01.md").write_text("# real", encoding="utf-8")
         (reports / "011-RESERVED.md").write_text('{"pid":1,"token":"x"}', encoding="utf-8")
-        assert max_report_num(reports, {}) == 11, "a lock must reserve its number"
+        assert max_report_num(reports, {}, tmp_path / "none.md") == 11, "a lock must reserve its number"
 
 
 class TestHeadedAdditionDetection:

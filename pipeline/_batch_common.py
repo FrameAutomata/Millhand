@@ -15,8 +15,8 @@ from pipeline.work_location import (
     WORK_LOCATION_RE, location_mark, parse_work_location,
 )
 from pipeline.tracker_layout import (
-    SCORE_SENTINELS, data_rows, header_aliases, header_columns, is_score_cell,
-    load_contract, split_row,
+    SCORE_SENTINELS, claimed_report_nums, data_rows, header_aliases, header_columns,
+    is_score_cell, load_contract, split_row,
     # Aliased: `report_num` is also the name of the number itself in
     # write_job_result and below, and a local shadowing a callable is a
     # TypeError waiting for whoever adds the next call.
@@ -305,7 +305,7 @@ def load_state(state_path: Path) -> dict:
     return {"jobs": {}}
 
 
-def max_report_num(reports_dir: Path, state: dict) -> int:
+def max_report_num(reports_dir: Path, state: dict, applications_md: Path) -> int:
     """Highest report number already claimed, so the next one is free.
 
     A `NNN-RESERVED.md` lock counts, deliberately: claiming the number is the
@@ -314,6 +314,22 @@ def max_report_num(reports_dir: Path, state: dict) -> int:
     `find_report_file` below, which must skip locks because it
     resolves a number to a file to render. Do not "make them consistent" —
     they answer different questions.
+
+    The tracker counts too (#203), and the argument is required so a new caller
+    cannot leave it out. `reports/` and the batch state are the cloud's cached
+    paths, so after a cache eviction both read as empty while a restored tracker
+    still links every number up to its maximum. Numbered from the files alone,
+    the next run minted `001` again: two rows of one tracker then resolve to one
+    report file, and merge-tracker's report-number tier can fold a new
+    evaluation onto an old row at the same company. `max_tracker_num` already
+    reads the tracker for the same reason, and career-ops'
+    `reserve-report-num.mjs` (the `--batch` minter) counts tracker report links
+    too, so the two minters agree.
+
+    What it cannot see after an eviction is a number minted but never linked —
+    an addition merge-tracker refused, a row kept out by `--min-score` — so such
+    a number can be handed out again; the batch state that recorded it is the
+    cached path that was lost.
     """
     max_num = 0
     if reports_dir.exists():
@@ -326,6 +342,8 @@ def max_report_num(reports_dir: Path, state: dict) -> int:
             max_num = max(max_num, int(job.get("report_num", 0)))
         except (ValueError, TypeError):
             pass
+    for row in _tracker_rows(applications_md):
+        max_num = max(max_num, *claimed_report_nums(row.get("report", ""), row.get("notes", "")), 0)
     return max_num
 
 

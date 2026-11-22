@@ -39,6 +39,7 @@ from pipeline._batch_common import (
     APPLY_MIN_SCORE,
     SKIP_BELOW,
     build_user_message,
+    load_state,
     eval_system_prompt,
     max_report_num,
     max_tracker_num,
@@ -1777,8 +1778,11 @@ def add_job(req: AddJobRequest) -> JSONResponse:
     reports_dir = co / "reports"
     tracker_dir = co / "batch" / "tracker-additions"
 
-    tracker_num = max_tracker_num(apps_md, {}) + 1
-    report_num  = max_report_num(reports_dir, {}) + 1
+    # The batch state too: an --evaluate-batch run assigns every pending job's
+    # numbers before writing any report, so files and tracker alone undercount.
+    state = load_state(co / "batch" / "batch-api-state.json")
+    tracker_num = max_tracker_num(apps_md, state) + 1
+    report_num  = max_report_num(reports_dir, state, apps_md) + 1
     report_num_str = str(report_num).zfill(3)
     today = datetime.date.today().isoformat()
     job_id = f"manual-{tracker_num}"
@@ -1835,8 +1839,9 @@ def _run_add_job(job_id: str, url: str, company: str, role: str) -> None:
         reports_dir = co / "reports"
         tracker_dir = co / "batch" / "tracker-additions"
 
-        tracker_num = max_tracker_num(apps_md, {}) + 1
-        report_num  = max_report_num(reports_dir, {}) + 1
+        state = load_state(co / "batch" / "batch-api-state.json")   # see add_job
+        tracker_num = max_tracker_num(apps_md, state) + 1
+        report_num  = max_report_num(reports_dir, state, apps_md) + 1
         report_num_str = str(report_num).zfill(3)
         today = datetime.date.today().isoformat()
 

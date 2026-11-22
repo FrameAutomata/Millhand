@@ -884,7 +884,7 @@ def _run_eval(
     # resolution the UI add-job path uses, so the two never diverge.
     system_prompt = eval_system_prompt(career_ops)
 
-    report_counter = max_report_num(reports_dir, state)
+    report_counter = max_report_num(reports_dir, state, applications_md)
     tracker_counter = max_tracker_num(applications_md, state)
 
     reports_dir.mkdir(parents=True, exist_ok=True)

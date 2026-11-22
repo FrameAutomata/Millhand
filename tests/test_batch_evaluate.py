@@ -1086,6 +1086,36 @@ class TestEvalUsesSharedPromptBuilder:
         assert captured["career_ops"] == career_ops
 
 
+class TestRunEvalNumbering:
+    """After a cache eviction reports/ and the batch state are empty, while a
+    restored tracker still links every report it ever had. The run must number
+    past the tracker, or it mints 001 again (#203). Driven through _run_eval, so
+    a call site that passes the wrong path fails here too."""
+
+    class _Stop(Exception):
+        pass
+
+    def test_numbers_continue_past_the_tracker(self, tmp_path, monkeypatch):
+        career_ops = TestEvalUsesSharedPromptBuilder()._career_ops(tmp_path)
+        (career_ops / "data").mkdir()
+        (career_ops / "data" / "applications.md").write_text(
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|---|---|---|---|---|---|---|---|\n"
+            "| 7 | 2026-01-01 | Acme | Eng | 4.0/5 | Applied | | [3200](reports/3200-acme.md) | |\n",
+            encoding="utf-8")
+        monkeypatch.setattr(eval_mod, "_check_provider", lambda p: None)
+        captured = {}
+
+        def spy(pending, state, report_counter, tracker_counter, co):
+            captured.update(report=report_counter, tracker=tracker_counter)
+            raise self._Stop()
+
+        monkeypatch.setattr(eval_mod, "assign_job_numbers", spy)
+        with pytest.raises(self._Stop):
+            eval_mod._run_eval(career_ops, provider="anthropic")
+        assert captured == {"report": 3200, "tracker": 7}
+
+
 class TestUnconformableWarningAtBuildCaller:
     """The 'conforming is on but this model has no known limits' warning is
     emitted where the no-op happens — _build_caller — so every path that builds
