@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 
 from pipeline._batch_common import (
+    MERGE_NOT_CLEAN_LINE,
     env_float,
     pid_alive as _pid_alive,
     process_lock_active,
@@ -236,6 +237,7 @@ def _idle_status() -> dict:
         "stages_seen": [],
         "exit_code": None,
         "ok": None,
+        "merge_not_clean": False,
         "log_tail": "",
     }
 
@@ -266,6 +268,7 @@ def status(tail_lines: int = 30) -> dict:
                 _clear_pid_file()
                 return _idle_status()
         seen = _scan_log_for_stages()
+        log_tail = tail_text(LOG_PATH, tail_lines)
         return {
             "running": running,
             "started_at": _state.get("started_at"),
@@ -275,5 +278,11 @@ def status(tail_lines: int = 30) -> dict:
             "stages_seen": sorted(set(seen), key=STAGES.index),
             "exit_code": exit_code,
             "ok": (exit_code == 0) if exit_code is not None else None,
-            "log_tail": tail_text(LOG_PATH, tail_lines),
+            # A run that finished every stage and exited 1 only because its
+            # tracker merge was not clean — orchestrate's last line says so —
+            # rather than one that crashed: what it did merge is in the
+            # tracker, so the UI reloads it and says which kind of failure.
+            "merge_not_clean": bool(exit_code) and any(
+                line.startswith(MERGE_NOT_CLEAN_LINE) for line in log_tail.splitlines()),
+            "log_tail": log_tail,
         }

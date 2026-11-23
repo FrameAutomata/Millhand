@@ -127,6 +127,25 @@ def real_pacers_on_fake_clock(monkeypatch) -> dict:
     return st
 
 
+def evaluate_without_a_provider(monkeypatch) -> None:
+    """Let `batch_evaluate._run_eval` reach its worker pool and its
+    post-evaluation merge with no provider: every job "succeeds" without a
+    call, so a test can drive the merge after evaluating."""
+    from pipeline import batch_evaluate
+
+    monkeypatch.setattr(batch_evaluate, "_check_provider", lambda p: None)
+    monkeypatch.setattr(batch_evaluate, "eval_system_prompt", lambda co: "system")
+    monkeypatch.setattr(batch_evaluate, "_build_caller", lambda p, m: None)
+
+    def process(meta, *args, **_kw):
+        state, state_lock = args[5], args[6]     # _process_one's positional order
+        with state_lock:
+            state["jobs"][meta["id"]]["status"] = "completed"
+        return True, meta["id"], None
+
+    monkeypatch.setattr(batch_evaluate, "_process_one", process)
+
+
 # Synthetic resume used by filter tests. Includes a Skills section so
 # extract_keywords produces a non-empty result.
 SYNTHETIC_RESUME = """
@@ -455,17 +474,6 @@ def tracker_row(source, num) -> dict:
     rows = (data.parse_applications_text(source) if isinstance(source, str)
             else data.parse_applications(source))
     return {r["num"]: r for r in rows}[str(num)]
-
-
-# career-ops' batch worker's label row, verbatim from its batch/batch-prompt.md
-# (Step 5) since career-ops#3706: a header row, then exactly one data row, which
-# merge-tracker resolves by NAME. Its first nine labels are in ADDITION_COLUMNS
-# order — the only reason the positional sanitize chain can address the data
-# row at all. One copy for every test that writes a headed addition, so an
-# upstream relabelling is one edit.
-ADDITION_LABELS = ("num", "date", "company", "role", "status", "score", "pdf",
-                   "report", "notes", "url")
-ADDITION_LABEL_LINE = "\t".join(ADDITION_LABELS)
 
 
 @pytest.fixture

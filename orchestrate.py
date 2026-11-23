@@ -28,7 +28,8 @@ from pipeline.search_config import (  # noqa: E402
 
 
 from pipeline import scrape, filter as filter_step, screen, bridge, batch_prep, batch_evaluate, notify  # noqa: E402
-from pipeline._batch_common import env_float  # noqa: E402  (shared with batch_evaluate's timeout/budget knobs)
+# env_float is shared with batch_evaluate's timeout/budget knobs.
+from pipeline._batch_common import MERGE_NOT_CLEAN_LINE, env_float  # noqa: E402
 # Only the board vocabulary is needed at arg-parse time; handoff.run itself is
 # still lazy-imported below to keep the hot pipeline path free of its tailoring
 # deps. This module-level import is cheap (handoff pulls only _batch_common + app.data).
@@ -154,14 +155,17 @@ def main() -> int:
 
     notify.notify("Pipeline", f"Pipeline complete! {len(new_offers)} offers queued")
 
+    # An unclean tracker merge fails the run, but only at the end: the
+    # re-check and the handoff below still run first.
+    merge_clean = True
     if args.evaluate_batch:
-        batch_evaluate.run(
+        merge_clean = batch_evaluate.run(
             career_ops,
             provider=args.batch_provider,
             model=args.batch_model,
             concurrency=args.batch_concurrency,
             dry_run=args.dry_run,
-        )
+        ).merge_clean
 
     if args.recheck_liveness:
         # Re-check the tracker's still-open roles and Discard the ones whose
@@ -176,13 +180,13 @@ def main() -> int:
         else:
             recheck.run(career_ops, timeout=args.recheck_timeout)
 
-    if args.handoff:
-        if args.dry_run:
-            # --dry-run promises "print without doing it": the handoff stage
-            # rewrites the tracker/work-order and --handoff-tailor spends real
-            # LLM calls + renders, so it must not run during a rehearsal.
-            print("[handoff] skipped (--dry-run)")
-            return 0
+    rc = 0
+    if args.handoff and args.dry_run:
+        # --dry-run promises "print without doing it": the handoff stage
+        # rewrites the tracker/work-order and --handoff-tailor spends real
+        # LLM calls + renders, so it must not run during a rehearsal.
+        print("[handoff] skipped (--dry-run)")
+    elif args.handoff:
         # Terminal stage: emit the work-order for the user's browser agent.
         # Lazy import keeps the hot pipeline path free of it. (handoff reads
         # HANDOFF_JOB_LOG itself; queue = the scored-export jsonl when present,
@@ -194,10 +198,23 @@ def main() -> int:
                          tailor_min_score=args.handoff_tailor_min_score,
                          career_ops=career_ops,
                          workers=args.batch_concurrency)
-        if rc != 0:
-            return rc
 
-    return 0
+    if not merge_clean:
+        # An evaluation that is not in the tracker should not end green. In the
+        # cloud this is what fails the daily's evaluate step, and so what makes
+        # the digest send its failure notice: the queue is not cached there, so
+        # a refused addition is never retried and nothing else would say so.
+        if rc:
+            # Something else failed too (the handoff). Not MERGE_NOT_CLEAN_LINE:
+            # the UI reads that line as "the run finished, only the merge was
+            # not clean", which would hide this failure.
+            print(f"[orchestrate] also: the tracker merge was not clean — see the "
+                  f"[batch] lines above; exiting {rc}", file=sys.stderr)
+        else:
+            rc = 1
+            print(f"{MERGE_NOT_CLEAN_LINE} — see the [batch] lines above; exiting 1",
+                  file=sys.stderr)
+    return rc
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ import pytest
 
 from pipeline import batch_evaluate as eval_mod
 from pipeline import gemini_limits as gl
-from tests.conftest import fake_clock, real_pacers_on_fake_clock
+from tests.conftest import evaluate_without_a_provider, fake_clock, real_pacers_on_fake_clock
 from pipeline.batch_evaluate import (
     _build_caller,
     _call_with_retry,
@@ -19,6 +19,7 @@ from pipeline.batch_evaluate import (
     _is_rate_limit_error,
     _is_transient_provider_error,
     _PROVIDER_KEYS,
+    EvalRun,
     PROVIDER_BASE_URLS,
     PROVIDER_DEFAULTS,
     resolve_caller,
@@ -223,20 +224,20 @@ class TestRunDryRun:
         for key in ("BATCH_PROVIDER", "GEMINI_API_KEY", "GROQ_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
             monkeypatch.delenv(key, raising=False)
         result = run(career_ops, dry_run=True)
-        assert result == 0
+        assert result == EvalRun(0)
 
     def test_no_tsv_returns_zero(self, tmp_path, monkeypatch):
         career_ops = tmp_path / "career-ops"
         career_ops.mkdir()
         monkeypatch.setenv("BATCH_PROVIDER", "anthropic")
         result = run(career_ops, dry_run=True)
-        assert result == 0
+        assert result == EvalRun(0)
 
     def test_dry_run_returns_pending_count(self, tmp_path, monkeypatch):
         career_ops = self._make_career_ops(tmp_path)
         monkeypatch.setenv("BATCH_PROVIDER", "anthropic")
         result = run(career_ops, provider="anthropic", dry_run=True)
-        assert result == 2
+        assert result == EvalRun(2)
 
     def test_dry_run_skips_completed(self, tmp_path, monkeypatch):
         career_ops = self._make_career_ops(tmp_path)
@@ -244,12 +245,12 @@ class TestRunDryRun:
         state_path.write_text(json.dumps({"jobs": {"1": {"status": "completed"}}}), encoding="utf-8")
         monkeypatch.setenv("BATCH_PROVIDER", "anthropic")
         result = run(career_ops, provider="anthropic", dry_run=True)
-        assert result == 1
+        assert result == EvalRun(1)
 
     def test_unknown_provider_returns_zero(self, tmp_path, monkeypatch):
         career_ops = self._make_career_ops(tmp_path)
         result = run(career_ops, provider="unknownprovider", dry_run=True)
-        assert result == 0
+        assert result == EvalRun(0)
 
 
 class TestModelResolution:
@@ -643,7 +644,7 @@ class TestMergeAndConcurrency:
         called = []
         monkeypatch.setattr("pipeline.batch_evaluate.run_merge_tracker",
                             lambda co: called.append(co) or True)
-        assert run(career_ops, provider="anthropic") == 0
+        assert run(career_ops, provider="anthropic") == EvalRun(0)
         assert called == [career_ops]
 
     def test_no_merge_when_zero_pending_and_no_additions(self, tmp_path, monkeypatch):
@@ -656,8 +657,29 @@ class TestMergeAndConcurrency:
         called = []
         monkeypatch.setattr("pipeline.batch_evaluate.run_merge_tracker",
                             lambda co: called.append(co) or True)
-        assert run(career_ops, provider="anthropic") == 0
+        assert run(career_ops, provider="anthropic") == EvalRun(0)   # nothing to merge: clean
         assert called == []
+
+    def test_an_unclean_heal_sweep_is_reported(self, tmp_path, monkeypatch):
+        # The heal sweep's result is the run's: a kept refusal from an earlier
+        # run is merged again here, refused again, and must not read as clean.
+        career_ops = self._career_ops(
+            tmp_path,
+            state_jobs={"1": {"status": "completed"}, "2": {"status": "completed"}},
+            additions=["1.tsv"],
+        )
+        monkeypatch.setattr("pipeline.batch_evaluate.run_merge_tracker", lambda co: False)
+        assert run(career_ops, provider="anthropic") == EvalRun(0, merge_clean=False)
+
+    @pytest.mark.parametrize("clean", [True, False])
+    def test_the_post_evaluation_merge_is_reported(self, tmp_path, monkeypatch, clean):
+        career_ops = self._career_ops(tmp_path)
+        evaluate_without_a_provider(monkeypatch)
+        called = []
+        monkeypatch.setattr("pipeline.batch_evaluate.run_merge_tracker",
+                            lambda co: called.append(co) or clean)
+        assert run(career_ops, provider="anthropic") == EvalRun(2, merge_clean=clean)
+        assert called == [career_ops]
 
     def test_concurrency_floored_to_one(self, tmp_path, monkeypatch, capsys):
         # BATCH_CONCURRENCY=0 would crash ThreadPoolExecutor(max_workers=0); the
@@ -683,7 +705,7 @@ class TestEvalLock:
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(15)"])
         try:
             lock.write_text(str(child.pid), encoding="utf-8")
-            assert run(tmp_path) == 0
+            assert run(tmp_path) == EvalRun(0)
             assert "already running" in capsys.readouterr().err
             assert lock.exists()          # we must not remove someone else's lock
         finally:
@@ -698,7 +720,7 @@ class TestEvalLock:
         lock.write_text(str(dead.pid), encoding="utf-8")
         monkeypatch.setenv("BATCH_PROVIDER", "anthropic")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
-        assert run(tmp_path) == 0          # proceeds to "no batch-input.tsv"
+        assert run(tmp_path) == EvalRun(0)  # proceeds to "no batch-input.tsv"
         out = capsys.readouterr()
         assert "already running" not in out.err
         assert not lock.exists()           # released on exit
@@ -994,7 +1016,7 @@ class TestFreeTierPacing:
         monkeypatch.setattr(eval_mod, "load_pending", lambda bi, st: list(rows))
         monkeypatch.setenv("GEMINI_FREE_TIER", "true")
 
-        n = eval_mod._run_eval(co, provider="gemini", model="gemini-2.5-flash", dry_run=True)
+        n = eval_mod._run_eval(co, provider="gemini", model="gemini-2.5-flash", dry_run=True).processed
         assert n == 20                                   # capped from 50 (RPD)
         err = capsys.readouterr().err
         assert "30 deferred" in err
@@ -1012,7 +1034,7 @@ class TestFreeTierPacing:
         monkeypatch.setattr(eval_mod, "load_pending", lambda bi, st: list(rows))
         monkeypatch.delenv("GEMINI_FREE_TIER", raising=False)
 
-        n = eval_mod._run_eval(co, provider="gemini", model="gemini-2.5-flash", dry_run=True)
+        n = eval_mod._run_eval(co, provider="gemini", model="gemini-2.5-flash", dry_run=True).processed
         assert n == 50                                   # no cap
 
     def test_run_eval_cap_sums_failover_chain(self, tmp_path, monkeypatch, capsys):
@@ -1025,7 +1047,7 @@ class TestFreeTierPacing:
         monkeypatch.setenv("GEMINI_FREE_TIER", "true")
         # chain of two 20-RPD models → summed cap 40
         n = eval_mod._run_eval(co, provider="gemini",
-                               model="gemini-2.5-flash,gemini-3.5-flash", dry_run=True)
+                               model="gemini-2.5-flash,gemini-3.5-flash", dry_run=True).processed
         assert n == 40
         assert "10 deferred" in capsys.readouterr().err
 

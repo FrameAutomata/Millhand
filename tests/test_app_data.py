@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 
 from pipeline import tracker_layout
+from pipeline._batch_common import ADDITION_LABEL_LINE
 from pipeline.app import data
-from tests.conftest import ADDITION_LABEL_LINE
 
 
 def _reset_contract_cache():

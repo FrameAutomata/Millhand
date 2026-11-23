@@ -28,6 +28,11 @@ while ($i -lt $args.Count) {
 }
 
 & "$root\.venv\Scripts\python.exe" "$root\orchestrate.py" @orchestrateArgs
+# A native command's exit code is not an error to $ErrorActionPreference, and
+# `pwsh -File` exits 0 for a script that runs off its end, so without this a
+# failed run — a crash, or --evaluate-batch's unclean tracker merge — went on
+# to --batch and could end green, where run.sh's `set -e` stops.
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 if ($runBatch) {
     # The registry resolves BATCH_CLI (reading .env, which the Setup wizard
@@ -69,10 +74,16 @@ if ($runBatch) {
                else { $null }
     if ($bashExe) {
         & $bashExe $batchRunner @batchArgs
+        # A failed runner ends the script here, as run.sh's `set -e` ends it.
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         # The runner merged its own additions as its last step. A row the agent
-        # CLI wrote with an unreadable score was refused there and archived; this
-        # pulls such rows back, repairs them, and merges again.
+        # CLI wrote with an unreadable score was refused there — archived before
+        # career-ops#5862, kept in the queue since; this repairs and re-merges
+        # either kind, and exits 1 unless the merge was clean, which ends this
+        # script in failure as run.sh's `set -e` ends it. See
+        # pipeline/merge_additions.py.
         & "$root\.venv\Scripts\python.exe" -m pipeline.merge_additions
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     } else {
         Write-Host "ERROR: Git for Windows not found. Install from https://git-scm.com/download/win"
         exit 1

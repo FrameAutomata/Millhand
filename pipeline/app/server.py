@@ -1961,6 +1961,8 @@ def add_job(req: AddJobRequest) -> JSONResponse:
 
     # Merge into applications.md. Failure is non-fatal — the tracker-additions
     # file is written and the next pipeline run will pick it up.
+    # `merged` is True only when the whole queue merged cleanly, so an older
+    # kept refusal makes it False too (the async path ignores it entirely: #240).
     merged = run_merge_tracker(co)
 
     return JSONResponse({

@@ -1,10 +1,12 @@
 """Shared utilities for batch job evaluation (submit, evaluate, retrieve)."""
 
+import contextlib
 import csv
 import json
 import os
 import re
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +16,7 @@ from pipeline.work_location import (
 )
 from pipeline.tracker_layout import (
     SCORE_SENTINELS, data_rows, header_aliases, header_columns, is_score_cell,
-    split_row,
+    load_contract, split_row,
     # Aliased: `report_num` is also the name of the number itself in
     # write_job_result and below, and a local shadowing a callable is a
     # TypeError waiting for whoever adds the next call.
@@ -146,15 +148,22 @@ def pid_alive(pid: int) -> bool:
         return True
 
 
+def queued_additions(tracker_dir: Path) -> set[str]:
+    """The names of the addition files in the queue, readable or not — the one
+    listing of it, taken before a merge and after (`run_merge_tracker`)."""
+    return {f.name for f in tracker_dir.glob("*.tsv")}
+
+
 def has_pending_tracker_additions(tracker_dir: Path) -> bool:
     """True when career-ops/batch/tracker-additions holds un-merged TSVs.
 
     merge-tracker.mjs MOVES each TSV into tracker-additions/merged/ once it has
     folded it into applications.md, so a top-level *.tsv means "evaluated but
     not yet merged" — the signal that lets an interrupted run heal on a later
-    invocation even when it processes zero new jobs."""
+    invocation even when it processes zero new jobs. Since career-ops#5862 that
+    includes an addition it refused and kept (see `_warn_on_lost_additions`)."""
     try:
-        return any(tracker_dir.glob("*.tsv"))
+        return bool(queued_additions(tracker_dir))
     except OSError:
         return False
 
@@ -570,6 +579,21 @@ ADDITION_COLUMNS = [
     "num", "date", "company", "role", "status", "score", "pdf", "report", "notes",
 ]
 _TRACKER_TSV_COLUMNS = len(ADDITION_COLUMNS)
+
+# career-ops' label line for an addition: the one its batch worker is told to
+# write "exactly as shown" (batch/batch-prompt.md, Step 5, since career-ops#3706)
+# and the one `write_job_result` puts above every row it writes for a checkout
+# that reads it (`reads_labelled_additions`), because career-ops#6062 refuses a
+# headerless addition outright. Its first nine labels are ADDITION_COLUMNS in
+# order — the only reason the positional chain can address the data row beneath
+# it (`_positional_addition`). The tenth is the `url` column the worker fills
+# and our writer leaves empty: the posting URL lives in Notes, where every
+# reader here looks for it, and a URL cell on a tracker with no URL column only
+# makes merge-tracker warn that its URL dedup is inactive. One copy, which the
+# tests import; `tests/test_merge_tracker_contract.py` holds it to the prompt
+# wherever a checkout is at hand.
+ADDITION_LABELS = (*ADDITION_COLUMNS, "url")
+ADDITION_LABEL_LINE = "\t".join(ADDITION_LABELS)
 # Every cell the sanitizers below reach for, resolved from that list rather than
 # written as a literal — the guards only check the TOTAL, so a column inserted
 # upstream would leave them silently rewriting the wrong cells.
@@ -579,6 +603,17 @@ _SCORE_IDX = ADDITION_COLUMNS.index("score")
 _COMPANY_IDX = ADDITION_COLUMNS.index("company")
 _REPORT_IDX = ADDITION_COLUMNS.index("report")
 _NOTES_IDX = ADDITION_COLUMNS.index("notes")
+_PDF_IDX = ADDITION_COLUMNS.index("pdf")
+
+# The cells merge-tracker's headed parser refuses BLANK ("present but empty —
+# use the documented sentinel"; tracker-parse.mjs's `TSV_REQUIRED_FIELDS`),
+# which its headerless parser never checked: every label but `notes` and `url`.
+_REQUIRED_IDXS = [ADDITION_COLUMNS.index(name) for name in (
+    "num", "date", "company", "role", "status", "score", "pdf", "report")]
+# What the evaluation prompt tells the model to write in the PDF column
+# (`build_system_prompt`), and so what `labelled_addition` writes into a PDF
+# cell the model left blank.
+_PDF_CELL = "null"
 
 # The Report cell is `[N](path)`, and it is the one cell whose shape identifies
 # it — which makes it the anchor for deciding whether a row's nine columns are
@@ -627,15 +662,15 @@ def _addition_lines(text: str) -> tuple[list[str], dict[str, int] | None]:
     data row since career-ops#3706 (merged 2026-09-04), and merge-tracker reads
     that form by NAME — the one form in which a discarded, never-scored row,
     `—` in both score and status, has an order at all (#3517). The headerless
-    row is still accepted, so both arrive. Detected by merge-tracker's own rule
-    (`looksLikeTsvHeaderRow`) against the alias table career-ops ships
-    (`header_aliases`) and resolved by its first-occurrence rule
-    (`resolveTsvColumns`): the first cell is not all digits (a data row leads
-    with its tracker number) and at least three DISTINCT fields are recognised,
-    so a data row would need three header words in three cells to be taken for
-    one. Lines split on `\\r?\\n`, as merge-tracker splits them. Read as a
-    headerless row instead, the label line is a job called "role" at a company
-    called "company"."""
+    row is accepted until career-ops#6062, so both arrive. Detected by
+    merge-tracker's own rule (`looksLikeTsvHeaderRow`) against the alias table
+    career-ops ships (`header_aliases`) and resolved by its first-occurrence
+    rule (`resolveTsvColumns`): the first cell is not all digits (a data row
+    leads with its tracker number) and at least three DISTINCT fields are
+    recognised, so a data row would need three header words in three cells to
+    be taken for one. Lines split on `\\r?\\n`, as merge-tracker splits them.
+    Read as a headerless row instead, the label line is a job called "role" at
+    a company called "company"."""
     lines = [line for line in re.split(r"\r?\n", text) if line.strip()]
     if not lines:
         return lines, None
@@ -722,6 +757,97 @@ def _read_positional(path: Path) -> tuple[str, str] | None:
     return _positional_addition(text)
 
 
+def labelled_addition(tracker_tsv: str) -> str | None:
+    """The file text for a sanitized headerless row under career-ops' label
+    line, padded on `_rejoin_addition`'s terms — or None, and the row is
+    written as it stands, for merge-tracker to judge headerless: since #6062
+    that is a refusal, which the guard names.
+
+    Labels settle by POSITION what merge-tracker's headerless parser worked out
+    by content, so only a row whose positions are known qualifies: its nine
+    columns in place with the Report cell where `_row_parts` anchors a wider row
+    (a nine-cell row is taken as it stands there, but a row one cell short in
+    the middle and padded at the end would be read by name as the report link
+    under `pdf` — a refusal turned into a silent mis-merge), and at most one
+    cell after Notes, empty or a URL, since `url` is the only label there. A
+    tenth cell holding a location or a `via=` tag is the case upstream's own
+    refusal warns about: labelled `url`, its value would be dropped. A pipe row
+    splits to one cell and is declined, like every step declines it.
+
+    The status/score pair is the one thing a position cannot settle. The
+    headerless parser asked which ONE of the two cells looked like a score —
+    `_normalize_score_cell` leaves a swapped pair alone so that this still can —
+    so a pair the model wrote the other way round is put into label order here,
+    by the same rule; labelled as written, a row it used to merge is refused.
+
+    The headed parser also refuses a BLANK required cell, which the headerless
+    one never checked, so labels must not turn a blank cell into a refusal. A
+    blank PDF gets what the prompt tells the model to write there (`_PDF_CELL`),
+    and a blank score is `N/A` by the time the chain is done; any other blank
+    required cell declines the row, which a checkout before #6062 then merges
+    headerless as it always did."""
+    parts = _row_parts(tracker_tsv)
+    if parts is None or not _REPORT_CELL_RE.match(parts[_REPORT_IDX].strip()):
+        return None
+    extras = [cell.strip() for cell in parts[_TRACKER_TSV_COLUMNS:]]
+    # Case-insensitive, as merge-tracker's own test for a URL cell is.
+    if len(extras) > 1 or (extras and extras[0]
+                           and not re.fullmatch(_NOTES_URL_RE.pattern, extras[0], re.I)):
+        return None
+    if is_score_cell(parts[_STATUS_IDX]) and not is_score_cell(parts[_SCORE_IDX]):
+        parts[_STATUS_IDX], parts[_SCORE_IDX] = parts[_SCORE_IDX], parts[_STATUS_IDX]
+    if not parts[_PDF_IDX].strip():
+        parts[_PDF_IDX] = _PDF_CELL
+    if any(not parts[i].strip() for i in _REQUIRED_IDXS):
+        return None
+    return _rejoin_addition(ADDITION_LABEL_LINE + "\n", "\t".join(parts))
+
+
+# What a merge-tracker that reads labelled additions has and an older one does
+# not: career-ops#3706's headed-addition parser, and career-ops#6062's opt-out
+# flag — a checkout that refuses headerless rows reads labelled ones by
+# definition. Either marker answers the question, so an upstream rename of one
+# leaves the answer right.
+_HEADED_PARSER_MARKER = "parseHeadedAddition"
+_REFUSES_HEADERLESS_MARKER = "--allow-headerless"
+
+
+def reads_labelled_additions(career_ops: Path) -> bool:
+    """Whether the merge-tracker in `career_ops` reads a labelled addition
+    (career-ops#3706, 2026-09-04). The writer and the merge-time sanitizer label
+    a row only when it does (`_addition_text`). A merge-tracker from before
+    #3706 reads the label line as a data row and refuses the file — archives
+    it, exits 0 — and recovery will not re-queue it, since its score is
+    readable; that checkout merges the same row headerless, so labelling for it
+    would lose every evaluation it was given. Any checkout still on the retired
+    fork is one: the fork's merge-base was 2026-08-25.
+
+    A text probe for either marker, through `load_contract`, so it is cached
+    until the script's mtime changes (the writer asks once per evaluation).
+    `test_the_checkout_reads_labelled_additions` holds it to what the script
+    does: an upstream rename of both fails that gate instead of quietly sending
+    current checkouts headerless rows #6062 refuses. True when the script is
+    missing or unreadable — labelled is what every current checkout and the
+    cloud's pin need, and with no script nothing merges anyway."""
+    return load_contract(
+        "merge-tracker.mjs",
+        lambda text: _HEADED_PARSER_MARKER in text or _REFUSES_HEADERLESS_MARKER in text,
+        True, root=career_ops)
+
+
+def _addition_text(header: str, row: str, career_ops: Path) -> str:
+    """The file text for a sanitized addition `row` under `header`, written
+    into `career_ops`'s queue — the one place labels are decided. A headerless
+    row (`header` "") goes under the label line when the checkout reads labels
+    and `labelled_addition` takes it, and out as it stands otherwise; a headed
+    one keeps its own line."""
+    if not header and reads_labelled_additions(career_ops):
+        labelled = labelled_addition(row)
+        if labelled is not None:
+            return labelled
+    return _rejoin_addition(header, row)
+
+
 def _row_parts(tracker_tsv: str) -> list[str] | None:
     """The cells of an addition row whose nine columns are IN PLACE, else None.
 
@@ -762,8 +888,9 @@ def _restore_trailing_cells(tracker_tsv: str) -> str:
     here eats it — `extract_tag` strips the tag body before we ever see the row.
     The row then has 8 fields, and each sanitizer below no-ops on its 9-column
     guard: the score is left unnormalized, merge-tracker cannot tell it from the
-    status, and it refuses the row and archives it. So the row that arrives one
-    cell short is exactly the row this chain exists to save.
+    status, and it refuses the row (archiving it, before career-ops#5862). So
+    the row that arrives one cell short is exactly the row this chain exists to
+    save.
 
     Exactly ONE cell, deliberately. Notes is the last column, so a lost trailing
     tab can only ever cost one. A row short by more is genuinely malformed, and
@@ -837,12 +964,13 @@ def _normalize_score_cell(tracker_tsv: str) -> str:
     score by asking whether exactly one of them *looks like* a score cell
     (`tracker-parse.mjs:resolveScoreStatus` — `/^\\d+(?:\\.\\d+)?\\/5$/`, plus the
     N/A / DUP / dash sentinels). When neither matches it refuses the row rather
-    than risk merging a column swap. That refusal is counted as `skipped`, not
-    as a failure: merge-tracker still exits 0 AND still moves the TSV into
-    tracker-additions/merged/. So a model that writes "4.2" instead of "4.2/5"
-    loses the evaluation outright — the report is on disk, the row never
-    reaches applications.md, `run_merge_tracker` sees returncode 0, and
-    `has_pending_tracker_additions` goes false so no later run retries it.
+    than risk merging a column swap — and a labelled row whose `score` cell is
+    not one is refused the same way. That refusal is counted as `skipped`, not
+    as a failure: merge-tracker exits 0. Before career-ops#5862 it also moved
+    the TSV into tracker-additions/merged/, so a model that writes "4.2"
+    instead of "4.2/5" lost the evaluation outright — the report on disk, the
+    row never in applications.md, and nothing retrying it. Since then the TSV
+    is kept for a re-run, which refuses it again until something repairs it.
 
     The older merge-tracker had a heuristic whose final fallback assumed
     "status then score" — this row order — so any score string merged and the
@@ -858,11 +986,13 @@ def _normalize_score_cell(tracker_tsv: str) -> str:
         parts[_SCORE_IDX] = raw.upper()
         return "\t".join(parts)
     # The model may have written the pair the other way round (status in col 6,
-    # score in col 5). merge-tracker resolves that on its own — it asks which
-    # ONE of the two looks like a score. Writing N/A here would make BOTH look
-    # like one, so its "exactly one" test fails and it refuses a row it would
-    # otherwise have merged correctly: the loss this function exists to prevent,
-    # caused by this function. Leave a swapped pair alone.
+    # score in col 5). Leave a swapped pair alone. A headerless row is labelled
+    # after this chain, and `labelled_addition` puts the pair into label order
+    # by asking which ONE of the two looks like a score — writing N/A here would
+    # make BOTH look like one, so the swap would not happen and the row would
+    # go out labelled with its score under `status`. A headed row is read by
+    # name, where merge-tracker refuses a swapped pair on purpose, and N/A
+    # would not move the score out of `status` either.
     if is_score_cell(parts[_STATUS_IDX]):
         return tracker_tsv
     value = score_value(raw)
@@ -1138,7 +1268,12 @@ def write_job_result(
                                         job_meta.get("jd_text", ""),
                                         report_file=report_file or "",
                                         work_location=_report_location_mark(report_content))
-        (tracker_dir / f"{job_id}.tsv").write_text(tracker_tsv + "\n", encoding="utf-8")
+        # Every caller writes into <career-ops>/batch/tracker-additions, so the
+        # checkout is two up. Atomic, because a merge's sanitizer in another
+        # thread or process reads and rewrites this directory: one that read a
+        # half-written row would "repair" it and replace the whole one.
+        atomic_write_text(tracker_dir / f"{job_id}.tsv",
+                          _addition_text("", tracker_tsv, tracker_dir.parent.parent))
 
     return {
         "report_file": report_file,
@@ -1416,9 +1551,10 @@ def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
     `--batch` path, `gemini-eval.mjs`, the web runner) write straight into
     `tracker-additions/`, never entering Python. Those rows reach a merge with
     none of the chain applied — no score normalization, so an unreadable score
-    cell gets the row REFUSED and archived (exit 0, never retried); no URL in
-    notes, so the UI's "Open posting" link renders as `#`; and no req id, so two
-    levels of one title fold.
+    cell gets the row REFUSED (archived and never retried before
+    career-ops#5862, refused again on every run since); no URL in notes, so the
+    UI's "Open posting" link renders as `#`; and no req id, so two levels of
+    one title fold.
 
     **This covers the merges WE run** — `--evaluate-batch`, the UI, and the heal
     sweep that picks up whatever is still pending. It does NOT cover a `--batch`
@@ -1441,11 +1577,18 @@ def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
     same-numbered files the row meant.
 
     A headed addition (career-ops#3706) is sanitized through its data row, its
-    label line written back, on `_positional_addition`'s terms.
+    label line written back, on `_positional_addition`'s terms. A HEADERLESS row
+    goes back under the label line where the writer would put one
+    (`_addition_text`), because career-ops#6062 refuses one without labels:
+    what an older version of this repo wrote, or Add-Job before the writer
+    labelled its rows, would otherwise sit refused in the queue on a checkout
+    that has pulled it.
 
-    A pipe-delimited row is left alone. merge-tracker parses that shape natively,
-    while every step here splits on tabs and no-ops on it — rewriting it would
-    change which of upstream's two parsers reads the row, for no gain."""
+    A pipe-delimited row is left alone: every step here splits on tabs and
+    no-ops on it, and turning it into a tab row would be a guess at its cells.
+    merge-tracker before #6062 parses that shape natively; since, it refuses it
+    as headerless and keeps it, which the loss guard names
+    (`_warn_on_lost_additions`)."""
     urls = _batch_input_urls(career_ops / "batch" / "batch-input.tsv")
     changed = 0
     for f in sorted(tracker_dir.glob("*.tsv")):
@@ -1461,52 +1604,175 @@ def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
                                   read_text(jd_cache_path(career_ops, f.stem)),
                                   report_file=_dead_link_repair(career_ops, row, report),
                                   work_location=_pending_location_mark(row, report))
-        # The ROW, not the rejoined file: rejoining drops a blank line between a
-        # header and its row, which would count an unchanged row as repaired.
-        if fixed == row:
+        text = _addition_text(header, fixed, career_ops)
+        # Nothing repaired and no label line gained. The ROW, not the file read:
+        # rejoining drops a blank line between a header and its row, which
+        # would count an unchanged row as repaired.
+        if fixed == row and text == _rejoin_addition(header, row):
             continue
         try:
-            atomic_write_text(f, _rejoin_addition(header, fixed))
+            atomic_write_text(f, text)
         except OSError:
             continue        # a row we cannot repair still merges as it stands
         changed += 1
     if changed:
-        print(f"[batch] sanitized {changed} addition(s) written outside the "
-              "Python path (score/URL/req-id/report link/work location)")
+        print(f"[batch] sanitized {changed} addition(s) pending a merge "
+              "(score/URL/req-id/report link/work location/label line)")
+
+
+# One Millhand merge at a time (`_merge_lock`). Both locks, as
+# `data.override_file_lock` holds them: acquire_process_lock treats its own pid
+# as reclaimable, so two threads of one process would each "take" the file.
+# MAX_AGE is merge-tracker's own stale default for its tracker lock, far above a
+# real merge, so only a hung holder is reclaimed; WAIT is comfortably above its
+# 60s tracker-lock timeout, so a merge queued behind one that is itself waiting
+# on that lock still gets its turn.
+_MERGE_LOCK_MAX_AGE = 600.0
+_MERGE_LOCK_WAIT = 150.0
+_MERGE_LOCK_POLL = 0.1
+# Consecutive OSErrors from the lock file before giving up on it: enough to
+# ride out a Windows sharing violation on a file mid-delete, not enough to make
+# every merge wait out the bound when the file simply cannot be written.
+_MERGE_LOCK_MAX_ERRORS = 10
+_merge_thread_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _merge_lock(career_ops: Path):
+    """Hold the thread lock and `career_ops`'s cross-process merge lock —
+    `batch/.merge-lock`, beside the batch-eval lock and never inside
+    tracker-additions/, where it would be listed as an addition. Past
+    `_MERGE_LOCK_WAIT` the merge goes ahead without it, with one warning: every
+    caller is best-effort, and refusing would lose a merge. An OSError from the
+    lock file is a miss rather than a raise, for the same reason — and a run of
+    them means the file cannot be written, so the merge goes ahead then rather
+    than polling out the bound."""
+    lock = career_ops / "batch" / ".merge-lock"
+    deadline = time.monotonic() + _MERGE_LOCK_WAIT
+    threaded = _merge_thread_lock.acquire(timeout=_MERGE_LOCK_WAIT)
+    held = False
+    errors = 0
+    # Never the file without the thread lock: it would "reclaim" the file from
+    # the thread of this process that holds both.
+    while threaded:
+        try:
+            held = acquire_process_lock(lock, max_age=_MERGE_LOCK_MAX_AGE)
+            errors = 0
+        except OSError:
+            held, errors = False, errors + 1
+        if held or errors >= _MERGE_LOCK_MAX_ERRORS or time.monotonic() >= deadline:
+            break
+        time.sleep(_MERGE_LOCK_POLL)
+    if not held:
+        print(f"[batch] could not take {lock.name} within {_MERGE_LOCK_WAIT:.0f}s "
+              "(another merge holds it, or it cannot be written) — merging without it")
+    try:
+        yield
+    finally:
+        if held:
+            release_process_lock(lock)
+        if threaded:
+            _merge_thread_lock.release()
+
+
+# The line orchestrate ends a run with when its tracker merge was not clean,
+# just before it exits 1. Here rather than in orchestrate because the UI's
+# Run-local (`app.local_run`) reads it back to tell that exit 1 from a crash,
+# and the UI venv cannot import orchestrate.
+MERGE_NOT_CLEAN_LINE = "[orchestrate] the tracker merge was not clean"
 
 
 def run_merge_tracker(career_ops: Path) -> bool:
-    merge_script = career_ops / "merge-tracker.mjs"
-    if not merge_script.exists():
+    """Merge every pending addition into applications.md. True only for a
+    CLEAN merge: merge-tracker exited 0 and every addition pending before it
+    reached the tracker.
+
+    A non-zero exit is not "nothing happened" any more. merge-tracker exits 1
+    when it could not apply one addition (its `failedAdditions`), after it has
+    written the tracker and archived the others — so treating every non-zero
+    exit as total failure skipped the loss guard and the #163 reopen on rows
+    that had just merged. The evidence of a merge is an exit of 0 or an
+    addition that left the queue — merge-tracker archives each one it applies,
+    whatever it exits — and either gets the guard and the reopen, as a partial
+    merge when the exit was not 0. A non-zero exit with neither is a failure,
+    which is where the missing-npm-deps hint belongs. Not a changed tracker:
+    another writer can rewrite applications.md while this runs.
+
+    Nor is a file that left the queue evidence while another of our merges
+    runs, so one runs at a time (`_merge_lock`), from recovery to the reopen.
+    Add-Job merges from background threads, and the UI's merge can overlap the
+    pipeline's in another process; merge-tracker serializes its own writes on
+    its tracker lock, but not the listings around them. A merge that timed out
+    on that lock (exit 1, nothing applied) while another archived what it
+    applied read as a partial merge, and reported every valid addition still
+    queued as refused and KEPT, with advice to delete it.
+
+    False for a partial merge too, and for an exit-0 merge that refused
+    something — kept in the queue since career-ops#5862, archived before it,
+    readable or not (see `_warn_on_lost_additions`) — because a caller reading
+    True as "the evaluations are in the tracker" would be wrong about the ones
+    the guard just named. `merge_additions` turns that into its exit code,
+    Add-Job's synchronous endpoint returns it as `merged`, and `--evaluate-batch`
+    hands it to orchestrate, which runs every later stage and then exits 1
+    (`MERGE_NOT_CLEAN_LINE`). So a kept refusal makes every merge False while it
+    stays queued, and `run.sh`/`run.ps1 --batch` and every `--evaluate-batch`
+    that merges end in failure until its file is fixed or deleted — on purpose:
+    an evaluation that is not in the tracker should not end green. The cloud
+    daily's evaluate step fails on it too, once, since the queue is not cached
+    there. A merge that could not run at all (no `merge-tracker.mjs`, no
+    `node`) is False on the same terms, with a line saying so; an empty queue
+    merges cleanly and is True."""
+    if not (career_ops / "merge-tracker.mjs").exists():
+        print(f"[batch] no merge-tracker.mjs in {career_ops} — nothing was merged; "
+              "the additions stay in batch/tracker-additions/")
         return False
-    # Seed the tracker header first — otherwise merge-tracker no-ops on a
-    # fresh run (see ensure_applications_md).
-    ensure_applications_md(career_ops)
-    tracker_dir = career_ops / "batch" / "tracker-additions"
-    # Recovery first, so a restored row is sanitized and snapshotted with the
-    # rest; sanitizing before the snapshot, since it can change the role cell (a
-    # pipe suffix), which is half the identity the loss guard matches on.
-    _recover_refused_additions(career_ops, tracker_dir)
-    _sanitize_pending_additions(career_ops, tracker_dir)
-    before = _pending_additions(tracker_dir)
-    # The re-check's Discards, read before the merge can rewrite their Notes.
-    closed = _liveness_closed_rows(career_ops / "data" / "applications.md")
-    print("[batch] running merge-tracker.mjs...")
-    r = subprocess.run(["node", "merge-tracker.mjs"], cwd=career_ops, capture_output=True, text=True, encoding="utf-8")
-    if r.returncode == 0:
-        print("[batch] tracker merged")
+    with _merge_lock(career_ops):
+        # Seed the tracker header first — otherwise merge-tracker no-ops on a
+        # fresh run (see ensure_applications_md).
+        ensure_applications_md(career_ops)
+        tracker_dir = career_ops / "batch" / "tracker-additions"
+        # Recovery first, so a restored row is sanitized and snapshotted with
+        # the rest; sanitizing before the snapshot, since it can change the role
+        # cell (a pipe suffix), which is half the identity the loss guard
+        # matches on.
+        _recover_refused_additions(career_ops, tracker_dir)
+        _sanitize_pending_additions(career_ops, tracker_dir)
+        before = _pending_additions(tracker_dir)
+        queued = queued_additions(tracker_dir)
+        # The re-check's Discards, read before the merge can rewrite their Notes.
+        closed = _liveness_closed_rows(career_ops / "data" / "applications.md")
+        print("[batch] running merge-tracker.mjs...")
+        try:
+            r = subprocess.run(["node", "merge-tracker.mjs"], cwd=career_ops,
+                               capture_output=True, text=True, encoding="utf-8")
+        except OSError as exc:
+            # No `node` on PATH: a merge that did not run, like the missing
+            # script above — not a traceback that ends the run before its
+            # later stages.
+            print(f"[batch] could not run merge-tracker.mjs ({exc}) — is Node.js "
+                  "installed? Nothing was merged; the additions stay in "
+                  "batch/tracker-additions/")
+            return False
+        pending = queued_additions(tracker_dir)
+        if r.returncode != 0:
+            if queued <= pending:
+                print(f"[batch] merge-tracker failed:\n{r.stderr.strip()}")
+                _hint_missing_node_modules(r.stderr)
+                return False
+            print(f"[batch] merge-tracker exited {r.returncode} after a partial merge — "
+                  "what it applied is in the tracker; what it did not is listed below. "
+                  f"Its error output:\n{r.stderr.strip()}")
+        else:
+            print("[batch] tracker merged")
         # BOTH streams: merge-tracker refuses a row with console.warn, which is
-        # stderr. Passing stdout alone left the reasons block empty on every
-        # genuine loss — and printed the one refusal it does log to stdout (the
-        # benign unscoreable re-eval) as the explanation for some other
-        # addition's disappearance.
-        _warn_on_lost_additions(before, career_ops, tracker_dir,
-                                f"{r.stdout}\n{r.stderr}")
+        # stderr. Passing stdout alone left the reasons empty on every genuine
+        # loss — and printed the one refusal it does log to stdout (the benign
+        # unscoreable re-eval) as the explanation for some other addition's
+        # disappearance.
+        unapplied = _warn_on_lost_additions(before, queued, pending, career_ops,
+                                            f"{r.stdout}\n{r.stderr}")
         _reopen_reposted(closed, career_ops)
-        return True
-    print(f"[batch] merge-tracker failed:\n{r.stderr.strip()}")
-    _hint_missing_node_modules(r.stderr)
-    return False
+        return r.returncode == 0 and not unapplied
 
 
 # ── "Discarded" is two different things (#163) ───────────────────────────────
@@ -1721,9 +1987,10 @@ def _pending_additions(tracker_dir: Path) -> list[dict]:
     puts two TSVs under one company::role, and collapsing them would under-report
     a loss and send the operator hunting for one report while another stays
     buried. The filename is also what "still pending" is decided on, since
-    merge-tracker moves a processed TSV into merged/ under its own name — so the
-    file answers "was this addition processed at all" exactly, where a shared key
-    answers it for whichever TSV moved first.
+    merge-tracker moves an applied TSV into merged/ under its own name (and,
+    since career-ops#5862, leaves a refused one where it was) — so the file
+    answers "was this addition applied" exactly, where a shared key answers it
+    for whichever TSV moved first.
 
     A headerless row short of `role` is unreadable and skipped (a headed file
     is counted regardless — see below); short of `notes` it is not, since a
@@ -1737,10 +2004,10 @@ def _pending_additions(tracker_dir: Path) -> list[dict]:
             if "role" not in row:
                 continue
         # A headed file with no single readable row is still counted, with no
-        # identity, which `_classify_landing` reads as lost: merge-tracker
-        # refuses it and archives it all the same, so skipping it the way an
-        # unreadable headerless row is skipped dropped a two-row file's
-        # evaluations without a line in the log.
+        # identity: merge-tracker refuses it — archived (read as lost by
+        # `_classify_landing`) or kept (reported as kept) by release — so
+        # skipping it the way an unreadable headerless row is skipped dropped a
+        # two-row file's evaluations without a line in the log.
         additions.append({
             "name": f.name,
             "company": row.get("company", ""),
@@ -1757,6 +2024,8 @@ def _classify_landing(records: list[dict], career_ops: Path) -> tuple[list[dict]
     Shared by the loss guard, which reports the answer, and the recovery pass,
     which acts on it — one definition, so the row the guard calls lost is the
     row recovery goes after, never two slightly different sets."""
+    if not records:
+        return [], []
     landed, role_by_report = _tracker_identities(career_ops / "data" / "applications.md")
     lost: list[dict] = []
     retitled: list[tuple[dict, str]] = []
@@ -1811,8 +2080,19 @@ def _recover_refused_additions(career_ops: Path, tracker_dir: Path) -> None:
     and the score no longer changes.)
 
     A headed addition comes back through its data row with its label line kept,
-    on `_sanitize_pending_additions`' terms (`_positional_addition`). A row
-    already back in the queue is left to the merge in progress."""
+    on `_sanitize_pending_additions`' terms (`_positional_addition`); a
+    headerless one comes back as it was, and that pass labels it if the
+    checkout reads labels. A row already back in the queue is left to the merge
+    in progress.
+
+    **On a career-ops with #5862 this finds nothing, by design.** A refused
+    addition is no longer archived: it stays in `tracker-additions/`, where the
+    merge-time sanitizer reaches it on the next merge like any other pending
+    row. `merged/` then holds only additions that were applied — each of which
+    landed, or merged with a readable score and was later deleted by hand — and
+    neither qualifies under the rules above. This stays for a checkout before
+    #5862, which still archives refusals (the pinned cloud daily ran one), and
+    for refusals archived before a `git pull` brought it."""
     merged = tracker_dir / "merged"
     lost, _ = _classify_landing(_pending_additions(merged), career_ops)
     if not lost:
@@ -1842,15 +2122,43 @@ def _recover_refused_additions(career_ops: Path, tracker_dir: Path) -> None:
               "for an unreadable score — re-queued with the score repaired")
 
 
-def _warn_on_lost_additions(before: list[dict], career_ops: Path,
-                            tracker_dir: Path, merge_output: str = "") -> None:
-    """Report what became of each evaluation that left tracker-additions/.
+def _warn_on_lost_additions(before: list[dict], queued: set[str], pending: set[str],
+                            career_ops: Path, merge_output: str = "") -> int:
+    """Report what became of each evaluation pending before the merge, and
+    return how many did NOT reach the tracker. `before` is the parsed snapshot
+    (`_pending_additions`), and `queued` and `pending` list the queue
+    (`queued_additions`) before the merge and after it.
 
-    merge-tracker declines a row it can't read confidently — an unreadable score
-    cell, a report number marked `failed` in batch-state.tsv — and archives the
-    TSV into merged/ anyway, with a warning on stdout and exit 0. So the row is
+    merge-tracker declines a row it can't read confidently — no label line
+    (career-ops#6062), an unreadable score cell, a report number marked `failed`
+    in batch-state.tsv — with a warning and exit 0, and what it does with the
+    TSV depends on the release, so both shapes are read:
+
+    **Kept** (career-ops#5862, 2026-10-26, and its `failedAdditions` exit-1 case
+    before that): the TSV is in the queue before the merge and after it. That
+    is decided by the FILES, readable or not, because `before` skips a
+    headerless file it cannot read up to the role cell (a short positional or
+    pipe row), which #6062 refuses and #5862 keeps like any other. Judged on
+    the parsed set, that refusal went unnamed and the merge read as clean
+    (#241). `before` only lends a kept file its identity; without one it is
+    named by its file as "no readable row". Being there IS the refusal, so it
+    is reported as its own category, with what to do, and never through the
+    "did it land" test below: a refused re-evaluation of a role already in the
+    tracker would pass that test while its new report never arrived. The one
+    message is true in both places a merge runs: locally every later merge
+    retries the file and merge-tracker refuses it again until it changes,
+    while the cloud daily does not keep batch/tracker-additions/ at all.
+
+    **Lost** (before #5862): the TSV was archived into merged/ anyway, so it is
     gone from the queue, absent from applications.md, and
     `has_pending_tracker_additions` is false, meaning nothing ever retries it.
+    Judged on `before` alone: an unreadable file that left the queue is not
+    claimed lost, since a merge-tracker before #6062 can merge a pipe row.
+
+    Each named addition is followed by merge-tracker's own lines about it —
+    every refusal names its file as `<name>:` — since in a cloud run the log is
+    all the operator has, and a block of every `Skipping` line in the run
+    could not say which reason belonged to which file.
 
     Asking the filesystem and the tracker, rather than grepping merge-tracker's
     prose for "Skipping", is what makes this survive an upstream release: those
@@ -1868,14 +2176,25 @@ def _warn_on_lost_additions(before: list[dict], career_ops: Path,
     it is real information nothing else surfaces: the fuzzy tier can fold two
     genuinely distinct reqs (a leveled title and its sibling) into one row, and
     from then on only one of them is visible to dedup, the handoff and the UI."""
-    if not before:
-        return
-    # The directory entry is the whole question here — a TSV merge-tracker
-    # processed is one it moved into merged/ under the same name — so this is a
-    # listing, not a re-read of every file `before` already parsed.
-    still_pending = {f.name for f in tracker_dir.glob("*.tsv")}
+    kept = queued & pending
+    identity = {add["name"]: add for add in before}
+    refused = [identity.get(name, {"name": name, "company": "", "role": "", "report": ""})
+               for name in sorted(kept)]
     lost, retitled = _classify_landing(
-        [add for add in before if add["name"] not in still_pending], career_ops)
+        [add for add in before if add["name"] not in kept], career_ops)
+
+    if refused:
+        # No "re-evaluate": the job is done in the batch state and its URL is in
+        # scan-history, so nothing would queue it again.
+        print(f"[batch] WARNING: {len(refused)} evaluation(s) were refused by "
+              "merge-tracker and KEPT in batch/tracker-additions/ — their reports "
+              "are on disk but the roles are not in applications.md, so the UI and "
+              "the handoff cannot see them. Locally every merge retries each one, "
+              "and reports failure, until its file is corrected as merge-tracker's "
+              "reason says or deleted to drop the evaluation; the cloud daily does "
+              "not keep that directory, so there nothing retries it and the file is "
+              "in that run's pipeline-output artifact for 7 days:")
+        _print_additions(refused, merge_output)
 
     if lost:
         print(f"[batch] WARNING: {len(lost)} evaluation(s) left "
@@ -1883,19 +2202,7 @@ def _warn_on_lost_additions(before: list[dict], career_ops: Path,
               "reports are on disk but the roles are invisible to the UI and to the "
               "handoff, and no later run retries them. The TSVs are in "
               "batch/tracker-additions/merged/:")
-        for add in lost:
-            who = (f"{add['company']} — {add['role']}" if add["company"] or add["role"]
-                   else "no readable row")
-            print(f"[batch]   {add['name']} ({who})")
-        # merge-tracker's output is captured, so the one line saying WHY it
-        # refused each row would otherwise be unreachable — in a cloud run the
-        # log is all the operator has. `merge_output` must therefore carry
-        # stderr: every refusal but one is a console.warn.
-        reasons = [l.strip() for l in merge_output.splitlines() if "Skipping" in l]
-        if reasons:
-            print("[batch] merge-tracker's reasons:")
-            for line in reasons:
-                print(f"[batch]   {line}")
+        _print_additions(lost, merge_output)
 
     if retitled:
         print(f"[batch] note: {len(retitled)} evaluation(s) merged into an existing "
@@ -1907,6 +2214,25 @@ def _warn_on_lost_additions(before: list[dict], career_ops: Path,
         for add, row_role in retitled:
             print(f"[batch]   {add['name']}: {add['company']} — "
                   f'"{add["role"]}" merged into "{row_role}" (report {add["report"]})')
+    return len(refused) + len(lost)
+
+
+def _print_additions(additions: list[dict], merge_output: str) -> None:
+    """One line per addition the guard names, each followed by merge-tracker's
+    own lines about that file. Every refusal upstream prints names its file as
+    `<name>:` (`Skipping 7.tsv: …`, `❌ 7.tsv: could not locate …`), while its
+    run summaries list names without the colon — so the match is the name as a
+    whole token followed by `:`, which also keeps `17.tsv`'s reasons off
+    `7.tsv`. `merge_output` must carry stderr: every refusal but one is a
+    console.warn."""
+    for add in additions:
+        who = (f"{add['company']} — {add['role']}" if add["company"] or add["role"]
+               else "no readable row")
+        print(f"[batch]   {add['name']} ({who})")
+        names_it = re.compile(rf"(?<![\w.-]){re.escape(add['name'])}:")
+        for line in merge_output.splitlines():
+            if names_it.search(line):
+                print(f"[batch]     merge-tracker: {line.strip()}")
 
 
 def _tracker_identities(applications_md: Path) -> tuple[set[str], dict[str, str]]:
@@ -2165,11 +2491,11 @@ TRACKER_NUM	DATE	COMPANY	ROLE	STATUS	SCORE/5	PDF	[REPORT_NUM](reports/REPORT_NUM
 
 work_location rules: `mode` is what the posting REQUIRES of the person, not what it prefers - any required office days at all are "hybrid", never "remote". `metro` is where that presence is required (the work site, not the employer's headquarters) and `state` is that metro's 2-letter state/province code; both are "" for a fully remote role and "" when the posting does not say. Never guess a metro from the company's address.
 
-Tracker TSV rules (9 tab-separated columns, no header):
+Tracker TSV rules (one row of 9 tab-separated columns, no header line - the column labels are added when the file is written):
 - Col 1 TRACKER_NUM: use the Tracker Number from the user message
 - Col 5 STATUS: "Evaluada" normally; "NO APLICAR" if score < 3.0
 - Col 6 SCORE: format X.X/5
-- Col 7 PDF: null (batch mode)
+- Col 7 PDF: {_PDF_CELL} (batch mode)
 - Col 8 report link: [REPORT_NUM](reports/REPORT_NUM-company-slug-DATE.md)
 - company-slug: lowercase, spaces to hyphens
 - Col 9 notes: one sentence starting with APPLY / CONSIDER / SKIP + key reason

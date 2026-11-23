@@ -175,6 +175,26 @@ class TestRunLocalEndpoints:
         s = client.get("/api/run-local/status").json()
         assert s["exit_code"] == 3 and s["ok"] is False
 
+    def test_an_unclean_merge_is_told_from_a_crash(self, client, fake_popen, tmp_path):
+        # orchestrate exits 1 for both; only its last line tells them apart,
+        # and only the unclean merge finished every stage.
+        from pipeline._batch_common import MERGE_NOT_CLEAN_LINE
+        log = tmp_path / "local-run.log"
+        client.post("/api/run-local", json={})
+        log.write_text("[batch-eval] done — processed=2 failed=0\n"
+                       f"{MERGE_NOT_CLEAN_LINE} — see the [batch] lines above; exiting 1\n",
+                       encoding="utf-8")
+        fake_popen[0].finish(1)
+        s = client.get("/api/run-local/status").json()
+        assert s["ok"] is False and s["merge_not_clean"] is True
+
+        client.post("/api/run-local", json={})
+        log.write_text("Traceback (most recent call last):\nRuntimeError: boom\n",
+                       encoding="utf-8")
+        fake_popen[1].finish(1)
+        s = client.get("/api/run-local/status").json()
+        assert s["ok"] is False and s["merge_not_clean"] is False
+
     def test_cancel_terminates(self, client, fake_popen):
         client.post("/api/run-local", json={})
         r = client.post("/api/run-local/cancel")

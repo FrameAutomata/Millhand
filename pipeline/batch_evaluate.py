@@ -45,6 +45,7 @@ import sys
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -727,14 +728,30 @@ def _eval_lock_max_age() -> float:
     return env_float("EVAL_LOCK_MAX_AGE", 1800.0)
 
 
+@dataclass(frozen=True)
+class EvalRun:
+    """What `run` reports: how many jobs it evaluated (a dry run: would
+    evaluate), and whether the tracker merge it ran — the heal sweep of an
+    earlier run's additions, or the merge after evaluating — was clean
+    (`run_merge_tracker`'s True). A run that merged nothing is clean: no
+    evaluation and no queued addition is not a failure.
+
+    orchestrate turns `merge_clean=False` into its exit code after every later
+    stage has run, which is what fails the cloud daily's evaluate step — there
+    the queue is not cached, so a refused addition is not retried, and the
+    digest's failure notice is what reaches the person."""
+    processed: int
+    merge_clean: bool = True
+
+
 def run(
     career_ops: Path,
     provider: str | None = None,
     model: str | None = None,
     concurrency: int = 3,
     dry_run: bool = False,
-) -> int:
-    """Evaluate pending jobs synchronously. Returns number of jobs processed.
+) -> EvalRun:
+    """Evaluate pending jobs synchronously, then merge (see `EvalRun`).
 
     Single-flight across processes: two concurrent evaluations (e.g. a
     forgotten background run plus a fresh one — a live incident) contend on the
@@ -748,7 +765,7 @@ def run(
               "running — wait for it to finish or kill it first (concurrent runs "
               "corrupt shared state). Nothing was evaluated this run.",
               file=sys.stderr)
-        return 0
+        return EvalRun(0)
     try:
         return _run_eval(career_ops, provider, model, concurrency, dry_run)
     finally:
@@ -763,7 +780,7 @@ def _run_eval(
     model: str | None = None,
     concurrency: int = 3,
     dry_run: bool = False,
-) -> int:
+) -> EvalRun:
     provider = (provider or _detect_provider() or "").strip().lower()
     if not provider:
         print(
@@ -772,11 +789,11 @@ def _run_eval(
             "or OLLAMA_BASE_URL with BATCH_PROVIDER=ollama",
             file=sys.stderr,
         )
-        return 0
+        return EvalRun(0)
 
     if provider not in PROVIDER_DEFAULTS:
         print(f"error: unknown provider {provider!r}. Choose: {', '.join(PROVIDER_DEFAULTS)}", file=sys.stderr)
-        return 0
+        return EvalRun(0)
 
     # Note: `os.environ.get("BATCH_MODEL", DEFAULT)` would NOT fall back to
     # DEFAULT when the env var is set to an empty string — and that's exactly
@@ -796,7 +813,7 @@ def _run_eval(
 
     if not batch_input.exists():
         print("[batch-eval] no batch-input.tsv found — nothing to evaluate")
-        return 0
+        return EvalRun(0)
 
     state = load_state(state_path)
     pending = load_pending(batch_input, state)
@@ -810,8 +827,8 @@ def _run_eval(
         # to process ≥1 new job. Heal it here — merge-tracker moves merged TSVs
         # out, so this is a no-op once they're folded in.
         if not dry_run and has_pending_tracker_additions(tracker_dir):
-            run_merge_tracker(career_ops)
-        return 0
+            return EvalRun(0, merge_clean=run_merge_tracker(career_ops))
+        return EvalRun(0)
 
     # ThreadPoolExecutor(max_workers=0) raises ValueError; a typo'd
     # BATCH_CONCURRENCY ("0", "0.9"→0) shouldn't traceback the eval stage after
@@ -849,17 +866,17 @@ def _run_eval(
             print(f"  [{row['id']}] {row.get('source') or '?'} / {row.get('notes') or '?'}")
         if len(pending) > 5:
             print(f"  ... and {len(pending) - 5} more")
-        return len(pending)
+        return EvalRun(len(pending))
 
     err = _check_provider(provider)
     if err:
         print(f"error: {err}", file=sys.stderr)
-        return 0
+        return EvalRun(0)
 
     cv = read_text(career_ops / "cv.md")
     if not cv:
         print("error: career-ops/cv.md not found — cannot evaluate without a CV", file=sys.stderr)
-        return 0
+        return EvalRun(0)
 
     # cv.md above is still the "profile configured" sentinel (a PROFILE.md-only
     # setup is a later-commit concern). eval_system_prompt is the shared builder:
@@ -993,9 +1010,8 @@ def _run_eval(
     # from an earlier interrupted run. merge-tracker moves merged files out, so
     # a clean run won't re-merge endlessly.
     if processed > 0 or has_pending_tracker_additions(tracker_dir):
-        run_merge_tracker(career_ops)
-
-    return processed
+        return EvalRun(processed, merge_clean=run_merge_tracker(career_ops))
+    return EvalRun(processed)
 
 
 def _parse_argv(argv: list[str]) -> argparse.Namespace:
@@ -1014,6 +1030,8 @@ if __name__ == "__main__":
     load_dotenv(ROOT / ".env")
     args = _parse_argv(sys.argv[1:])
     career_ops_path = Path(os.environ.get("CAREER_OPS_PATH", ROOT / "career-ops")).resolve()
+    # Exit 1 when the tracker merge was not clean; run_merge_tracker has
+    # already printed which additions and why.
     sys.exit(
-        0 if run(career_ops_path, args.provider, args.model, args.concurrency, args.dry_run) >= 0 else 1
+        0 if run(career_ops_path, args.provider, args.model, args.concurrency, args.dry_run).merge_clean else 1
     )
