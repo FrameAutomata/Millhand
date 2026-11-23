@@ -44,8 +44,6 @@ def client(tmp_path, monkeypatch):
 
     from pipeline.app import server
     importlib.reload(server)
-    server.PUSHED_OVERRIDES_FILE = tmp_path / ".ui-cache" / "pushed-overrides.json"
-    server.UI_CACHE = tmp_path / ".ui-cache" / "latest"
     return TestClient(server.app)
 
 

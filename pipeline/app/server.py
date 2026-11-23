@@ -19,7 +19,6 @@ import ipaddress
 import json
 import os
 import secrets
-import shutil
 import socket
 import threading
 import time
@@ -61,7 +60,12 @@ from pipeline.sites import (
     unreadable_options,
 )
 from pipeline.stdio import line_buffer_stdout
-from pipeline import handoff, recheck
+from pipeline import handoff, recheck, state_sync
+# Push and Refresh run in pipeline/state_sync.py, which owns the scratch dir,
+# the pushed-overrides overlay and the workflow names; their routes here are
+# wrappers. Read its paths through the module, never bound here: a copy bound
+# here is one a test could redirect while the core wiped the real .ui-cache.
+from pipeline.state_sync import DAILY_WORKFLOW
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -73,56 +77,9 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 from dotenv import load_dotenv
 load_dotenv(ROOT / ".env", override=False)
 
-# Scratch dir where `gh run download` drops artifacts before Refresh merges them
-# into the local career-ops. Gitignored. The data layer ALWAYS reads from the
-# local install (offline-first); Refresh/Push just keep it synced with the cloud.
-UI_CACHE = ROOT / ".ui-cache" / "latest"
-
 # Background add-job tasks: job_id → {status, result?, error?}
 _add_job_tasks: dict[str, dict] = {}
 _add_job_lock = threading.Lock()
-
-# Cloud workflow filenames (must match .github/workflows/*.yml).
-DAILY_WORKFLOW = "daily-pipeline.yml"
-EDIT_WORKFLOW = "edit-tracker.yml"
-
-# The daily pipeline uploads the `pipeline-output-*` artifact. Refresh/push pull
-# its most recent successful run. (Kept as a list — latest_successful_run takes
-# several — in case more artifact-producing workflows are added later.)
-PIPELINE_WORKFLOWS = [DAILY_WORKFLOW]
-
-# Pending status changes the user hasn't pushed yet. Written by kanban drags —
-# one channel, owned by
-# pipeline.app.data (atomic writes + an in-process lock). The server delegates
-# rather than re-implementing read/modify/write, and resolves the path at call
-# time so tests that redirect data.STATUS_OVERRIDES_FILE take effect.
-# Overrides that have been dispatched to the cloud but aren't yet reflected in
-# a pipeline artifact. Applied on every job load so statuses survive Refresh
-# and restarts; self-cleans entry-by-entry once the artifact catches up.
-PUSHED_OVERRIDES_FILE = ROOT / ".ui-cache" / "pushed-overrides.json"
-
-
-def _load_overrides() -> dict:
-    return data.load_status_overrides()
-
-
-def _save_overrides(d: dict) -> None:
-    data.save_status_overrides(d)
-
-
-def _load_pushed_overrides() -> dict:
-    if PUSHED_OVERRIDES_FILE.exists():
-        try:
-            return json.loads(PUSHED_OVERRIDES_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
-
-
-def _save_pushed_overrides(d: dict) -> None:
-    PUSHED_OVERRIDES_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PUSHED_OVERRIDES_FILE.write_text(json.dumps(d, indent=2), encoding="utf-8")
-
 
 class StatusChange(BaseModel):
     num: str
@@ -461,23 +418,7 @@ def list_jobs() -> JSONResponse:
     payload = data.load_jobs(_career_ops())
     rows = payload["rows"]
 
-    # Apply pushed-overrides: changes dispatched to the cloud that aren't yet in
-    # a pipeline artifact. Self-clean any entry where the artifact has caught up.
-    pushed = _load_pushed_overrides()
-    if pushed:
-        caught_up: set[str] = set()
-        for row in rows:
-            num = str(row.get("num"))
-            if num in pushed:
-                if row.get("status_canonical") == pushed[num]:
-                    caught_up.add(num)
-                else:
-                    row["status"] = pushed[num]
-                    row["status_canonical"] = pushed[num]
-        if caught_up:
-            for num in caught_up:
-                del pushed[num]
-            _save_pushed_overrides(pushed)
+    state_sync.apply_pushed_overlay(rows)
 
     # Apply pending-overrides: local kanban drags + recheck discards not yet
     # pushed. A plain (num-keyed) override lands on the row with that num; an
@@ -488,7 +429,7 @@ def list_jobs() -> JSONResponse:
     # Prebuild O(1) lookups so the overlay is O(rows + overrides), not
     # O(rows x overrides): identity anchors are keyed by (norm_company, norm_role),
     # with a company-only anchor under (norm_company, "").
-    overrides = _load_overrides()
+    overrides = data.load_status_overrides()
     if overrides:
         by_num: dict[str, str] = {}
         by_identity: dict[tuple[str, str], str] = {}
@@ -534,97 +475,26 @@ def set_status(change: StatusChange) -> JSONResponse:
     # Through the locked read/modify/write accessor so a concurrent push or
     # recheck discard can't lose this drag (or be lost by it).
     data.record_status_override(str(change.num), change.status, note=note or None)
-    return JSONResponse({"ok": True, "pending": len(_load_overrides())})
+    return JSONResponse({"ok": True, "pending": len(data.load_status_overrides())})
+
+
+def _sync(core) -> JSONResponse:
+    """Run a state_sync core against the local install and answer as the route
+    always has: its result under "ok", a SyncError as the same HTTPException."""
+    try:
+        return JSONResponse({"ok": True, **core(_career_ops_local())})
+    except state_sync.SyncError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail) from e
 
 
 @app.post("/api/push-status")
 def push_status() -> JSONResponse:
     """Push pending status changes to the cloud tracker via the edit-tracker
-    workflow.
-
-    Clobber guard: we first pull the latest pipeline artifact and MERGE it into
-    the local tracker (so rows the pipeline added since the last Refresh are
-    present), then apply the pending status overrides onto the local base and
-    dispatch the resolved {num: status} — {num: {status, note}} for a re-check
-    Discard or a merge reopen, whose Notes mark must reach the cloud too (#163)
-    — to edit-tracker. Offline (no runs / gh error) → push against the
-    last-synced local tracker."""
-    overrides = _load_overrides()
-    if not overrides:
-        raise HTTPException(status_code=400, detail="No pending status changes to push.")
-
-    local_apps = _career_ops_local() / "data" / "applications.md"
-
-    # Clobber guard: pull the latest cloud artifact and MERGE it into local
-    # first, so rows the pipeline added since the last Refresh are present and
-    # overrides resolve against current cloud numbers. Offline (no runs / gh
-    # error) → push against the last-synced local tracker, untouched.
-    base_source = "local"
-    try:
-        run = gh.latest_successful_run(PIPELINE_WORKFLOWS)
-        if run is not None:
-            if UI_CACHE.exists():
-                shutil.rmtree(UI_CACHE)
-            artifact = gh.download_artifact(run["databaseId"], UI_CACHE)
-            data.sync_pulled_tracker(artifact, _career_ops_local())
-            base_source = "refreshed"
-    except gh.GhError:
-        pass  # offline — push against the last-synced local tracker
-
-    if not local_apps.exists():
-        raise HTTPException(
-            status_code=409,
-            detail="No applications.md to update (run the pipeline so the tracker exists).",
-        )
-    base_text = local_apps.read_text(encoding="utf-8")
-
-    # Resolve each identity-anchored override to the correct num IN THIS base. An
-    # override whose company isn't in the tracker is returned in `unresolved` —
-    # NOT applied and NOT dispatched, so we never mark a different company that
-    # merely shares the num. cloud_payload is {num: status}, or {num: {status,
-    # note}} when a Notes mark rides along (edit-tracker.yml's input). We do NOT
-    # write the status into applications.md: that file is the
-    # last-synced CLOUD mirror, and the pending edit lives in the pushed-override
-    # overlay (below) until a real cloud run incorporates it — only then does the
-    # self-clean in list_jobs fire. Writing it here would self-clean immediately
-    # and then vanish when Refresh's cloud-wins reverts the row.
-    _, cloud_payload, unresolved = data.resolve_overrides_for_push(
-        base_text, overrides, build_text=False)
-
-    # An unresolved DISCARD override targets a closed role that isn't in the cloud
-    # tracker: it's already applied locally, a closed role won't reappear to match
-    # on a later push, and the cloud's own daily recheck catches its own closed
-    # roles — so drop it instead of keeping it to nag on every future push.
-    # Non-Discard unresolved overrides (e.g. an auto-submitted Applied) are KEPT:
-    # their company may appear in a later cloud run, and then the next push lands.
-    stale_discards = [k for k in unresolved
-                      if data.canonical_status(data.override_status(overrides[k])) == "Discarded"]
-    kept_unresolved = [k for k in unresolved if k not in stale_discards]
-
-    # Dispatch edit-tracker with only the resolved overrides — avoids GitHub's
-    # workflow_dispatch input size limit that the full base64 tracker can exceed.
-    # Nothing resolved → nothing to push (don't fire an empty workflow run).
-    if cloud_payload:
-        try:
-            gh.trigger_workflow(EDIT_WORKFLOW, {"status_overrides_json": json.dumps(cloud_payload)})
-        except gh.GhError as e:
-            raise HTTPException(status_code=502, detail=str(e))
-        # Clear the keys we pushed PLUS the dead Discard overrides (re-reading
-        # under the lock), leaving only the genuinely-pending unresolved ones so
-        # a recheck discard recorded during the gh round-trip isn't dropped.
-        pushed_keys = [k for k in overrides if k not in unresolved]
-        data.clear_status_overrides(pushed_keys + stale_discards)
-        # Persist dispatched overrides so they survive Refresh and restarts until
-        # the pipeline produces a new artifact that already has the correct statuses.
-        pushed = _load_pushed_overrides()
-        # The overlay is status-only: the board compares a row's status to it.
-        pushed.update({num: data.override_status(v) for num, v in cloud_payload.items()})
-        _save_pushed_overrides(pushed)
-    elif stale_discards:
-        # Nothing resolved to dispatch, but still drop the dead Discard overrides.
-        data.clear_status_overrides(stale_discards)
-    return JSONResponse({"ok": True, "pushed": len(cloud_payload),
-                         "unresolved": len(kept_unresolved), "base": base_source})
+    workflow — `state_sync.push_pending`, which pulls the latest artifact into
+    the local tracker first so the overrides resolve against current cloud
+    numbers. Offline (no runs / gh error) → pushes against the last-synced
+    local tracker."""
+    return _sync(state_sync.push_pending)
 
 
 @app.get("/api/reports/{report_num}", response_class=HTMLResponse)
@@ -651,11 +521,7 @@ def health() -> dict:
 
 @app.post("/api/refresh")
 def refresh() -> JSONResponse:
-    """Pull the most recent successful pipeline artifact and MERGE it into the
-    local career-ops (offline-first): cloud wins for shared roles, local-only
-    rows (offline `Run local` results) are preserved. The merged tracker lives
-    durably in local, so it survives restarts and offline periods. Only writes
-    to local on a successful download — a gh/credits error leaves local intact."""
+    """Wrapper over state_sync.refresh, behind the two guards below."""
     # Every other route that rewrites applications.md takes this first. Refresh
     # did not, and it is the one a REMOTE user can now reach: mid-run,
     # sync_pulled_tracker would replace the tracker wholesale and rename report
@@ -679,32 +545,9 @@ def refresh() -> JSONResponse:
                    "refreshing now would overwrite the marks it is writing.",
         )
     try:
-        return _refresh_locked()
+        return _sync(state_sync.refresh)
     finally:
         _recheck_lock.release()
-
-
-def _refresh_locked() -> JSONResponse:
-    try:
-        run = gh.latest_successful_run(PIPELINE_WORKFLOWS)
-        if run is None:
-            raise HTTPException(status_code=404, detail="No successful pipeline runs found yet.")
-        # Fresh scratch dir for the download, then merge it into local.
-        if UI_CACHE.exists():
-            shutil.rmtree(UI_CACHE)
-        artifact = gh.download_artifact(run["databaseId"], UI_CACHE)
-        summary = data.sync_pulled_tracker(artifact, _career_ops_local())
-        return JSONResponse({
-            "ok": True,
-            "run_id": run["databaseId"],
-            "created_at": run.get("createdAt"),
-            "title": run.get("displayTitle"),
-            "rows": summary["rows"],
-            "renamed_reports": len(summary["renames"]),
-        })
-    except gh.GhError as e:
-        # Offline / no credits: keep the last-synced local tracker untouched.
-        raise HTTPException(status_code=502, detail=f"{e} — showing last-synced local data.")
 
 
 @app.post("/api/run")
@@ -756,7 +599,7 @@ def reset_search(req: ResetRequest) -> JSONResponse:
         raise HTTPException(status_code=400, detail='Type "RESET" to confirm — nothing was reset.')
     _refuse_during_local_run()   # a wipe mid-run would race the pipeline's writes
 
-    ui_root = UI_CACHE.parent     # .ui-cache/ (UI_CACHE is .ui-cache/latest)
+    ui_root = state_sync.UI_CACHE.parent     # .ui-cache/ (UI_CACHE is .ui-cache/latest)
     backup = ui_root / "backups" / f"reset-{datetime.datetime.now():%Y%m%d-%H%M%S}"
     summary = reset.reset_job_search(_career_ops_local(), ROOT, ui_root, backup)
     if req.clear_cloud:

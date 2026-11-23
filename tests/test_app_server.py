@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from pipeline import agent_cli
+from pipeline import agent_cli, state_sync
 
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
@@ -39,11 +39,8 @@ def client(tmp_path, monkeypatch):
     # fine, but reload keeps the test hermetic across runs.
     from pipeline.app import server
     importlib.reload(server)
-    # Isolate mutable module state into tmp so tests don't leak into each other
-    # or touch the real repo's .ui-cache. (status-overrides is isolated by the
-    # autouse conftest fixture via data.STATUS_OVERRIDES_FILE.)
-    server.PUSHED_OVERRIDES_FILE = tmp_path / ".ui-cache" / "pushed-overrides.json"
-    server.UI_CACHE = tmp_path / ".ui-cache" / "latest"
+    # The .ui-cache paths (status-overrides, pushed-overrides, the artifact
+    # scratch dir) are isolated by autouse conftest fixtures.
     return TestClient(server.app)
 
 
@@ -308,7 +305,7 @@ def test_push_status_refreshes_applies_and_dispatches(client, tmp_path, mocker):
     # edit-tracker was dispatched with a status_overrides_json payload.
     trigger.assert_called_once()
     wf, fields = trigger.call_args.args[0], trigger.call_args.args[1]
-    assert wf == server.EDIT_WORKFLOW
+    assert wf == state_sync.EDIT_WORKFLOW
     import json
     overrides = json.loads(fields["status_overrides_json"])
     assert overrides == {"1": "Applied"}
@@ -323,6 +320,7 @@ def test_push_carries_a_recheck_mark_to_the_cloud(client, mocker):
     erased the mark here too (#163). The mark rides in the payload; the board's
     post-push overlay stays status-only."""
     import json
+    from pipeline import state_sync
     from pipeline.app import data, server
     mark = "Closed 2026-09-06 (liveness re-check: HTTP 404)"
     local_apps = server._career_ops_local() / "data" / "applications.md"
@@ -333,7 +331,7 @@ def test_push_carries_a_recheck_mark_to_the_cloud(client, mocker):
     assert client.post("/api/push-status").status_code == 200
     payload = json.loads(trigger.call_args.args[1]["status_overrides_json"])
     assert payload == {"1": {"status": "Discarded", "note": mark}}
-    assert json.loads(server.PUSHED_OVERRIDES_FILE.read_text(encoding="utf-8")) == {"1": "Discarded"}
+    assert json.loads(state_sync.PUSHED_OVERRIDES_FILE.read_text(encoding="utf-8")) == {"1": "Discarded"}
     assert client.get("/api/jobs").json()["rows"][0]["status_canonical"] == "Discarded"
 
 

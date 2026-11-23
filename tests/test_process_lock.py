@@ -97,6 +97,22 @@ class TestProcessLock:
         bc.release_process_lock(lock)
         assert not lock.exists()
 
+    def test_release_retries_a_delete_refused_by_a_reader(self, tmp_path, monkeypatch):
+        # Windows refuses to delete a file another process holds open, and a
+        # waiter polling the lock holds it open for a moment.
+        lock = tmp_path / "x.lock"
+        assert bc.acquire_process_lock(lock, max_age=1800)
+        real, refusals = type(lock).unlink, []
+
+        def unlink(self, missing_ok=False):
+            if not refusals:
+                refusals.append(self)
+                raise PermissionError(32, "sharing violation")
+            real(self, missing_ok=missing_ok)
+        monkeypatch.setattr(type(lock), "unlink", unlink)
+        bc.release_process_lock(lock)
+        assert refusals and not lock.exists()
+
     def test_process_lock_active(self, tmp_path):
         # The non-acquiring liveness probe used by is_running()-style checks.
         lock = tmp_path / "x.lock"

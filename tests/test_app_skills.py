@@ -69,11 +69,7 @@ def client(tmp_path, monkeypatch):
                 "SKILL_PATH_DEFAULT", *_PROVIDER_KEYS.values(),
                 *daily_digest.SECRET_VARS, *daily_digest.SETTING_VARS):
         monkeypatch.delenv(var, raising=False)
-    # status-overrides is isolated by the autouse _isolate_status_overrides
-    # conftest fixture; isolate the pushed-overrides + cache paths here so no
-    # push-touching test can write the developer's real (gitignored) .ui-cache.
-    server.PUSHED_OVERRIDES_FILE = tmp_path / ".ui-cache" / "pushed-overrides.json"
-    server.UI_CACHE = tmp_path / ".ui-cache" / "latest"
+    # The .ui-cache paths are isolated by autouse conftest fixtures.
     return TestClient(server.app)
 
 
