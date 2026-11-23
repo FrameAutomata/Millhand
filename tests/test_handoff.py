@@ -10,7 +10,9 @@ This is the signed-off spec. It covers four concerns:
 """
 
 import json
+import os
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -328,6 +330,16 @@ class TestReconcile:
         reloaded = handoff.load_tracker(path)
         assert {t.key for t in reloaded} == {t.key for t in roles}
         assert {t.key: t.status for t in reloaded} == {t.key: t.status for t in roles}
+
+    def test_tracker_roundtrip_keeps_the_claim_stamp(self, tmp_path):
+        # A claim's TTL clock lives in `date` (#178): a write/load cycle must
+        # hand it back exactly, or every run would restart or lose the clock.
+        claim = handoff.TrackedRole(
+            key=handoff.role_key("Acme", "SWE"), company="Acme", role="SWE",
+            status="claimed", date="2026-11-01T08:00:00+00:00", source="writeback")
+        path = tmp_path / handoff.DEFAULT_TRACKER_NAME
+        handoff.write_tracker(path, [claim])
+        assert handoff.load_tracker(path) == [claim]
 
     def test_load_tracker_missing_file_is_empty(self, tmp_path):
         assert handoff.load_tracker(tmp_path / "nope.jsonl") == []
@@ -1893,12 +1905,14 @@ class TestSubmitPolicy:
 
 class TestStatusPrecedence:
     """Pinned numbers: applied 6 > handoff 5 > ready-to-submit 4 > drafted 3 >
-    claimed 2 > skipped 1. A ready form outranks a claim and a skip (the work is
-    done, waiting on a click) and loses to the two terminal outcomes."""
+    skipped 2 > claimed 1. A ready form outranks a claim and a skip (the work is
+    done, waiting on a click) and loses to the two terminal outcomes. A claim is
+    lowest because it expires (#178): a status that can expire must not outrank
+    one that cannot, or the expiry takes the other with it."""
 
     def test_pinned(self):
         assert handoff.STATUS_PRECEDENCE == {
-            "applied": 6, "handoff": 5, READY: 4, "drafted": 3, "claimed": 2, "skipped": 1,
+            "applied": 6, "handoff": 5, READY: 4, "drafted": 3, "skipped": 2, "claimed": 1,
         }
 
     @pytest.mark.parametrize("other,winner", [
@@ -2174,6 +2188,291 @@ class TestReadyRoundTrip:
         assert apps["Acme"]["status_canonical"] == "Evaluated"
 
 
+class TestClaimExpiry:
+    """#178: `claimed` is written before the work, so a crashed session left its
+    roles subtracted from every future work-order. A writeback claim nothing
+    replaced expires HANDOFF_CLAIM_TTL_HOURS (default 12) after it was written
+    (its file's last write, capped at the run's `now`), is pruned from the
+    ledger, and its role comes back as an ordinary fresh row — named in the
+    run's output. Every run here passes `now=`, the run's one clock; T0 is
+    before the files' real mtimes, so the cap makes `now` the stamp unless a
+    test sets the mtime itself."""
+
+    T0 = datetime(2026, 11, 1, 8, 0, tzinfo=timezone.utc)
+    URL = "https://www.linkedin.com/jobs/view/1"
+    ACME = handoff.role_key("Acme", "AI Engineer")
+    STALE_LINE = "[handoff] re-offered 1 role(s) whose claim went stale (>12h; each returns on its site's next build): Acme - AI Engineer"
+
+    def _co(self, tmp_path):
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        (co / "data" / "applications.md").write_text(
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+            "| 1 | 2026-10-01 | Acme | AI Engineer | 4.6/5 | Evaluated | X | [1](reports/1.md) "
+            f"| {self.URL} |\n"
+            "| 2 | 2026-10-01 | Curri | Software Engineer | 4.9/5 | Evaluated | X | [2](reports/2.md) "
+            "| https://www.linkedin.com/jobs/view/2 |\n", encoding="utf-8")
+        return co
+
+    def _export(self, tmp_path):
+        # The scored-export queue, whose rows stay Evaluated whatever is recorded.
+        q = tmp_path / "export.jsonl"
+        q.write_text("\n".join(json.dumps(r) for r in (
+            {"num": "1", "score": 4.6, "company": "Acme", "role": "AI Engineer",
+             "url": self.URL, "status": "Evaluated"},
+            {"num": "2", "score": 4.9, "company": "Curri", "role": "Software Engineer",
+             "url": "https://www.linkedin.com/jobs/view/2", "status": "Evaluated"},
+        )) + "\n", encoding="utf-8")
+        return q
+
+    def _wo(self, out):
+        return handoff.work_order_paths(out, "linkedin")[0]
+
+    def _rows(self, out):
+        return [json.loads(l) for l in self._wo(out).read_text(encoding="utf-8").splitlines()
+                if l.strip()]
+
+    def _write(self, out, rows):
+        self._wo(out).write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    def _set(self, out, company, status):
+        rows = self._rows(out)
+        next(r for r in rows if r["company"] == company)["status"] = status
+        self._write(out, rows)
+
+    def _append(self, out, status):
+        """An Acme row the agent adds by hand — the per-role prompt's fallback
+        row, or a session still holding a claim the last rebuild folded."""
+        self._write(out, self._rows(out) + [
+            {"company": "Acme", "role": "AI Engineer", "url": self.URL, "status": status}])
+
+    def _ledger(self, out):
+        return {t.key: t for t in handoff.load_tracker(out / handoff.DEFAULT_TRACKER_NAME)}
+
+    def _claim(self, date="", source="writeback", status="claimed"):
+        return handoff.TrackedRole(key=self.ACME, company="Acme", role="AI Engineer",
+                                   status=status, url=self.URL, date=date, source=source)
+
+    def _runner(self, tmp_path, queue_kind="tracker"):
+        co, out = self._co(tmp_path), tmp_path / "handoff"
+        q = self._export(tmp_path) if queue_kind == "export" else tmp_path / "missing.jsonl"
+
+        def run(at, **kw):
+            assert handoff.run(queue_path=q, out_dir=out, career_ops=co, now=at, **kw) == 0
+            return [r["company"] for r in self._rows(out)]
+        return run, out
+
+    def _claimed_at(self, tmp_path, at, queue_kind="tracker"):
+        """A run, then the agent claims Acme and dies; the next run (at `at`)
+        folds the claim — the moment its clock starts."""
+        run, out = self._runner(tmp_path, queue_kind)
+        assert run(self.T0) == ["Curri", "Acme"]
+        self._set(out, "Acme", "claimed")
+        assert run(at) == ["Curri"]
+        return run, out
+
+    def test_load_writeback_stamps_claims_only(self, tmp_path):
+        self._write(tmp_path, [{"company": c, "role": "R", "url": self.URL, "status": s}
+                               for c, s in (("A", "claimed"), ("B", "applied"), ("C", "skip:no"),
+                                            ("D", "handoff"), ("E", READY))])
+        got = {t.company: t.date for t in handoff.load_writeback(self._wo(tmp_path), now=self.T0)}
+        assert got == {"A": "2026-11-01T08:00:00+00:00", "B": "", "C": "", "D": "", "E": ""}
+        # The real clock (no seam) gives a full, aware UTC stamp the expiry can age.
+        (a,) = [t for t in handoff.load_writeback(self._wo(tmp_path)) if t.company == "A"]
+        stamp = handoff._claim_stamp(a.date)
+        assert stamp is not None and stamp.utcoffset() == timedelta(0)
+        assert abs(datetime.now(timezone.utc) - stamp) < timedelta(minutes=5)
+
+    def test_first_fold_date_survives_later_folds(self, tmp_path):
+        folded = self.T0 + timedelta(hours=1)
+        run, out = self._claimed_at(tmp_path, folded)
+        assert self._ledger(out)[self.ACME].date == folded.isoformat()
+        # A session still holding the claim is read again hours later (its row
+        # is back in a file): the first-seen stamp is kept, not restarted.
+        self._set(out, "Curri", "claimed")
+        self._append(out, "claimed")
+        assert run(folded + timedelta(hours=5)) == []
+        ledger = self._ledger(out)
+        assert ledger[self.ACME].date == folded.isoformat()
+        assert ledger[handoff.role_key("Curri", "Software Engineer")].date == \
+            (folded + timedelta(hours=5)).isoformat()
+
+    def test_stale_claim_is_pruned_and_reoffered(self, tmp_path, capsys):
+        folded = self.T0 + timedelta(hours=1)
+        run, out = self._claimed_at(tmp_path, folded)
+        assert run(folded + timedelta(hours=11, minutes=59)) == ["Curri"]   # still fresh
+        assert "re-offered" not in capsys.readouterr().out
+        assert run(folded + timedelta(hours=12)) == ["Curri", "Acme"]       # back, in score order
+        assert self.STALE_LINE in capsys.readouterr().out.splitlines()
+        assert self.STALE_LINE.isascii()                                    # cp1252 consoles
+        # Pruned from the ledger, not merely skipped at build time — and back as
+        # a FRESH row, never under the ready heading with a marker it hasn't earned.
+        assert self.ACME not in self._ledger(out)
+        acme = next(r for r in self._rows(out) if r["company"] == "Acme")
+        assert acme["status"] == "" and acme["resume_from"] == ""
+        md = handoff.work_order_paths(out, "linkedin")[1].read_text(encoding="utf-8")
+        assert handoff.READY_HEADING not in md and "| Acme |" in md and "0 excluded" in md
+
+    def test_reclaim_gets_a_fresh_clock(self, tmp_path, capsys):
+        run, out = self._claimed_at(tmp_path, self.T0 + timedelta(hours=1))
+        back = self.T0 + timedelta(hours=13)
+        assert run(back) == ["Curri", "Acme"]
+        capsys.readouterr()
+        # A new session claims it again. The old stamp went with the pruned
+        # entry, so this claim's clock starts at the run that reads it — had it
+        # stayed in the ledger, the tie rule would have handed it the old one
+        # and the run would have expired the live claim on the spot.
+        self._set(out, "Acme", "claimed")
+        assert run(back + timedelta(hours=1)) == ["Curri"]
+        assert self._ledger(out)[self.ACME].date == (back + timedelta(hours=1)).isoformat()
+        assert run(back + timedelta(hours=12)) == ["Curri"]                 # 11h into the new claim
+        assert "re-offered" not in capsys.readouterr().out
+
+    def _written_at(self, out, at):
+        os.utime(self._wo(out), (at.timestamp(), at.timestamp()))
+
+    def test_the_clock_starts_when_the_claim_was_written(self, tmp_path, capsys):
+        """A session claims Acme just after a build and dies; with daily runs the
+        claim is first READ a day later. Stamped at that read it stayed hidden
+        another 12 h; stamped at the file's last write it is already stale."""
+        run, out = self._runner(tmp_path)
+        assert run(self.T0) == ["Curri", "Acme"]
+        self._set(out, "Acme", "claimed")
+        self._written_at(out, self.T0 + timedelta(minutes=5))
+        assert run(self.T0 + timedelta(hours=24)) == ["Curri", "Acme"]
+        assert self.STALE_LINE in capsys.readouterr().out.splitlines()
+
+    def test_a_pruned_claim_still_on_disk_is_not_read_back(self, tmp_path, capsys):
+        """A build narrowed to another site leaves this site's work-order, and the
+        stale claim in it, on disk. The run's second read must not hand the claim
+        back to the ledger with a new clock, or the next full build hides it."""
+        run, out = self._runner(tmp_path)
+        assert run(self.T0) == ["Curri", "Acme"]
+        self._set(out, "Acme", "claimed")
+        self._written_at(out, self.T0 + timedelta(minutes=5))
+        run(self.T0 + timedelta(hours=13), board="indeed")    # linkedin's file is not rewritten
+        assert self.ACME not in self._ledger(out)
+        assert run(self.T0 + timedelta(hours=13, minutes=5)) == ["Curri", "Acme"]
+
+    def test_undated_legacy_claim_starts_its_clock(self, tmp_path):
+        # A ledger written before claims were stamped: no date, source writeback.
+        run, out = self._runner(tmp_path)
+        handoff.write_tracker(out / handoff.DEFAULT_TRACKER_NAME, [self._claim()])
+        assert run(self.T0) == ["Curri"]
+        assert self._ledger(out)[self.ACME].date == self.T0.isoformat()
+        assert run(self.T0 + timedelta(hours=11)) == ["Curri"]
+        assert run(self.T0 + timedelta(hours=12)) == ["Curri", "Acme"]
+
+    def test_date_only_unparseable_and_non_writeback_stay(self):
+        # Aged against a clock years later, none of these expire: a date with no
+        # time of day (a JOB_LOG `## Claimed` line), an unparseable value, a
+        # JOB_LOG claim whatever its date, and `handoff`, which never ages.
+        late, old = datetime(2030, 1, 1, tzinfo=timezone.utc), "2026-01-01T00:00:00+00:00"
+        entries = [self._claim("2026-01-01"), self._claim("last tuesday"),
+                   self._claim("2026-01-01", source="claimed"), self._claim(old, source="claimed"),
+                   self._claim(old, source="log_line"), self._claim(old, status="handoff")]
+        dates = [t.date for t in entries]
+        kept, expired = handoff._expire_stale_claims(entries, now=late, ttl_hours=12)
+        assert kept == entries and expired == []
+        assert [t.date for t in kept] == dates
+
+    @pytest.mark.parametrize("dated", [True, False], ids=["dated", "undated"])
+    def test_job_log_claim_stays_when_the_agent_also_claims_it(self, tmp_path, capsys, dated):
+        # Undated is the case the source rule exists for: merge_tracked backfills
+        # the JOB_LOG entry's empty date from the agent's stamped claim, so a rule
+        # on the date's shape alone would age the person's own claim out.
+        log = tmp_path / "JOB_LOG.md"
+        log.write_text("## Claimed\n- **Acme — AI Engineer**" + (" 2026-11-01" if dated else "")
+                       + "\n", encoding="utf-8")
+        run, out = self._runner(tmp_path)
+        assert run(self.T0, job_log=log) == ["Curri"]
+        self._set(out, "Curri", "claimed")
+        self._append(out, "claimed")
+        assert run(self.T0 + timedelta(hours=1), job_log=log) == []
+        assert run(self.T0 + timedelta(days=30), job_log=log) == ["Curri"]  # only the agent's claim aged
+        stale = [l for l in capsys.readouterr().out.splitlines() if "re-offered" in l]
+        assert stale == ["[handoff] re-offered 1 role(s) whose claim went stale (>12h; each returns on its site's next build): "
+                         "Curri - Software Engineer"]
+
+    @pytest.mark.parametrize("ttl", ["0", "-1"])
+    def test_non_positive_ttl_disables(self, tmp_path, monkeypatch, capsys, ttl):
+        monkeypatch.setenv(handoff.CLAIM_TTL_ENV, ttl)
+        run, _ = self._claimed_at(tmp_path, self.T0 + timedelta(hours=1))
+        assert run(self.T0 + timedelta(days=365)) == ["Curri"]
+        assert "re-offered" not in capsys.readouterr().out
+        # Disabled means untouched: an undated legacy entry is not stamped either.
+        legacy = self._claim()
+        assert handoff._expire_stale_claims([legacy], now=self.T0, ttl_hours=float(ttl)) == ([legacy], [])
+        assert legacy.date == ""
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("inf", 0.0), ("1e12", 0.0), ("-1", 0.0), ("0", 0.0),   # "never expire", without a crash
+        ("nan", handoff.DEFAULT_CLAIM_TTL_HOURS), ("6", 6.0),
+    ])
+    def test_the_ttl_read_cannot_crash_the_build(self, monkeypatch, raw, expected):
+        """timedelta raises on inf, nan and huge hours; inf is the obvious way to
+        write "keep claims forever"."""
+        monkeypatch.setenv(handoff.CLAIM_TTL_ENV, raw)
+        assert handoff.claim_ttl_hours() == expected
+        handoff._expire_stale_claims([self._claim(self.T0.isoformat())], now=self.T0,
+                                     ttl_hours=handoff.claim_ttl_hours())
+
+    def test_a_person_claim_is_not_absorbed_by_the_agents(self):
+        """The ledger's writeback claim used to win the tie and keep source
+        `writeback`, so the person's JOB_LOG claim expired with it."""
+        agent = self._claim(self.T0.isoformat())
+        log = "## Claimed\n- **Acme — AI Engineer**\n"
+        (t,) = handoff.reconcile(log, [agent])
+        assert t.source != "writeback"
+        kept, expired = handoff._expire_stale_claims([t], now=self.T0 + timedelta(days=3), ttl_hours=12)
+        assert kept == [t] and expired == []
+
+    def test_the_agent_is_told_to_check_before_reapplying(self):
+        """A session can submit and crash before writing `applied`; the role then
+        comes back fresh, so every surface that explains expiry says to check."""
+        for text in (handoff.render_handoff_readme(), handoff._WRITEBACK_FOLD_NOTE):
+            assert "check the site's own list of your applications" in text
+
+    def test_ttl_comes_from_the_env(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv(handoff.CLAIM_TTL_ENV, "0.5")
+        folded = self.T0 + timedelta(hours=1)
+        run, _ = self._claimed_at(tmp_path, folded)
+        assert run(folded + timedelta(minutes=29)) == ["Curri"]
+        assert run(folded + timedelta(minutes=30)) == ["Curri", "Acme"]
+        assert "whose claim went stale (>0.5h; each returns on its site's next build): Acme - AI Engineer" in capsys.readouterr().out
+
+    def test_a_skip_outranks_a_claim_from_any_source(self):
+        """By precedence alone, so it holds for a JOB_LOG skip as much as for the
+        agent's own writeback: the claim expires, the skip does not."""
+        claim = self._claim("2026-11-01T09:00:00+00:00")
+        (t,) = handoff.reconcile("", [claim], writeback=[self._claim(status="skipped")])
+        assert t.status == "skipped"
+        log = "## Skipped\n- **Acme — AI Engineer** not a fit\n"
+        (t,) = handoff.reconcile(log, [], writeback=[claim])
+        assert t.status == "skipped"
+        # A claim over a claim is kept, with its date: that is the first-seen clock.
+        again = self._claim("2026-11-01T15:00:00+00:00")
+        assert handoff._supersede_ready([claim], [again]) == [claim]
+        (t,) = handoff.reconcile("", [claim], writeback=[again])
+        assert t.date == "2026-11-01T09:00:00+00:00"
+
+    @pytest.mark.parametrize("queue_kind", ["export", "tracker"])
+    def test_skip_appended_after_a_folded_claim_retires_the_role(self, tmp_path, queue_kind):
+        # A rebuild folds Acme's claim mid-session (the row leaves the file), and
+        # the agent then appends the per-role prompt's fallback row with its
+        # skip. Were claimed to outrank skipped, the claim would keep the
+        # ledger, and once it expired the export path (whose queue row stays
+        # Evaluated) would re-offer a role the person had skipped.
+        folded = self.T0 + timedelta(hours=1)
+        run, out = self._claimed_at(tmp_path, folded, queue_kind)
+        self._append(out, "skip:not for me")
+        assert run(folded + timedelta(hours=1)) == ["Curri"]
+        acme = self._ledger(out)[self.ACME]
+        assert acme.status == "skipped" and acme.reason == "not for me"
+        assert run(folded + timedelta(days=2)) == ["Curri"]                 # never re-offered
+
+
 class TestPolicyText:
     """Every agent-facing surface states the policy: README section + legend,
     work-order header, kickoff prompt, per-role prompt (whose first line and
@@ -2333,6 +2632,30 @@ class TestEnvExampleSubmitPolicy:
         assert found == handoff.SUBMIT_POLICIES
         assert list(found) == list(handoff.SUBMIT_POLICIES)            # same order
         assert assign.split("=", 1)[1].strip() == handoff.DEFAULT_SUBMIT_POLICY
+
+
+class TestClaimTtlMirrors:
+    """The claim TTL's default is restated for humans in `.env.example` (as the
+    commented `# HANDOFF_CLAIM_TTL_HOURS=<default>` line in the handoff block)
+    and in README/QUICKSTART's status paragraph; the module constant is the
+    source, so each restatement is held to it."""
+
+    def test_env_example_line_equals_the_module_default(self):
+        text = (handoff.ROOT / ".env.example").read_text(encoding="utf-8")
+        start = text.index("# ── Browser-agent handoff")
+        block = text[start:text.index("\n# ── ", start + 1)]
+        found = re.findall(rf"^# {handoff.CLAIM_TTL_ENV}=(.*)$", block, re.M)
+        assert len(found) == 1, f"one commented {handoff.CLAIM_TTL_ENV} line in the handoff block"
+        assert float(found[0]) == handoff.DEFAULT_CLAIM_TTL_HOURS
+        # ...and nowhere else, so a second, stale copy cannot hide outside it.
+        assert len(re.findall(rf"^#?\s*{handoff.CLAIM_TTL_ENV}=", text, re.M)) == 1
+
+    @pytest.mark.parametrize("doc", ["README.md", "QUICKSTART.md"])
+    def test_docs_state_the_module_default(self, doc):
+        text = (handoff.ROOT / doc).read_text(encoding="utf-8")
+        paras = [p for p in text.split("\n\n") if handoff.CLAIM_TTL_ENV in p]
+        assert len(paras) == 1, f"{doc}: one paragraph names {handoff.CLAIM_TTL_ENV}"
+        assert f"{handoff.DEFAULT_CLAIM_TTL_HOURS:g} hours" in " ".join(paras[0].split())
 
 
 # ── Out of area (#180) ───────────────────────────────────────────────────────

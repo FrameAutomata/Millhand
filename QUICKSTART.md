@@ -281,8 +281,9 @@ that:
 The other statuses the agent writes back are `claimed` (in progress), `handoff`
 (blocked on something only you can do — a login, a CAPTCHA, a verification code)
 and `skip:<reason>`. Anything recorded is remembered across every board, so a role
-you applied to on LinkedIn never comes back on Indeed — `ready-to-submit` is the
-one deliberate exception.
+you applied to on LinkedIn never comes back on Indeed — except `ready-to-submit`,
+and a `claimed` row nothing else replaced: that is forgotten after 12 hours
+(`HANDOFF_CLAIM_TTL_HOURS`), so the roles of a session that crashed come back.
 
 ### Choosing an agent CLI
 

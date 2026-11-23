@@ -24,7 +24,9 @@ Two moving parts:
    One tracked status is NOT subtracted: ``ready-to-submit`` (the form is filled
    and the agent stopped before Submit, per the submit policy) comes back at the
    TOP of its site's session, status pre-filled, until the person records
-   ``applied`` — see build_work_order and SUBMIT_POLICIES.
+   ``applied`` — see build_work_order and SUBMIT_POLICIES. And a ``claimed``
+   entry is forgotten once it goes stale (HANDOFF_CLAIM_TTL_HOURS), so a
+   crashed session's roles come back as fresh rows — see _expire_stale_claims.
 
 `reconcile()` builds (1) from JOB_LOG.md; `build_sessions()` builds (2) (over
 `build_work_order()`, which produces the single deduped/ranked list). `run()`
@@ -36,9 +38,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 from dataclasses import asdict, dataclass
+from datetime import date as _date, datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -102,8 +106,10 @@ def _work_order_jsonls(out_dir, *, include_legacy: bool = True) -> list[Path]:
 # Statuses a role can carry in the tracker. Any role present in the tracker is
 # "touched" and excluded from the work-order — except READY_STATUS, which is
 # re-emitted at the top until the person records `applied` (build_work_order).
-# Precedence resolves conflicts when the same role is seen from multiple sources
-# (e.g. parsed as a prose skip AND present in the Applied table → applied wins).
+# (A stale `claimed` is not excluded because it is not present: run() prunes it
+# from the tracker first — CLAIM_TTL_ENV.) Precedence resolves conflicts when the
+# same role is seen from multiple sources (e.g. parsed as a prose skip AND
+# present in the Applied table → applied wins).
 # Pinned by tests/test_handoff.py::TestStatusPrecedence — renumbering is a
 # behaviour change for every merge, not a cosmetic one.
 READY_STATUS = "ready-to-submit"   # form filled + reviewed, stopped before Submit
@@ -112,13 +118,47 @@ STATUS_PRECEDENCE: dict[str, int] = {
     "handoff": 5,      # blocked on something only the person can do (login, CAPTCHA, code)
     READY_STATUS: 4,   # awaiting the person's click on Submit — outranks an in-progress claim
     "drafted": 3,      # written but not sent (e.g. a Work-at-a-Startup note left for review)
-    "claimed": 2,      # in progress this session
-    "skipped": 1,      # evaluated and passed on
+    "skipped": 2,      # evaluated and passed on
+    "claimed": 1,      # in progress this session — lowest because it EXPIRES (#178)
 }
+# A status that can expire ranks below every status that cannot. A claim that
+# outranked a skip took the skip with it when it expired: the agent claims a
+# role, the person's JOB_LOG records it skipped, and a day later the role was
+# re-offered — then hidden again when the log was re-read.
 # Writeback spellings accepted for a status that is rendered under another name.
 # `ready` is the short form a person types by hand; the canonical token is the
 # one WRITEBACK_STATUSES renders, so the two never coexist in the tracker.
 _STATUS_ALIASES: dict[str, str] = {"ready": READY_STATUS}
+
+# A claim EXPIRES (#178). `claimed` is written BEFORE the work — an intention,
+# not an outcome — so a crashed, timed-out or Ctrl-C'd session leaves its
+# claims behind, and a permanent claim subtracted the session's first (best-
+# scoring) roles from every future work-order with nothing saying so. A claim
+# that nothing has replaced is therefore forgotten once it is this many hours
+# old (_expire_stale_claims), and its role comes back as an ordinary fresh row.
+# The clock is when the claim was written (load_writeback), so a claim a session
+# is still working is never re-handed while it is fresh — re-handing a live role
+# risks a duplicate application, a worse failure than a crashed one returning a
+# few hours late. 12h is longer than any plausible session and short enough
+# that a crashed role is back the next morning. Non-positive disables expiry.
+# Which claims age, and which stay, is _expire_stale_claims' docstring.
+CLAIM_TTL_ENV = "HANDOFF_CLAIM_TTL_HOURS"
+DEFAULT_CLAIM_TTL_HOURS = 12.0
+_CLAIM_TTL_MAX_HOURS = 1e6   # ~114 years: past this a timedelta overflows, so it means "never"
+
+
+def claim_ttl_hours() -> float:
+    """HANDOFF_CLAIM_TTL_HOURS as a number expiry can use. Non-positive, `inf`
+    or anything past _CLAIM_TTL_MAX_HOURS disables expiry (0.0) — `inf` is the
+    obvious spelling of "keep claims forever", and timedelta raises on it; `nan`
+    warns and falls back to the default. env_float promises not to crash, and a
+    TTL that crashed the handoff build would break that promise one call later."""
+    ttl = env_float(CLAIM_TTL_ENV, DEFAULT_CLAIM_TTL_HOURS)
+    if math.isnan(ttl):
+        print(f"[handoff] {CLAIM_TTL_ENV}={os.environ.get(CLAIM_TTL_ENV)!r} is not a number of "
+              f"hours — using {DEFAULT_CLAIM_TTL_HOURS:g}")
+        return DEFAULT_CLAIM_TTL_HOURS
+    return 0.0 if ttl <= 0 or ttl > _CLAIM_TTL_MAX_HOURS else ttl
 
 # ── Submit policy ──────────────────────────────────────────────────────────────
 # What the browser agent does at the Submit button. The DEFAULT is the safe one:
@@ -754,9 +794,60 @@ def write_tracker(path: Path, roles: list[TrackedRole]) -> None:
     atomic_write_text(path, "\n".join(lines) + ("\n" if lines else ""))
 
 
-def load_writeback(work_order_jsonl: Path) -> list[TrackedRole]:
+def _as_utc(dt: datetime) -> datetime:
+    """A naive datetime read as UTC; an aware one unchanged."""
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _utc_now(now: datetime | None = None) -> datetime:
+    """`now` as an aware UTC datetime (the real clock when None) — the one clock
+    a run stamps claims with and ages them against."""
+    return _as_utc(now or datetime.now(timezone.utc))
+
+
+def _claim_date(stamp: datetime) -> str:
+    """The form a claim's TTL clock is stored in, and read back by _claim_stamp."""
+    return stamp.isoformat(timespec="seconds")
+
+
+def _claim_stamp(value: str) -> datetime | None:
+    """The full timestamp a claim's `date` carries, or None when it carries
+    nothing that can age. Anything unparseable is None — bridge._expired's
+    "unparseable stays permanent" reading — and so, deliberately UNLIKE
+    bridge._expired (which does age a bare date), is a date with no time of
+    day: that is what a JOB_LOG `## Claimed` line yields, and merge_tracked
+    can backfill it onto an undated writeback claim of the same role. The
+    date is tried first because datetime.fromisoformat reads a bare date as
+    midnight, which would age exactly those claims."""
+    value = value.strip()
+    try:
+        _date.fromisoformat(value)
+        return None
+    except ValueError:
+        pass
+    try:
+        stamp = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return _as_utc(stamp)
+
+
+def load_writeback(work_order_jsonl: Path, *, now: datetime | None = None) -> list[TrackedRole]:
     """Read agent-written statuses back out of a completed next-roles.jsonl,
-    so the next reconcile folds them into the tracker."""
+    so the next reconcile folds them into the tracker. A `claimed` row is
+    stamped with the file's last write, or `now` if that is later: the agent
+    writes the status by hand and never a time, and the file's mtime is the
+    agent's last write to its own session, so it is never earlier than the
+    claim. Stamping at the first READ instead made the TTL depend on how often
+    `--handoff` runs: with daily runs, a claim written just after one build was
+    first read a day later and hidden for two. merge_tracked keeps the
+    first-seen date on every later fold (CLAIM_TTL_ENV)."""
+    now = _utc_now(now)
+    try:
+        written = datetime.fromtimestamp(Path(work_order_jsonl).stat().st_mtime, timezone.utc)
+    except OSError:
+        written = now
+    claimed_at = _claim_date(min(written, now))
     out: list[TrackedRole] = []
     for o in _iter_jsonl(work_order_jsonl):
         raw_status = str(o.get("status") or "").strip()
@@ -780,16 +871,17 @@ def load_writeback(work_order_jsonl: Path) -> list[TrackedRole]:
             key=role_key(company, role), company=company, role=role,
             status=status, board=board_of(url), url=url,
             reason=_clean_reason(reason), source="writeback",
+            date=claimed_at if status == "claimed" else "",
         ))
     return out
 
 
-def load_all_writeback(out_dir) -> list[TrackedRole]:
+def load_all_writeback(out_dir, *, now: datetime | None = None) -> list[TrackedRole]:
     """Harvest agent-written statuses from EVERY work-order file in out_dir: each
     per-site next-roles-<board>.jsonl plus the legacy combined next-roles.jsonl
     (an agent may still be finishing one written before the per-site upgrade).
     Deduped by key via merge_tracked."""
-    groups = [load_writeback(p) for p in _work_order_jsonls(out_dir)]
+    groups = [load_writeback(p, now=now) for p in _work_order_jsonls(out_dir)]
     return merge_tracked(*groups) if groups else []
 
 
@@ -840,8 +932,11 @@ def drop_late_writeback(items: list[WorkOrderItem], out_dir: Path, *,
 def merge_tracked(*groups: list[TrackedRole]) -> list[TrackedRole]:
     """Merge tracked-role lists, deduping by key. On a key collision the
     highest-STATUS_PRECEDENCE status wins (applied > handoff > ready-to-submit >
-    drafted > claimed > skipped); on a tie the earlier entry wins but empty
-    detail fields are backfilled from the later one."""
+    drafted > skipped > claimed); on a tie the earlier entry wins but empty
+    detail fields are backfilled from the later one — except that the person's
+    own claim (a JOB_LOG `## Claimed` entry) wins a tie with the agent's, since
+    only the agent's claims expire (#178) and an absorbed person's claim would
+    expire with it."""
     by_key: dict[str, TrackedRole] = {}
     for group in groups:
         for t in group:
@@ -849,7 +944,9 @@ def merge_tracked(*groups: list[TrackedRole]) -> list[TrackedRole]:
             if cur is None:
                 by_key[t.key] = t
                 continue
-            if STATUS_PRECEDENCE.get(t.status, 0) > STATUS_PRECEDENCE.get(cur.status, 0):
+            person_over_agent = (t.status == cur.status == "claimed"
+                                 and cur.source == "writeback" and t.source not in ("writeback", ""))
+            if STATUS_PRECEDENCE.get(t.status, 0) > STATUS_PRECEDENCE.get(cur.status, 0) or person_over_agent:
                 winner, loser = t, cur
             else:
                 winner, loser = cur, t
@@ -863,7 +960,7 @@ def merge_tracked(*groups: list[TrackedRole]) -> list[TrackedRole]:
 def _supersede_ready(tracker: list[TrackedRole], newer: list[TrackedRole]) -> list[TrackedRole]:
     """Drop from `tracker` every READY_STATUS entry whose key `newer` carries
     under a DIFFERENT status. merge_tracked resolves a collision by precedence,
-    and ready-to-submit (4) outranks skipped (1), claimed (2) and drafted (3) —
+    and ready-to-submit (4) outranks drafted (3), skipped (2) and claimed (1) —
     right when both are fresh reports, wrong when the ready entry is the
     previous run's ledger and the other is what the person just typed over the
     pre-fill. A status recorded on a re-emitted row is by construction newer
@@ -874,9 +971,45 @@ def _supersede_ready(tracker: list[TrackedRole], newer: list[TrackedRole]) -> li
     exists to prevent, reached from the precedence side. `applied`/`handoff`
     already outrank READY_STATUS, so for them this is a no-op. Only READY_STATUS
     entries are dropped: every other tracked status is terminal or in-progress
-    and never re-emitted, so nothing else can be typed over."""
+    and never re-emitted, so nothing else can be typed over — and a claim needs
+    no such rule, since it ranks below everything (STATUS_PRECEDENCE)."""
     moved = {t.key for t in newer if t.status != READY_STATUS}
     return [t for t in tracker if not (t.status == READY_STATUS and t.key in moved)]
+
+
+def _expire_stale_claims(tracked: list[TrackedRole], *, now: datetime,
+                         ttl_hours: float) -> tuple[list[TrackedRole], list[TrackedRole]]:
+    """Split `tracked` into (kept, expired): a `claimed` entry from the agent's
+    writeback whose stamp is at least `ttl_hours` old is expired, so the run
+    that calls this re-offers its role as a fresh row (#178; see CLAIM_TTL_ENV).
+    run() PRUNES the expired ones from the ledger rather than skipping them at
+    build time, and that is load-bearing: merge_tracked keeps the first-seen
+    date on a claimed-over-claimed tie, so a stale claim left in the ledger
+    would hand a live re-claim its old timestamp and re-offer the role while
+    a session was working it.
+
+    Only `claimed` from source `writeback` is touched — never `handoff` (a
+    signal aimed at the person) and never a JOB_LOG claim, which is re-parsed
+    every run, so expiring it could only make it flicker. Of those: an undated
+    entry (a ledger written before claims were stamped) is stamped `now` in
+    place, which starts its clock; a date-only or unparseable date stays
+    permanent (_claim_stamp), the stricter reading. Non-positive `ttl_hours`
+    disables expiry and touches nothing (CLAIM_TTL_ENV for the why)."""
+    if ttl_hours <= 0:
+        return tracked, []
+    kept: list[TrackedRole] = []
+    expired: list[TrackedRole] = []
+    for t in tracked:
+        if t.status == "claimed" and t.source == "writeback":
+            if not t.date.strip():
+                t.date = _claim_date(now)
+            else:
+                stamp = _claim_stamp(t.date)
+                if stamp is not None and now - stamp >= timedelta(hours=ttl_hours):
+                    expired.append(t)
+                    continue
+        kept.append(t)
+    return kept, expired
 
 
 def reconcile(
@@ -888,7 +1021,8 @@ def reconcile(
     """Fold JOB_LOG.md + any agent writeback into the existing tracker. A
     ready-to-submit entry in `existing` that the writeback moved on (skip,
     claimed, drafted — not just the higher-ranked applied/handoff) is dropped
-    first, since the writeback overwrote the pre-fill (_supersede_ready)."""
+    first, since the writeback overwrote the pre-fill (_supersede_ready). Stale claims are run()'s to expire, after this
+    (_expire_stale_claims)."""
     parsed = parse_job_log(job_log_text, known_companies=known_companies)
     writeback = writeback or []
     return merge_tracked(_supersede_ready(existing, writeback), parsed, writeback)
@@ -1190,7 +1324,8 @@ def render_work_order_jsonl(items: list[WorkOrderItem]) -> str:
 # and in STATUS_PRECEDENCE/load_writeback is the whole change — plus _TRACKER_STATUS
 # if the new status is a terminal outcome that should surface in applications.md.
 WRITEBACK_STATUSES = (
-    ("claimed", "you are working on it now (claim-before-apply when sessions run in parallel)"),
+    ("claimed", "you are working on it now (claim-before-apply when sessions run in parallel), "
+                "not an outcome: overwrite it with one when you finish"),
     (READY_STATUS, "form filled and reviewed, stopped before Submit — the person clicks Submit, "
                    "then sets `applied`"),
     ("applied", "submitted successfully"),
@@ -1209,12 +1344,22 @@ def _status_legend_md() -> list[str]:
 # so the load-bearing "we fold your statuses back" guarantee can't drift. Kept
 # general (role-status.jsonl dedups ALL statuses); the applications.md reflection
 # is a partial, separate mechanism (applied/skip only) and isn't claimed here.
-# The one exception is stated with it: a ready-to-submit row is folded too, but
-# it is re-emitted at the top until the person records applied.
+# The two exceptions are stated with it: a ready-to-submit row is folded too, but
+# it is re-emitted at the top until the person records applied; and a claim
+# nothing replaced expires (CLAIM_TTL_ENV), so its role comes back fresh. The
+# number is the default, not the env's value: a constant can't resolve the env,
+# and the env name beside it says where a different number would come from.
+_CLAIM_EXPIRY_NOTE = (
+    f"a claim nothing replaces is forgotten after {DEFAULT_CLAIM_TTL_HOURS:g} hours "
+    f"by default ({CLAIM_TTL_ENV}), and its role comes back as a fresh row — the "
+    "session that claimed it may have submitted before it stopped, so check the "
+    "site's own list of your applications before applying to a role that came back"
+)
 _WRITEBACK_FOLD_NOTE = (
     "The next pipeline run folds these statuses into the tracker, so recorded roles "
     f"never reappear — except `{READY_STATUS}`, which comes back at the top until the "
-    "candidate clicks Submit and `applied` is recorded."
+    "candidate clicks Submit and `applied` is recorded. `claimed` is the other "
+    f"exception: {_CLAIM_EXPIRY_NOTE}."
 )
 
 # The instruction beside every re-emitted ready-to-submit row, addressed to the
@@ -1801,7 +1946,7 @@ def _writeback_contract(work_order: Path) -> str:
         f"field: {statuses}. The pipeline folds these statuses into its tracker "
         f"on the next run, so recorded roles never reappear — except \"{READY_STATUS}\", "
         "which comes back at the top until the candidate clicks Submit and \"applied\" "
-        "is recorded."
+        f"is recorded. \"claimed\" is the other exception: {_CLAIM_EXPIRY_NOTE}."
     )
 
 
@@ -1993,11 +2138,14 @@ def run(
     tailor_min_score: float | None = None,
     career_ops: Path | None = None,
     workers: int | None = None,
+    now: datetime | None = None,
 ) -> int:
     """Reconcile then build: read queue + JOB_LOG + tracker, write the updated
     tracker and the work-order (jsonl + md). Re-runnable; idempotent given the
     same inputs. This is the programmatic entry point orchestrate calls; main()
-    is its argparse wrapper."""
+    is its argparse wrapper. `now` is the run's one clock — the time claims are
+    stamped with and aged against (_expire_stale_claims); tests pass it."""
+    now = _utc_now(now)
     queue_path = Path(queue_path) if queue_path else ROOT / "output" / "evaluated-roles-by-score.jsonl"
     out_dir = Path(out_dir) if out_dir else default_out_dir()
     try:
@@ -2059,10 +2207,19 @@ def run(
     # Fold in any statuses the agent wrote into the previous work-order(s) — one
     # per site now, plus a legacy combined file if one predates the upgrade —
     # before we overwrite them.
-    writeback = load_all_writeback(out_dir)
+    writeback = load_all_writeback(out_dir, now=now)
     known = {norm_company(q.company) for q in queue if q.company}
 
     tracked = reconcile(job_log_text, existing, writeback=writeback, known_companies=known)
+    # #178: expire stale claims before the write (_expire_stale_claims), and
+    # name them, because a role silently missing from every work-order is how
+    # this was found.
+    ttl = claim_ttl_hours()
+    tracked, stale = _expire_stale_claims(tracked, now=now, ttl_hours=ttl)
+    if stale:
+        names = ", ".join(f"{t.company} - {t.role}" for t in sorted(stale, key=lambda t: t.key))
+        print(f"[handoff] re-offered {len(stale)} role(s) whose claim went stale "
+              f"(>{ttl:g}h; each returns on its site's next build): {names}")
     write_tracker(tracker_path, tracked)
 
     # One session per site the scraper searches from (ranked + limited within
@@ -2095,7 +2252,14 @@ def run(
     # fold the statuses into the tracker rather than clobbering (double-apply
     # risk). One read of every per-site file (+ the legacy one), shared across
     # sessions (load_all_writeback is directory-wide, not per-session).
-    late = load_all_writeback(out_dir)
+    # A claim pruned above is still on disk until its file is rewritten; read
+    # back here it would drop the row this run just re-offered and re-enter the
+    # ledger with a new clock. Drop exactly what the first pass pruned, rather
+    # than re-judging it: the first pass aged it by the ledger's first-seen
+    # stamp, which this read cannot see.
+    pruned = {t.key for t in stale}
+    late = [t for t in load_all_writeback(out_dir, now=now)
+            if not (t.status == "claimed" and t.key in pruned)]
     for b in list(sessions):
         sessions[b], _ = drop_late_writeback(sessions[b], out_dir, late=late)
     if late:
