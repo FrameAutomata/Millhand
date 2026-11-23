@@ -1,6 +1,7 @@
 """Shared fixtures for Millhand tests."""
 
 import json
+import os
 import sys
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -11,6 +12,68 @@ from pipeline import gemini_limits as gemini_limits_mod
 from pipeline import scrape as scrape_mod
 from pipeline import filter as filter_mod
 from pipeline import bridge as bridge_mod
+
+
+# The contract gate's switch (#192). These two modules drive the REAL career-ops
+# (merge-tracker.mjs, batch-runner.sh), and they skip wherever no checkout is
+# installed. That is every Tests run, and it is the right behaviour for a PR
+# gate. For the contract gate (.github/workflows/career-ops-contract.yml) it is
+# the wrong one: a run whose checkout or `npm install` the modules cannot find
+# would skip every test and still come back green, which certifies a bump nobody
+# tested. So while this variable is set (to anything but "", "0" or a spelling of
+# off), ANY skip in these modules is reported as a failure that carries the skip's
+# own reason. That covers the module-level `pytestmark`, a class or per-test mark,
+# a `pytest.skip()` in a body or a fixture, a module-level `importorskip`, and an
+# xfail. Every layer, on purpose, rather than
+# the one mark that exists today: a contract test added later with a skip of its
+# own would otherwise pass the gate by not running. Unset, nothing changes. The
+# gate sets it by this name, and tests/test_contract_gate.py holds it to that.
+REQUIRE_CONTRACT_ENV = "MILLHAND_REQUIRE_CONTRACT"
+CONTRACT_MODULES = ("test_merge_tracker_contract.py", "test_batch_runner_contract.py")
+
+
+def contract_required() -> bool:
+    # Off spelled any of the usual ways, since `=false` meaning ON is the
+    # quoted-"false"-is-truthy trap the repo reads tolerantly everywhere else.
+    value = os.environ.get(REQUIRE_CONTRACT_ENV, "").strip().lower()
+    return value not in ("", "0", "false", "no", "off")
+
+
+def _fail_a_contract_skip(report, path) -> None:
+    """Rewrite a skipped (or xfailed) `report` from a contract module as a failure,
+    when the gate's switch is set. Leaves every other report alone."""
+    if not (report.skipped and path.name in CONTRACT_MODULES and contract_required()):
+        return
+    longrepr = report.longrepr
+    if hasattr(report, "wasxfail"):
+        # The xfail's own traceback is the evidence, so it is kept beneath the
+        # reason; the attribute goes, or the terminal still reports "xfailed".
+        why = f"xfail: {report.wasxfail}\n{longrepr}"
+        del report.wasxfail
+    else:
+        why = longrepr[2] if isinstance(longrepr, tuple) else str(longrepr)   # (path, lineno, "Skipped: …")
+    report.outcome = "failed"
+    report.longrepr = (f"{REQUIRE_CONTRACT_ENV} is set, so a skip in a career-ops "
+                       f"contract module is a failure: {why}")
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_makereport(item, call):
+    # tryfirst keeps this wrapper the outermost one, so it sees the report after
+    # the skipping plugin has turned a failure under xfail into a skip.
+    report = yield
+    _fail_a_contract_skip(report, item.path)
+    return report
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_make_collect_report(collector):
+    # A skip raised at import (`importorskip`, or `pytest.skip(...,
+    # allow_module_level=True)`) skips the whole module during collection, and
+    # no test report is ever made for it.
+    report = yield
+    _fail_a_contract_skip(report, collector.path)
+    return report
 
 
 @pytest.fixture(autouse=True)

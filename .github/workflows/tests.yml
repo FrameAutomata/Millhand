@@ -3,9 +3,24 @@ name: Tests
 on:
   pull_request:
     branches: ["**"]
+  # main itself, so a merge leaves a green (or red) commit behind it, and a
+  # caller: the release workflow (later) runs this on the SHA it is about to
+  # tag. Both are template-only; see the job's `if:`.
+  push:
+    branches: [main]
+  workflow_call:
 
 jobs:
   test:
+    # A pull request runs this anywhere, as it always has. A push or a call runs
+    # it only in the template. This file ships in every person's copy, and under
+    # the roadmap's committed state (#211) a copy's daily commits to that copy's
+    # main on every run, so an unguarded push trigger would bill a Windows +
+    # Linux test run against the account's 2,000 free minutes every day, in
+    # every copy, to re-test code the copy did not change. A skipped job bills
+    # nothing.
+    # tests/test_contract_gate.py holds this condition.
+    if: github.event_name == 'pull_request' || github.repository == 'FrameAutomata/Millhand'
     name: "py${{ matrix.python-version }} / ${{ matrix.os }}"
     runs-on: ${{ matrix.os }}
     # Bounded so a hang bills 30 minutes, not GitHub's 360-minute default, against

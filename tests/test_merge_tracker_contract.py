@@ -17,8 +17,9 @@ So this drives the real one, the way `tests/test_app_onboard.py` drives the real
 `setup-profile.mjs` and `tests/test_jobspy_contract.py` reads the installed
 library.
 
-Local-only, on the same terms as that round-trip: career-ops is cloned by setup
-and `npm install`ed, neither of which CI does. Read-only with respect to the
+It needs a career-ops checkout with its npm deps, so it runs locally (setup
+clones and installs one) and in the contract gate, `career-ops-contract.yml`,
+which does both; `tests.yml` installs neither and skips it. Read-only with respect to the
 checkout — the tracker, the additions dir and batch-state all live in tmp_path
 via merge-tracker's own env overrides.
 """
@@ -91,7 +92,8 @@ _RUNNABLE = _merge_tracker_runnable()
 
 pytestmark = pytest.mark.skipif(
     not _RUNNABLE,
-    reason="needs a career-ops checkout with npm deps (local install; CI does neither)")
+    reason=(f"needs node and a career-ops checkout with its npm deps at {career_ops_dir()} "
+            "(CAREER_OPS_PATH; `npm install --ignore-scripts` there)"))
 
 
 def _stage(tmp_path, tracker_text, additions, batch_state=""):

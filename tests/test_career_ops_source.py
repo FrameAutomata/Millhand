@@ -8,9 +8,10 @@ format. Both are upstream now (career-ops#738 and #3343), and the fork's runner
 had fallen strictly BEHIND upstream's — it still dropped `--model` for gemini and
 qwen — so the checkout tracks upstream and the fork is retired.
 
-Three sites fetch it, in three host languages with no shared step: setup.sh,
-setup.ps1 and the daily workflow. Nothing stops one of them drifting from the
-others — an old line pasted back from a branch that predates the move, or a pin
+Four sites fetch it, in three host languages with no shared step: setup.sh,
+setup.ps1, the daily workflow and the contract gate (#192), which runs the
+contract tests against the pin and, weekly, against the branch. Nothing stops
+one of them drifting from the others — an old line pasted back from a branch that predates the move, or a pin
 done in one site and not the others — and the drift is invisible where it lands:
 a person's setup and the cloud daily would run different runners against the same
 tracker, and the daily would say nothing. So `career-ops.ref` states the source
@@ -45,15 +46,21 @@ REF_FILE = "career-ops.ref"
 CAREER_OPS_OWNER = "career-ops-hq"
 
 WORKFLOW = ".github/workflows/daily-pipeline.yml"
+# The contract gate. It fetches the pin exactly as the daily does, because the
+# pin is what it certifies, and its weekly run clones the branch instead.
+GATE = ".github/workflows/career-ops-contract.yml"
 SETUP_SITES = ["setup.sh", "setup.ps1"]
+# Every site that fetches CAREER_OPS_COMMIT, each held to the same mechanism.
+PIN_SITES = [WORKFLOW, GATE]
 
 # Where a person or a run could pick up a career-ops URL. The docs are here
 # because a reader copies a clone URL out of README as readily as out of setup.
-SOURCE_FILES = SETUP_SITES + [WORKFLOW, REF_FILE,
-                              "README.md", "QUICKSTART.md", "CLAUDE.md"]
+SOURCE_FILES = SETUP_SITES + PIN_SITES + [REF_FILE,
+                                          "README.md", "QUICKSTART.md", "CLAUDE.md"]
 # Files known to name career-ops by URL, so the owner check below cannot pass by
-# finding nothing. Two are deliberately absent for opposite reasons: CLAUDE.md
-# may carry no URL at all, and the workflow must carry none (TestDailyFetch).
+# finding nothing. Three are deliberately absent for opposite reasons: CLAUDE.md
+# may carry no URL at all, and the two workflows must carry none
+# (TestFetchesThePin).
 FILES_WITH_A_URL = SETUP_SITES + [REF_FILE, "README.md", "QUICKSTART.md"]
 
 _CLONE_RE = re.compile(r"\bgit\s+clone\b")
@@ -253,73 +260,76 @@ class TestSetupClonesTheBranch:
             f"{name} makes a shallow clone:\n  {line}")
 
 
-class TestDailyFetchesThePin:
-    """The cloud daily, the audience that gets determinism — and the half of
-    "bumping the pin is one line" that only a guard can hold: every value in
-    these lines is a variable out of career-ops.ref, so the workflow itself
-    names no source at all."""
+@pytest.mark.parametrize("name", PIN_SITES)
+class TestFetchesThePin:
+    """The cloud daily, the audience that gets determinism, and the contract
+    gate, which certifies the commit the daily runs and so has to fetch it the
+    same way. This is the half of "bumping the pin is one line" that only a
+    guard can hold: every value in these lines is a variable out of
+    career-ops.ref, so neither workflow names a source of its own."""
 
-    def test_does_not_clone(self):
-        """`git clone --branch` takes a ref name, so a clone cannot land on the
-        pinned commit — it would be back on whatever the branch is at 12:00 UTC,
-        which is the thing this design gave up."""
-        lines = _matching_lines(_read(WORKFLOW), _CLONE_RE)
-        assert not lines, (
-            f"{WORKFLOW} clones career-ops instead of fetching the pin:\n  "
-            + "\n  ".join(lines))
-
-    def test_sources_the_ref_file(self):
-        run = [line for line in _logical_lines(_read(WORKFLOW))
+    def test_sources_the_ref_file(self, name):
+        run = [line for line in _logical_lines(_read(name))
                if not _is_comment(line)]
         # `.` or bash's `source`: the check is that the file is sourced at all,
         # and a guard that calls a working line missing is one that gets deleted
         # rather than fixed.
         assert any(re.search(rf"(?:^|\s)(?:\.|source)\s+\./{re.escape(REF_FILE)}(?!\S)", line)
                    for line in run), (
-            f"{WORKFLOW} does not source ./{REF_FILE}, so the variables its "
+            f"{name} does not source ./{REF_FILE}, so the variables its "
             "fetch expands are empty")
 
-    def _fetch_line(self) -> str:
-        lines = _matching_lines(_read(WORKFLOW), _GIT_FETCH_RE)
+    def test_refuses_an_empty_pin(self, name):
+        """`git fetch <url> ""` fetches the remote's default branch and exits
+        0, so an empty CAREER_OPS_COMMIT would run (or certify) whatever main is
+        at the time. `set -u` cannot catch it: the variable is set, just
+        empty."""
+        assert re.search(r"\$\{CAREER_OPS_COMMIT:\?", _read(name)), (
+            f"{name} does not refuse an empty pin with "
+            '`: "${CAREER_OPS_COMMIT:?…}"` before fetching it')
+
+    def _fetch_line(self, name) -> str:
+        lines = _matching_lines(_read(name), _GIT_FETCH_RE)
         assert len(lines) == 1, (
-            f"{WORKFLOW}: expected exactly one `git … fetch`, found "
+            f"{name}: expected exactly one `git … fetch`, found "
             f"{len(lines)}:\n  " + "\n  ".join(lines))
         return lines[0]
 
-    def test_fetches_the_pinned_commit_and_not_a_branch(self):
-        line = self._fetch_line()
+    def test_fetches_the_pinned_commit_and_not_a_branch(self, name):
+        line = self._fetch_line(name)
         assert re.search(r"\$\{?CAREER_OPS_COMMIT\b", line), (
-            f"{WORKFLOW} does not fetch \"$CAREER_OPS_COMMIT\":\n  {line}\n"
+            f"{name} does not fetch \"$CAREER_OPS_COMMIT\":\n  {line}\n"
             f"A branch tip, or a SHA pasted here, is a second source of truth "
             f"that {REF_FILE} cannot move.")
         assert not re.search(r"\$\{?CAREER_OPS_BRANCH\b", line), (
-            f"{WORKFLOW} fetches the branch, which is the one ref this job must "
-            f"not run: it evaluates real queues unattended.\n  {line}")
+            f"{name} fetches the branch where it fetches the pin. The daily "
+            f"must not run it, since it evaluates real queues unattended, and "
+            f"the gate's pin run would certify a commit it never tested.\n  {line}")
 
-    def test_fetch_is_shallow(self):
-        """The daily fetches on every run into a throwaway runner and only ever
-        executes the checkout, so history is minutes and bytes spent on
+    def test_fetch_is_shallow(self, name):
+        """Both fetch on every run into a throwaway runner and only ever
+        execute the checkout, so history is minutes and bytes spent on
         nothing."""
-        line = self._fetch_line()
+        line = self._fetch_line(name)
         assert re.search(r"(?<!\S)--depth(?:=|\s+)1(?!\S)", line), line
 
-    def test_checks_out_what_it_fetched(self):
+    def test_checks_out_what_it_fetched(self, name):
         """A shallow fetch of one commit leaves no branch to be on; naming
         FETCH_HEAD (or the same variable again) is what makes the checkout the
         commit that was fetched rather than whatever `git init` left behind."""
-        lines = _matching_lines(_read(WORKFLOW), _GIT_CHECKOUT_RE)
+        lines = _matching_lines(_read(name), _GIT_CHECKOUT_RE)
         assert any(re.search(r"\bFETCH_HEAD\b|\$\{?CAREER_OPS_COMMIT\b", line)
                    for line in lines), (
-            f"{WORKFLOW} does not check out the fetched commit:\n  "
+            f"{name} does not check out the fetched commit:\n  "
             + "\n  ".join(lines))
 
-    def test_names_no_source_of_its_own(self):
+    def test_names_no_source_of_its_own(self, name):
         """Comments included. A URL or a SHA in a comment is still a second copy
         that goes stale silently, and it is the paste a later edit promotes into
         the `run:` block."""
-        text = _read(WORKFLOW)
+        text = _read(name)
         assert not _OWNER_RE.findall(text), (
-            f"{WORKFLOW} names a career-ops URL; it must take it from "
+            f"{name} names a career-ops URL; it must take it from "
             f"$CAREER_OPS_URL so {REF_FILE} stays the only place to move it")
         # `uses:` excluded: pinning an ACTION by digest is GitHub's own
         # supply-chain advice, and it has nothing to do with the career-ops pin.
@@ -328,8 +338,31 @@ class TestDailyFetchesThePin:
         body = [line for line in text.splitlines()
                 if not re.match(r"\s*(?:-\s*)?uses:", line)]
         assert not _ANY_SHA_RE.findall("\n".join(body)), (
-            f"{WORKFLOW} carries a literal commit; the pin lives in {REF_FILE} "
+            f"{name} carries a literal commit; the pin lives in {REF_FILE} "
             "and bumping it must not mean editing the workflow too")
+
+
+def test_the_daily_does_not_clone():
+    """`git clone --branch` takes a ref name, so a clone cannot land on the
+    pinned commit — it would be back on whatever the branch is at 12:00 UTC,
+    which is the thing this design gave up. The daily only: the gate's weekly
+    run clones the branch on purpose (the test below)."""
+    lines = _matching_lines(_read(WORKFLOW), _CLONE_RE)
+    assert not lines, (
+        f"{WORKFLOW} clones career-ops instead of fetching the pin:\n  "
+        + "\n  ".join(lines))
+
+
+def test_the_gate_clones_the_branch_from_the_ref_file():
+    """The gate's weekly run tests the tip of CAREER_OPS_BRANCH: does upstream
+    main still honour the contract, before anyone moves the pin to it? The
+    branch comes out of career-ops.ref like everything else, so a branch
+    renamed there is the branch the gate tests."""
+    line, _ = _site_clone(GATE)
+    assert re.search(r"(?<!\S)--branch\s+\"?\$\{?CAREER_OPS_BRANCH\b", line), (
+        f"{GATE} does not clone \"$CAREER_OPS_BRANCH\":\n  {line}")
+    assert re.search(r"\$\{?CAREER_OPS_URL\b", line), (
+        f"{GATE} does not clone \"$CAREER_OPS_URL\":\n  {line}")
 
 
 @pytest.mark.parametrize("name", SOURCE_FILES)
@@ -447,7 +480,7 @@ def test_guard_catches_the_retired_clone_line():
 
 
 def test_guard_catches_a_pin_pasted_into_a_workflow():
-    """The shapes `TestDailyFetchesThePin` forbids, read the way it reads them:
+    """The shapes `TestFetchesThePin` forbids, read the way it reads them:
     an inlined SHA is a fetch that no longer names the variable AND a literal in
     the file, and a fetch of the branch is neither of those but still wrong."""
     inlined = 'git -C career-ops fetch --depth 1 "$CAREER_OPS_URL" 0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c'

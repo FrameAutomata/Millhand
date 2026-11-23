@@ -157,8 +157,11 @@ class TestCareerOpsInstallFlags:
     # each setup script that nothing executes: the retired-fork migration recipe
     # it prints for a person to paste. Scanned all the same, on purpose — a
     # pasted install is still an install, so the recipe must carry the flag too.
+    # Then the two workflows that install it: the daily, and the contract gate
+    # (#192), which runs merge-tracker.mjs under the contract tests and launches
+    # no browser either.
     EXPECTED_SITES = ["setup.sh", "setup.sh", "setup.sh", "setup.ps1", "setup.ps1",
-                      "daily-pipeline.yml"]
+                      "daily-pipeline.yml", "career-ops-contract.yml"]
 
     def _career_ops_installs(self, text):
         lines = text.splitlines()
