@@ -22,7 +22,7 @@ This repo is set up to be cloned into your own private copy. The public template
 
 GitHub creates a standalone private repo with the same files. It's *not* listed as a fork of this template, so there's no cross-reference and no fork-network visibility back to your account.
 
-> **One copy per GitHub account.** The Actions Free plan gives **2,000 Linux minutes a month per account** for private repositories — per *account*, not per repository. A daily run of this pipeline is long enough (see [Running it for free](#running-it-for-free)) that two copies under the same account will run out of minutes before the month does, and GitHub then stops creating workflow runs at all. If two people want their own searches, put the second copy under a second account. The digest that arrives after each run tells you what the month is costing at the current pace.
+> **Watch the Actions budget — it is per account, not per repository.** The Actions Free plan gives **2,000 Linux minutes a month** for private repositories, shared by everything private under your account, so every copy of this template you make there draws on the same pool; when it runs out, GitHub stops creating workflow runs at all. What a copy spends depends on the model its evaluations are paced to and on how many roles it evaluates, so it is a number to check, not a fixed count of copies: the digest after each run quotes that copy's minutes and monthly projection, and with more than one copy under the account you add their projections together. The measured figures are in [Running it for free](#running-it-for-free).
 
 ### Configure your private copy
 
@@ -493,10 +493,16 @@ for applying. Each of those has a ceiling, and the ones that bite are these:
   evaluations a day**, ten times what a daily scrape produces. That is not the
   constraint.
 - **Actions minutes are.** The Free plan gives **2,000 Linux minutes a month per
-  account**, and staying inside Gemini's free-tier token budget means pacing:
-  160–190 evaluations take **95–115 minutes** of runner time, so a daily at that
-  length is around 3,000 minutes a month and doesn't fit. Two copies under one
-  account certainly don't.
+  account**, shared by every private copy under it, and what makes a run long is
+  pacing to Gemini's free tier — so a copy's cost is its model's pace times its
+  volume. On the recommended model the token budget allows about 1.7 evaluations
+  a minute: 160–190 evaluations take **95–115 minutes** of runner time, around
+  3,000 minutes a month, which doesn't fit even alone. `gemini-3.5-flash-lite` is
+  paced by its 15 requests a minute instead: two copies measured over a month at
+  64–110 evaluations a run took about 10 minutes a run on average (7–8 at the
+  median), about **345 billed minutes a month each** once GitHub's per-job
+  rounding and the maintenance workflows are counted — both together about a
+  third of the budget. Count minutes, not copies.
 - **The fix is your own numbers.** The built-in rate-limit table is a hand-copied
   snapshot of the free tier and is only the fallback. Put your project's real
   limits from [aistudio.google.com/rate-limit](https://aistudio.google.com/rate-limit)
@@ -505,8 +511,11 @@ for applying. Each of those has a ceiling, and the ones that bite are these:
   Failing that, shrink the run: fewer search passes, a smaller `results_wanted`, a
   higher `min_score`. `python -m pipeline.gemini_limits --show` prints what's in
   effect and which limit is binding.
-- **The digest does the arithmetic for you**, quoting each run's minutes and the
-  monthly projection at that pace, and warning inside the last 10%.
+- **The digest does the arithmetic for one copy**, quoting each run's minutes and
+  the monthly projection at that pace, and warning inside the last 10%. It can't
+  see the account's other copies, so with more than one, add their projections
+  together — and leave a little room for the maintenance workflows, which the
+  projection leaves out (12–15 minutes a month per copy in that measurement).
 
 **What paying buys**, in the order it's worth buying: a paid evaluation key removes
 the pacing, and with it most of the minutes problem; paid Actions minutes (or a

@@ -134,7 +134,8 @@ jobs:
     # the always() cache save then stores the reports beside a state that
     # marks their jobs done — the day's evaluations never reach
     # applications.md, the UI or the digest. The budget guard is the digest's
-    # health line ("≈ N min/month of 2,000"), not this clock.
+    # health line ("≈ N min/month at this pace, this copy's share of the
+    # account's 2,000"), not this clock.
     # tests/test_workflow_env.py keeps this at or under 180.
     timeout-minutes: 150
 

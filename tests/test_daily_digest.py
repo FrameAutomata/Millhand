@@ -349,14 +349,19 @@ class TestContent:
         d = _build(root, manifest, run_started_at=started)
         assert d.duration_min == 40
         assert d.monthly_estimate == 1200
-        assert "run took 40 min ≈ 1,200 min/month of 2,000 at this pace" in d.health
+        assert "run took 40 min ≈ 1,200 min/month at this pace" in d.health
+        # The scope rides on the line that always prints, not only on the warning:
+        # three copies at ~700 each are over the budget together and warn about
+        # nothing alone (#197).
+        assert "this copy's share of the account's 2,000" in d.health
         assert "WARNING" not in d.health
 
     def test_warns_above_the_budget_line(self, world):
         root, manifest = world
         d = _build(root, manifest, run_started_at=str(int(NOW.timestamp()) - 61 * 60))
         assert d.monthly_estimate == 1830
-        assert "WARNING: above 1,800" in d.health
+        assert "WARNING: above 1,800 on its own" in d.health
+        assert "a smaller search shortens a run" in d.health   # the lever, not a cap on copies
 
     def test_unparseable_start_is_no_duration(self, world):
         root, manifest = world
