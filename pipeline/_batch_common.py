@@ -2342,9 +2342,48 @@ _REDACTED_PROFILE_SECTION = "voluntary_disclosures"
 # source of truth, so an unanchored "race" eats the fact-bank bullets for "Grace
 # Health", "Terrace Senior Living" and "Traceability" — silently deleting real
 # experience from the résumé it is about to write.
-_REDACTED_LABEL_RE = re.compile(
-    r"\b(gender|race|ethnic\w*|veteran|disab\w*)", re.IGNORECASE)
-_PROFILE_BULLET_RE = re.compile(r"^\s*[-*]\s*\*\*(?P<label>[^*]+?):?\*\*")
+#
+# Testing the bold LABEL alone let a disclosure through three ways (#216): a
+# label with none of the five stems ("Self-ID", "EEO", "Pronouns", "Voluntary
+# disclosures"), the continuation and nested lines under a dropped bullet, and
+# unlabelled bullets under a disclosure heading. Which rule is safe depends on
+# WHERE a line sits, so the rule is chosen by section. In the generator's own
+# Standing answers section a whole line is scanned against every stem: it holds
+# form answers, never experience. In its evidence sections (fact bank, skills)
+# the rule stays the pre-#216 label match on the five protected stems, because
+# experience carries these words too — "VA North Texas: served 2,000 veterans",
+# an "EEO Specialist" role, an "EEO-1 reporting" skill — and a value scan there
+# is the Grace Health deletion moved from labels to values. Everywhere else (a
+# section the agent added, text before the first heading) the DISCLOSURE stems
+# also match labels and headings, and such a heading drops its section. `eeo`
+# and `pronoun` stop at a word boundary: the EEOC is an employer, and
+# "pronounced" is not a pronoun.
+STANDING_ANSWERS_HEADING = "Standing answers"   # handoff.render_profile_md writes it
+_STANDING_ANSWERS = STANDING_ANSWERS_HEADING.casefold()
+_PROTECTED_STEMS = r"gender|rac(?:e|es|ial)\b|ethnic\w*|veteran|disab\w*"
+_DISCLOSURE_STEMS = r"self[\s-]*id\w*|eeo\b|pronouns?\b|voluntary\s+disclos\w*"
+_PROTECTED_RE = re.compile(rf"\b(?:{_PROTECTED_STEMS})", re.IGNORECASE)
+_REDACTED_STEM_RE = re.compile(rf"\b(?:{_PROTECTED_STEMS}|{_DISCLOSURE_STEMS})", re.IGNORECASE)
+# The generator's evidence sections (handoff.render_profile_md writes them). The
+# disclosure stems are words a job can carry too — an "EEO Specialist" role, an
+# "EEO-1 reporting" skill — so inside these the rule stays what it was before
+# #216: the five protected stems, on a bullet's label only, and no heading ever
+# drops a section. Dropping one there deletes real experience from the résumé
+# build's only source.
+EVIDENCE_HEADINGS = ("Role fact bank", "Skills inventory")
+# Every top-level section render_profile_md writes. An evidence section ends
+# only at one of THESE: the fact bank holds a CV's experience verbatim, own
+# `## Experience` heading included, and ending the section there put a role
+# like "### EEO Specialist" under the stricter rule, which deleted it.
+PROFILE_SECTION_HEADINGS = ("Identity & contact", "Positioning", *EVIDENCE_HEADINGS,
+                            STANDING_ANSWERS_HEADING, "Tailoring rules", "How this profile grows")
+_EVIDENCE = tuple(h.casefold() for h in EVIDENCE_HEADINGS)
+_GENERATOR = tuple(h.casefold() for h in PROFILE_SECTION_HEADINGS)
+_PROFILE_BULLET_RE = re.compile(
+    r"^\s*(?:[-*+]|\d+[.)])\s*(?:\*\*|__)(?P<label>[^*_\n]+?):?(?:\*\*|__)")
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s")
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+_MD_HEADING_RE = re.compile(r" {0,3}(#{1,6})(?=\s|$)")
 
 
 def redact_profile_yml(text: str) -> str:
@@ -2362,12 +2401,81 @@ def redact_profile_yml(text: str) -> str:
     return "".join(out)
 
 
+def _indent(line: str) -> int:
+    expanded = line.expandtabs(4)
+    return len(expanded) - len(expanded.lstrip())
+
+
 def redact_profile_master(text: str) -> str:
-    """`PROFILE.md` with the protected-characteristic standing answers dropped."""
+    """`PROFILE.md` with the protected-characteristic standing answers dropped.
+
+    Inside the Standing answers section: any line carrying a stem goes, label or
+    value, bulleted or not, and so does a sub-heading's whole section. Inside the
+    evidence sections (`EVIDENCE_HEADINGS`, which end only at another generator
+    section): only a bullet whose bold label carries one of the five protected
+    stems, as before #216, and no heading drops anything. Everywhere else: a
+    bullet whose label carries any stem, and a heading carrying any stem drops
+    its whole section, as `redact_profile_yml` drops `voluntary_disclosures:`.
+    The generator's own headings are recognised before any is tested, so
+    "Standing answers (incl. EEO)" is still that section. A dropped line takes
+    its continuation: deeper-indented lines (across blank lines, as a loose list
+    nests) and an unindented lazy continuation straight after it. A `#` inside a
+    code fence is not a heading."""
     out: list[str] = []
+    drop_level = scan_level = evidence_level = None   # levels of the open sections
+    cont = None        # indent of the last dropped line, while its continuation runs
+    blank_since = False
+    fence = False
     for line in (text or "").splitlines(keepends=True):
-        m = _PROFILE_BULLET_RE.match(line)
-        if m and _REDACTED_LABEL_RE.search(m.group("label")):
+        stripped = line.strip()
+        heading = None if fence else _MD_HEADING_RE.match(line)
+        if _FENCE_RE.match(line):
+            fence = not fence
+        if heading:
+            cont = None
+            level = len(heading.group(1))
+            title = " ".join(line.split()).casefold()
+            generator = any(h in title for h in _GENERATOR)
+            if drop_level is not None and level > drop_level:
+                continue
+            drop_level = None
+            if scan_level is not None and level <= scan_level:
+                scan_level = None
+            if evidence_level is not None and level <= evidence_level and generator:
+                evidence_level = None
+            if evidence_level is not None:
+                out.append(line)
+                continue
+            if scan_level is None and _STANDING_ANSWERS in title:
+                scan_level = level
+            elif scan_level is None and any(h in title for h in _EVIDENCE):
+                evidence_level = level
+            elif (level > 1 and not (scan_level is None and generator)
+                  and _REDACTED_STEM_RE.search(line)):
+                # Never the document's title: every section sits below it, and
+                # a surname like "Disabato" would take the whole profile.
+                drop_level = level
+                continue
+            out.append(line)
+            continue
+        if drop_level is not None:
+            continue
+        if not stripped:
+            blank_since = True
+            out.append(line)
+            continue
+        if cont is not None:
+            if _indent(line) > cont or (not blank_since and not _LIST_ITEM_RE.match(line)):
+                continue
+            cont = None
+        if scan_level is not None:
+            hit = _REDACTED_STEM_RE.search(line)
+        else:
+            m = _PROFILE_BULLET_RE.match(line)
+            stems = _PROTECTED_RE if evidence_level is not None else _REDACTED_STEM_RE
+            hit = m and stems.search(m.group("label"))
+        if hit:
+            cont, blank_since = _indent(line), False
             continue
         out.append(line)
     return "".join(out)
