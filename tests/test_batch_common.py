@@ -30,6 +30,7 @@ from pipeline._batch_common import (
     _normalize_score_cell,
     _pending_additions,
     _warn_on_lost_additions,
+    assign_job_numbers,
     build_system_prompt,
     build_user_message,
     eval_system_prompt,
@@ -412,6 +413,17 @@ class TestLoadPending:
         result = load_pending(tsv, state)
         assert len(result) == 1
 
+    def test_skips_abandoned_by_default(self, tmp_path):
+        # A job that used up its allowance of failed runs (#206) stays out of
+        # the queue; only --retry-abandoned brings it back.
+        tsv = tmp_path / "batch-input.tsv"
+        self._write_tsv(tsv, [
+            {"id": "1", "url": "https://a.com", "source": "Acme", "notes": "Eng"},
+            {"id": "2", "url": "https://b.com", "source": "Globex", "notes": "Dev"},
+        ])
+        state = {"jobs": {"1": {"status": "abandoned", "attempts": 3, "error": "x"}}}
+        assert [r["id"] for r in load_pending(tsv, state)] == ["2"]
+
     def test_skips_blank_ids(self, tmp_path):
         tsv = tmp_path / "batch-input.tsv"
         with open(tsv, "w", newline="", encoding="utf-8") as f:
@@ -421,6 +433,33 @@ class TestLoadPending:
         result = load_pending(tsv, {"jobs": {}})
         assert len(result) == 1
         assert result[0]["id"] == "2"
+
+
+class TestAssignJobNumbers:
+    """The entry is rebuilt every run, so a job's failure history survives only
+    if it is carried over by name — a counter written where the job fails would
+    otherwise be wiped on the next run, and the #206 allowance never reached."""
+
+    def _rows(self):
+        return [{"id": "1", "url": "https://a.com", "source": "Acme", "notes": "Eng"},
+                {"id": "2", "url": "https://b.com", "source": "Globex", "notes": "Dev"}]
+
+    def test_carries_attempts_forward(self, tmp_path):
+        state = {"jobs": {"1": {"status": "failed", "attempts": 2, "error": "boom",
+                                "report_num": "007", "score": 1.0}}}
+        assign_job_numbers(self._rows(), state, 10, 20, tmp_path, load_jd_text=False)
+        job = state["jobs"]["1"]
+        assert job["attempts"] == 2
+        # The error is this run's to write: a failure sets it, a success has none.
+        assert "error" not in job
+        # Everything else is this run's: fresh numbers, pending, no stale score.
+        assert job["status"] == "pending" and job["report_num"] == "011"
+        assert "score" not in job
+
+    def test_a_fresh_job_has_neither(self, tmp_path):
+        state = {"jobs": {}}
+        assign_job_numbers(self._rows(), state, 0, 0, tmp_path, load_jd_text=False)
+        assert not {"attempts", "error"} & set(state["jobs"]["2"])
 
 
 class TestWriteJobResult:

@@ -141,7 +141,7 @@ def evaluate_without_a_provider(monkeypatch) -> None:
         state, state_lock = args[5], args[6]     # _process_one's positional order
         with state_lock:
             state["jobs"][meta["id"]]["status"] = "completed"
-        return True, meta["id"], None
+        return True, meta["id"], None, False   # (success, id, error, countable)
 
     monkeypatch.setattr(batch_evaluate, "_process_one", process)
 

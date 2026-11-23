@@ -113,6 +113,14 @@ class TestBatchFlagForwarding:
         assert "--skip-scrape" in _recorded(stub_root, "orch_args.txt")
         assert "--parallel" in _recorded(stub_root, "batch_args.txt")
 
+    def test_retry_abandoned_is_the_orchestrators_not_the_runners(self, stub_root):
+        """Two retry flags, two programs: --retry-failed is batch-runner's
+        (--batch), --retry-abandoned is the --evaluate-batch evaluator's (#206)."""
+        proc = _run(stub_root, "--evaluate-batch", "--retry-abandoned")
+        assert proc.returncode == 0, proc.stderr
+        assert "--retry-abandoned" in _recorded(stub_root, "orch_args.txt")
+        assert not (stub_root / "batch_args.txt").exists()
+
     def test_batch_flag_without_batch_is_an_error(self, stub_root):
         """Without --batch these reach nothing, so refuse rather than run a
         full scrape and drop them silently."""

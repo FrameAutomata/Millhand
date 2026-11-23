@@ -178,3 +178,34 @@ class TestUncleanMergeExitCode:
                                                "anthropic"))
         assert orchestrate.main() == 0
         assert stages == []
+
+
+class TestEvaluateBatchWiring:
+    """--retry-abandoned reaches the evaluator: the jobs abandoned after
+    MAX_ATTEMPTS failed runs (#206) have no other way back into the queue."""
+
+    def _run(self, quiet_pipeline, monkeypatch, *extra):
+        cfg, co = quiet_pipeline
+        calls = []
+        monkeypatch.setattr(orchestrate.batch_evaluate, "run",
+                            lambda career_ops, **kw: calls.append((career_ops, kw))
+                            or orchestrate.batch_evaluate.EvalRun(0))
+        monkeypatch.setattr(sys, "argv", _argv(cfg, "--evaluate-batch", *extra))
+        assert orchestrate.main() == 0
+        assert len(calls) == 1 and calls[0][0] == co.resolve()
+        return calls[0][1]
+
+    def test_retry_abandoned_is_forwarded(self, quiet_pipeline, monkeypatch):
+        assert self._run(quiet_pipeline, monkeypatch, "--retry-abandoned")["retry_abandoned"] is True
+
+    def test_retry_abandoned_needs_evaluate_batch(self, quiet_pipeline, monkeypatch):
+        """Without --evaluate-batch the flag would be ignored after a full run,
+        and `--batch --retry-abandoned` is the easy slip."""
+        cfg, _ = quiet_pipeline
+        monkeypatch.setattr(sys, "argv", _argv(cfg, "--retry-abandoned"))
+        with pytest.raises(SystemExit) as exc:
+            orchestrate.main()
+        assert exc.value.code == 2
+
+    def test_retry_abandoned_is_off_by_default(self, quiet_pipeline, monkeypatch):
+        assert self._run(quiet_pipeline, monkeypatch)["retry_abandoned"] is False

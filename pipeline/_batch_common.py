@@ -1265,6 +1265,14 @@ def _report_location_mark(report_text: str) -> str:
     return location_mark(parse_work_location(parse_machine_summary(report_text)))
 
 
+class IncompleteResponse(RuntimeError):
+    """A provider answered, but not with a whole evaluation — the JOB's failure,
+    not the run's — so it counts against the job's allowance of failed runs
+    (`batch_evaluate._is_countable_failure`, #206). Raised by the Claude caller
+    for a cut-off or refused answer; #204 adds the other callers and the
+    tag-completeness check."""
+
+
 def write_job_result(
     response_text: str,
     job_meta: dict,
@@ -1340,7 +1348,11 @@ def assign_job_numbers(
 
     Pre-assigns sequential report and tracker numbers to pending jobs so
     parallel workers don't conflict on numbering. Mutates `state["jobs"]` to
-    record each job's metadata (excluding jd_text to keep state small)."""
+    record each job's metadata (excluding jd_text to keep state small).
+
+    The entry is rebuilt from scratch each run, so a job's count of failed
+    runs is carried over from the previous entry, or the allowance it enforces
+    (#206) would never be reached."""
     report_counter = report_start
     tracker_counter = tracker_start
     if "jobs" not in state:
@@ -1365,6 +1377,9 @@ def assign_job_numbers(
         jobs.append(meta)
 
         state_entry = {k: v for k, v in meta.items() if k != "jd_text"}
+        prior = state["jobs"].get(jid, {})
+        if "attempts" in prior:
+            state_entry["attempts"] = prior["attempts"]
         state["jobs"][jid] = state_entry
 
     return jobs
@@ -1373,9 +1388,13 @@ def assign_job_numbers(
 def load_pending(
     batch_input: Path,
     state: dict,
-    done_statuses: frozenset = frozenset({"completed"}),
+    done_statuses: frozenset = frozenset({"completed", "abandoned"}),
 ) -> list[dict]:
-    """Return rows from batch-input.tsv whose IDs are not in done_statuses."""
+    """Return rows from batch-input.tsv whose IDs are not in done_statuses.
+
+    `abandoned` is done by default: a job that failed the countable way on
+    `batch_evaluate.MAX_ATTEMPTS` runs stays out of the queue until
+    `--retry-abandoned` puts it back (#206)."""
     already_done = {
         jid for jid, job in state.get("jobs", {}).items()
         if job.get("status") in done_statuses

@@ -52,6 +52,7 @@ from typing import Callable
 
 from pipeline._batch_common import (
     MAX_TOKENS,
+    IncompleteResponse,
     acquire_process_lock,
     assign_job_numbers,
     atomic_write_text,
@@ -274,6 +275,36 @@ def _is_transient_provider_error(exc: BaseException) -> bool:
     return any(marker in text for marker in _TRANSIENT_SERVER_MARKERS)
 
 
+# ── Per-job failure allowance (#206) ────────────────────────────────────────
+# A failed job is re-queued by the next run, which is right for a 429, a 5xx or
+# a timeout — they clear on their own. An answer the model cut off or refused
+# does not: it fails the same way on the same JD every day, and every run pays
+# the whole in-run retry allowance above for it again. So a job may fail that
+# way on MAX_ATTEMPTS runs; then it is `abandoned`, keeps its last error, and
+# stays out of the queue until --retry-abandoned. Counted in RUNS — the in-run
+# retries are one attempt — and deliberately not an env knob.
+MAX_ATTEMPTS = 3
+
+# The failures that count are exactly the IncompleteResponse a caller raises
+# when it knows why an answer ended (cut off, refused). Not the complement of
+# _is_transient_provider_error: "empty content" is transient THERE (retry once,
+# fail over to a sibling model) and stays so — IncompleteResponse keeps that
+# wording — while a bare empty answer that ended naturally (a degraded endpoint
+# answering 200 with nothing), rate limits, server errors and config errors
+# count for nothing; the last because they hit every job, and an expired key
+# must not use up the backlog's allowance. A type rather than message text, so
+# rewording an error cannot silently stop the cap from firing.
+def _is_countable_failure(exc: BaseException) -> bool:
+    """Whether a job's failure counts against its MAX_ATTEMPTS allowance. The
+    cause chain too: a failover chain whose lead was cut off and whose sibling
+    was then overloaded raises the overload, caused by the cut-off."""
+    while exc is not None:
+        if isinstance(exc, IncompleteResponse):
+            return True
+        exc = exc.__cause__
+    return False
+
+
 def _call_with_retry(
     caller: Caller,
     system: str,
@@ -363,6 +394,10 @@ _warned_efforts: set[str] = set()
 # tags would be recorded as completed and the role lost — #204's failure, here
 # caught where only the caller can see why the answer ended.
 _COMPLETE_STOPS = ("end_turn", "stop_sequence")
+# The stop reasons that say the JD itself is what failed — cut off by the
+# output cap, refused, or too long for the context — so the same JD fails the
+# same way tomorrow (#206). A reason the API adds later is not assumed to be one.
+_JOB_SHAPED_STOPS = ("max_tokens", "refusal", "model_context_window_exceeded")
 
 
 def _anthropic_effort() -> str | None:
@@ -412,7 +447,12 @@ def _build_anthropic_caller(model: str) -> Caller:
         # thinking block, which has no .text, so reading content[0] crashed
         # whenever the model thought first.
         text = "".join(b.text for b in msg.content if b.type == "text")
+        if msg.stop_reason in _JOB_SHAPED_STOPS:
+            # Cut off or refused: the job's failure, counted against it (#206).
+            raise IncompleteResponse(
+                f"anthropic returned empty content (stop_reason={msg.stop_reason})")
         if not text or msg.stop_reason not in _COMPLETE_STOPS:
+            # An unknown reason is not assumed to be the JD's: failed, not counted.
             raise RuntimeError(
                 f"anthropic returned empty content (stop_reason={msg.stop_reason})")
         return text
@@ -513,6 +553,7 @@ def _build_failover_caller(provider: str, models: list[str], *,
 
     def call(system: str, user: str) -> str:
         last_exc: Exception | None = None
+        incomplete: IncompleteResponse | None = None
         for i, (model, caller) in enumerate(built):
             try:
                 return caller(system, user)
@@ -520,10 +561,19 @@ def _build_failover_caller(provider: str, models: list[str], *,
                 if not _is_transient_provider_error(exc):
                     raise
                 last_exc = exc
+                if isinstance(exc, IncompleteResponse) and incomplete is None:
+                    incomplete = exc
                 if i + 1 < len(built):
                     print(f"  model unavailable ({model}: {str(exc)[:60]}) — "
                           f"failing over to {built[i + 1][0]}")
-        raise last_exc if last_exc else RuntimeError("no models configured")
+        if last_exc is None:
+            raise RuntimeError("no models configured")
+        # The last member's error decides retry and backoff, as before; a
+        # cut-off earlier in the chain is kept as its cause, so the job is
+        # still charged for it (#206).
+        if incomplete is not None and last_exc is not incomplete:
+            raise last_exc from incomplete
+        raise last_exc
 
     return call
 
@@ -693,8 +743,10 @@ def _process_one(
     *,
     max_attempts: int = 6,
     budget: float | None = None,
-) -> tuple[bool, str, str | None]:
-    """Evaluate one job. Returns (success, job_id, error_or_None)."""
+) -> tuple[bool, str, str | None, bool]:
+    """Evaluate one job. Returns (success, job_id, error_or_None, countable):
+    whether the failure counts against the job's allowance is the exception's
+    type, decided here; whether the RUN lets it count is _charge_failed_runs'."""
     jid = job_meta["id"]
     try:
         response = _call_with_retry(
@@ -709,13 +761,47 @@ def _process_one(
             if out["summary"].get("score") is not None:
                 state["jobs"][jid]["score"] = out["summary"]["score"]
 
-        return True, jid, None
+        return True, jid, None, False
 
     except Exception as exc:
         with state_lock:
             state["jobs"][jid]["status"] = "failed"
             state["jobs"][jid]["error"] = str(exc)
-        return False, jid, str(exc)
+        return False, jid, str(exc), _is_countable_failure(exc)
+
+
+def _charge_failed_runs(jobs_state: dict, failures: dict[str, bool], processed: int,
+                        previously_failed: set[str]) -> list[str]:
+    """Count this run's countable failures (`failures`: job id → countable)
+    against each job's allowance; return the ids that reached MAX_ATTEMPTS, now
+    `abandoned` with their error kept.
+
+    A run counts for nobody when it looks like the RUN's trouble: two or more
+    jobs ran, at least half of them failed countably, and at least one of those
+    had never failed before (`previously_failed`: the jobs whose state said
+    `failed` when the run began). Run-wide trouble hits fresh jobs too — an
+    effort setting that thinks past the output cap cuts most answers off — and
+    counting it would abandon the whole backlog in MAX_ATTEMPTS days. A queue
+    left with only stuck jobs is counted, which "nothing succeeded" alone never
+    did, and one success no longer switches the protection off."""
+    countable = [jid for jid, c in failures.items() if c]
+    ran = processed + len(failures)
+    if (ran >= 2 and 2 * len(countable) >= ran
+            and any(jid not in previously_failed for jid in countable)):
+        print(f"[batch-eval] {len(countable)} of {ran} jobs failed the same way, some for the "
+              "first time — read as a problem with the run, not the jobs, so no job's "
+              "attempt count moved")
+        return []
+    abandoned = []
+    for jid in countable:
+        job = jobs_state[jid]
+        job["attempts"] = job.get("attempts", 0) + 1
+        if job["attempts"] >= MAX_ATTEMPTS:
+            job["status"] = "abandoned"
+            abandoned.append(jid)
+            print(f"  [{jid}] ABANDONED after {MAX_ATTEMPTS} failed runs: "
+                  f"{job.get('company') or '?'} — {job.get('error')}")
+    return abandoned
 
 
 # ── Main entry point ─────────────────────────────────────────────────────────
@@ -750,8 +836,12 @@ def run(
     model: str | None = None,
     concurrency: int = 3,
     dry_run: bool = False,
+    retry_abandoned: bool = False,
 ) -> EvalRun:
     """Evaluate pending jobs synchronously, then merge (see `EvalRun`).
+
+    `retry_abandoned` puts every abandoned job back in the queue with a fresh
+    allowance of MAX_ATTEMPTS failed runs.
 
     Single-flight across processes: two concurrent evaluations (e.g. a
     forgotten background run plus a fresh one — a live incident) contend on the
@@ -767,7 +857,8 @@ def run(
               file=sys.stderr)
         return EvalRun(0)
     try:
-        return _run_eval(career_ops, provider, model, concurrency, dry_run)
+        return _run_eval(career_ops, provider, model, concurrency, dry_run,
+                         retry_abandoned=retry_abandoned)
     finally:
         # Releases only if we still own it (release_process_lock guards against
         # deleting a lock a stale-takeover handed to another process).
@@ -780,6 +871,8 @@ def _run_eval(
     model: str | None = None,
     concurrency: int = 3,
     dry_run: bool = False,
+    *,
+    retry_abandoned: bool = False,
 ) -> EvalRun:
     provider = (provider or _detect_provider() or "").strip().lower()
     if not provider:
@@ -816,6 +909,21 @@ def _run_eval(
         return EvalRun(0)
 
     state = load_state(state_path)
+    if retry_abandoned:
+        # Back to `failed` with a fresh allowance, keeping the error. Written
+        # with the run's state, so a revived job the free-tier cap defers keeps
+        # the fresh allowance for the run that does reach it.
+        revived = 0
+        for job in state.get("jobs", {}).values():
+            if job.get("status") == "abandoned":
+                job["status"], job["attempts"] = "failed", 0
+                revived += 1
+        if revived and not dry_run:
+            # Saved now: an early return below (no provider key, no CV, nothing
+            # pending) must not leave the line below claiming something it isn't.
+            atomic_write_text(state_path, json.dumps(state, indent=2, ensure_ascii=False))
+        print(f"[batch-eval] --retry-abandoned: {revived} abandoned job(s) back in the queue"
+              + (" (dry run: not saved)" if dry_run and revived else ""))
     pending = load_pending(batch_input, state)
 
     if not pending:
@@ -890,6 +998,10 @@ def _run_eval(
     reports_dir.mkdir(parents=True, exist_ok=True)
     tracker_dir.mkdir(parents=True, exist_ok=True)
 
+    # Before assign_job_numbers rebuilds the entries: which jobs had failed
+    # before this run, for _charge_failed_runs' run-wide test.
+    previously_failed = {jid for jid, j in state.get("jobs", {}).items()
+                         if j.get("status") == "failed"}
     jobs = assign_job_numbers(pending, state, report_counter, tracker_counter, career_ops)
 
     state["provider"] = provider
@@ -900,11 +1012,12 @@ def _run_eval(
     # A configured failover chain already tries each sibling within one call, so
     # it needs far fewer whole-chain retries than a single model (which has no
     # sibling to fall over to). Bounds the worst case alongside the per-job budget.
-    attempts = 3 if len(_split_models(model)) > 1 else 6
+    call_attempts = 3 if len(_split_models(model)) > 1 else 6
     job_budget = _llm_job_budget()
 
     state_lock = threading.Lock()
-    processed = failed = 0
+    processed = 0
+    failures: dict[str, bool] = {}     # job id -> countable
     interrupted = {"flag": False}
 
     def _save_and_exit(*_a) -> None:
@@ -916,8 +1029,11 @@ def _run_eval(
             os._exit(130)
         interrupted["flag"] = True
         with state_lock:
+            # Charged on the way out too, or a run cut short every time (a
+            # timeout, a cancel) never moves a stuck job's count.
+            _charge_failed_runs(state["jobs"], failures, processed, previously_failed)
             atomic_write_text(state_path, json.dumps(state, indent=2, ensure_ascii=False))
-        print(f"\n[batch-eval] interrupted — {processed} processed, {failed} failed; "
+        print(f"\n[batch-eval] interrupted — {processed} processed, {len(failures)} failed; "
               "remaining jobs stay pending for the next run.")
         # os._exit skips stdio flushing and atexit entirely, so this is the one
         # place a print needs an explicit push: line_buffer_stdout() swallows
@@ -957,7 +1073,7 @@ def _run_eval(
                     meta, system_prompt, caller,
                     reports_dir, tracker_dir, today,
                     state, state_lock,
-                    max_attempts=attempts, budget=job_budget,
+                    max_attempts=call_attempts, budget=job_budget,
                 ): meta
                 for meta in jobs
             }
@@ -979,15 +1095,15 @@ def _run_eval(
                     last_heartbeat = now
                 for future in done:
                     meta = futures[future]
-                    success, jid, err_msg = future.result()
+                    success, jid, err, countable = future.result()
                     if success:
                         report = state["jobs"][jid].get("report", "")
                         score = state["jobs"][jid].get("score", "?")
                         print(f"  [{jid}] {meta['company'] or '?'} -> score={score} {report or '(no report)'}")
                         processed += 1
                     else:
-                        print(f"  [{jid}] FAILED: {err_msg}")
-                        failed += 1
+                        print(f"  [{jid}] FAILED: {err}")
+                        failures[jid] = countable
                 if done and now - last_flush >= FLUSH_S:
                     # Atomic snapshot+write under the lock so concurrent writers
                     # can't interleave or leave a partially-written file.
@@ -1001,10 +1117,16 @@ def _run_eval(
             except (ValueError, OSError):
                 pass
 
+    abandoned = _charge_failed_runs(state["jobs"], failures, processed, previously_failed)
+
     state["status"] = "completed"
     state["completed_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     atomic_write_text(state_path, json.dumps(state, indent=2, ensure_ascii=False))
-    print(f"[batch-eval] done — processed={processed} failed={failed}")
+    print(f"[batch-eval] done — processed={processed} failed={len(failures)} "
+          f"abandoned={len(abandoned)}")
+    if abandoned:
+        print("[batch-eval] abandoned jobs are no longer re-queued; "
+              "--retry-abandoned puts them back")
 
     # Merge when we produced results OR when unmerged TSVs are sitting around
     # from an earlier interrupted run. merge-tracker moves merged files out, so
@@ -1020,6 +1142,9 @@ def _parse_argv(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--model", default=None, help="overrides BATCH_MODEL env var")
     ap.add_argument("--concurrency", type=int, default=3)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--retry-abandoned", action="store_true",
+                    help=f"re-queue jobs abandoned after {MAX_ATTEMPTS} failed runs, "
+                         "with a fresh allowance")
     return ap.parse_args(argv)
 
 
@@ -1033,5 +1158,6 @@ if __name__ == "__main__":
     # Exit 1 when the tracker merge was not clean; run_merge_tracker has
     # already printed which additions and why.
     sys.exit(
-        0 if run(career_ops_path, args.provider, args.model, args.concurrency, args.dry_run).merge_clean else 1
+        0 if run(career_ops_path, args.provider, args.model, args.concurrency, args.dry_run,
+                 retry_abandoned=args.retry_abandoned).merge_clean else 1
     )
