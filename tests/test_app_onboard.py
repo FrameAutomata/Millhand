@@ -150,23 +150,23 @@ class TestBuildOnboardingJson:
 
 class TestParseResumeInfo:
     SAMPLE = (
-        "Thomas Thirlwall\n"
-        "+1 (956) 525-3015 | ththirlwall99@gmail.com | Dallas, TX | "
-        "linkedin.com/in/thomas-thirlwall | https://github.com/FrameAutomata | "
-        "https://thomas.dev\n"
+        "Jordan Avery\n"
+        "+1 (555) 014-2368 | jordan.avery@example.com | Dallas, TX | "
+        "linkedin.com/in/jordan-avery | https://github.com/jordanavery | "
+        "https://jordanavery.example\n"
         "PROFESSIONAL SUMMARY\nEngineer.\n"
     )
 
     def test_extracts_all_fields(self):
         info = onboard.parse_resume_info(self.SAMPLE)
-        assert info["name"] == "Thomas Thirlwall"
-        assert info["email"] == "ththirlwall99@gmail.com"
-        assert info["phone"] == "+1 (956) 525-3015"
+        assert info["name"] == "Jordan Avery"
+        assert info["email"] == "jordan.avery@example.com"
+        assert info["phone"] == "+1 (555) 014-2368"
         assert info["location"] == "Dallas, TX"
-        assert info["linkedin"] == "linkedin.com/in/thomas-thirlwall"
-        assert info["github"] == "github.com/FrameAutomata"
+        assert info["linkedin"] == "linkedin.com/in/jordan-avery"
+        assert info["github"] == "github.com/jordanavery"
         # website = first non-social URL
-        assert info["website"] == "https://thomas.dev"
+        assert info["website"] == "https://jordanavery.example"
 
     def test_website_skips_social_urls(self):
         info = onboard.parse_resume_info("Jane\nhttps://github.com/jane only")

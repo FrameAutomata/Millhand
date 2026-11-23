@@ -28,13 +28,13 @@ class TestCoverPath:
 
 class TestBuildPrompt:
     def test_includes_context_and_guardrails(self):
-        p = ApplyProfile(full_name="Thomas Thirlwall", email="t@x.com", city="Dallas", country="US")
+        p = ApplyProfile(full_name="Jordan Avery", email="t@x.com", city="Dallas", country="US")
         job = queue.ApplyJob(num="1", company="Apexon", role="Engineer", url="u", score=4.5,
                              report_path="reports/001.md")
         system, user = cover_letters.build_prompt(p, "MY CV TEXT", job, "REPORT NOTES")
         assert "Apexon" in user and "Engineer" in user
         assert "MY CV TEXT" in user and "REPORT NOTES" in user
-        assert "Thomas Thirlwall" in user
+        assert "Jordan Avery" in user
         assert "never invent" in system.lower()
 
 
@@ -69,8 +69,8 @@ class TestGenerateForJob:
         (tmp_path / "cv.md").write_text("CV", encoding="utf-8")
         job = queue.ApplyJob(num="1", company="Apexon", role="Eng", url="u", score=4.5)
         text = cover_letters.generate_for_job(
-            tmp_path, job, caller=lambda s, u: "Generated letter\nThomas")
-        assert text == "Generated letter\nThomas"
+            tmp_path, job, caller=lambda s, u: "Generated letter\nJordan")
+        assert text == "Generated letter\nJordan"
         assert (tmp_path / "output" / "Apexon - cover.md").exists()
 
 
@@ -78,7 +78,7 @@ class TestRun:
     def _career_ops(self, tmp_path):
         (tmp_path / "data").mkdir(parents=True)
         (tmp_path / "data" / "applications.md").write_text(_TRACKER, encoding="utf-8")
-        (tmp_path / "cv.md").write_text("My CV — built APIs at Capital One.", encoding="utf-8")
+        (tmp_path / "cv.md").write_text("My CV — built APIs at Initech.", encoding="utf-8")
         (tmp_path / "reports").mkdir()
         (tmp_path / "reports" / "001.md").write_text("Strong API match.", encoding="utf-8")
         return tmp_path
@@ -93,7 +93,7 @@ class TestRun:
         calls = []
         def caller(system, user):
             calls.append(user)
-            return "Dear Apexon team,\n\nI build APIs.\n\nThomas Thirlwall"
+            return "Dear Apexon team,\n\nI build APIs.\n\nJordan Avery"
         self._patch_caller(monkeypatch, caller)
 
         n = cover_letters.run(co, min_score=4.0)

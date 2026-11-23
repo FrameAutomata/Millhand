@@ -67,7 +67,7 @@ def real_pacers_on_fake_clock(monkeypatch) -> dict:
 # Synthetic resume used by filter tests. Includes a Skills section so
 # extract_keywords produces a non-empty result.
 SYNTHETIC_RESUME = """
-Thomas Thirlwall
+Jordan Avery
 Software Engineer
 Dallas, TX
 
@@ -81,11 +81,11 @@ Frontend/Mobile: Angular, React Native, Expo, Flutter
 Cloud/DevOps: AWS, Docker, Terraform, GitHub Actions
 
 PROJECTS
-Arcade Radar
-Built a cross-platform arcade locator app using Expo Router and Supabase.
+Trailhead Finder
+Built a cross-platform trail locator app using Expo Router and Supabase.
 
 PROFESSIONAL EXPERIENCE
-Capital One
+Initech
 Software Engineer
 Developed Angular frontend and Java/Spring Boot REST APIs.
 Deployed and supported Dockerized services running on AWS ECS.
