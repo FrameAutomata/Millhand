@@ -36,6 +36,8 @@ from pipeline import agent_cli
 from pipeline import article_digest
 from pipeline import gemini_limits
 from pipeline._batch_common import (
+    APPLY_MIN_SCORE,
+    SKIP_BELOW,
     build_user_message,
     eval_system_prompt,
     max_report_num,
@@ -884,7 +886,10 @@ def capabilities() -> JSONResponse:
     # The status vocabulary rides along: the SPA keeps its own STATES list for
     # first paint, and career-ops adding a 10th state must not require editing
     # it. Board columns and the report pane's picker use this when it arrives.
-    return JSONResponse({**skills.capabilities(), "states": data.canonical_states()})
+    # The score lines ride along for the same reason: the pill colours follow the
+    # evaluator's bands (#208), so moving a band must not need a JS edit.
+    return JSONResponse({**skills.capabilities(), "states": data.canonical_states(),
+                         "score_lines": {"apply": APPLY_MIN_SCORE, "skip": SKIP_BELOW}})
 
 
 @app.post("/api/skills/run")

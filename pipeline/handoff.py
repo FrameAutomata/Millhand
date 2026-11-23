@@ -44,7 +44,7 @@ from pathlib import Path
 import yaml
 
 from pipeline._batch_common import (
-    atomic_write_text, env_float, env_int, normalize_company as _squeeze, read_text,
+    APPLY_MIN_SCORE, atomic_write_text, env_float, env_int, normalize_company as _squeeze, read_text,
 )
 from pipeline.app import data as _data
 from pipeline.work_location import OUT_OF_AREA_TAG, commutable_area
@@ -2102,7 +2102,7 @@ def run(
         sessions = {board: sessions.get(board, [])}
 
     if tailor:
-        min_score = tailor_min_score if tailor_min_score is not None else env_float("APPLY_TAILOR_MIN_SCORE", 4.0)
+        min_score = tailor_min_score if tailor_min_score is not None else env_float("APPLY_TAILOR_MIN_SCORE", APPLY_MIN_SCORE)
         try:
             tailor_fn = _make_tailor_fn(co.resolve(), out_dir)
         except ImportError as e:
@@ -2212,7 +2212,7 @@ def main(argv: list[str] | None = None) -> int:
                          "work-order ships ready-to-upload files")
     ap.add_argument("--tailor-min-score", type=float, default=None,
                     help="Only pre-tailor rows scoring >= this "
-                         "(default: APPLY_TAILOR_MIN_SCORE env, else 4.0)")
+                         f"(default: APPLY_TAILOR_MIN_SCORE env, else {APPLY_MIN_SCORE})")
     ap.add_argument("--career-ops", type=Path, default=None,
                     help="career-ops install for --tailor caching "
                          "(default: CAREER_OPS_PATH env, else ./career-ops)")

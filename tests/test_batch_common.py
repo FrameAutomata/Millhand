@@ -1122,6 +1122,64 @@ class TestEvalSystemPrompt:
         assert "The candidate profile above states their target roles" in eval_system_prompt(co)
 
 
+class TestScoreBands:
+    """The Global score is defined, not left to each model's reading (#208).
+
+    The number is what the digest, the role selector and the tracker's SKIP status
+    all act on, so its bands are stated in the prompt, and the two lines the rest
+    of the pipeline uses are floors of those bands."""
+
+    def test_bands_cover_the_scale_without_gaps(self):
+        floors = [b[0] for b in _batch_common.SCORE_BANDS]
+        assert floors == sorted(floors, reverse=True)
+        assert floors[0] < 5.0 and floors[-1] == 1.0
+        # one decimal each, or the table's "floor-(next-0.1)" ranges overlap
+        assert all(round(f, 1) == f for f in floors)
+        # every band has a meaning and evidence, not a bare number
+        assert all(meaning and evidence for _, meaning, evidence in _batch_common.SCORE_BANDS)
+
+    def test_every_band_is_in_the_prompt(self):
+        prompt = build_system_prompt("cv", "profile")
+        assert _batch_common._score_band_table() in prompt
+        # the ends of the scale, as the model reads them
+        assert "| 4.5-5.0 | Strong match: apply now |" in prompt
+        assert "| 1.0-1.9 | No fit |" in prompt
+
+    def test_old_location_score_lines_are_dropped_from_profile_md(self):
+        """Setups before #208 wrote these into every _profile.md, which is never
+        regenerated; they assigned a Global score by location."""
+        old = ("## Your Location Policy\n\n**In evaluations (scoring):**\n"
+               "- **Remote roles:** Score 5.0 (ideal)\n"
+               "- **On-site 4-5 days/week, no exceptions:** Score 1.0 (not viable)\n"
+               "- **My own note:** I could relocate for the right role\n")
+        prompt = build_system_prompt("cv", "profile", old)
+        assert "Score 1.0 (not viable)" not in prompt and "Score 5.0 (ideal)" not in prompt
+        assert "I could relocate for the right role" in prompt
+
+    def test_profile_md_cannot_override_the_bands(self):
+        """_profile.md weighs dimensions; it must not re-score a hard stop. Old
+        setups wrote "On-site ...: Score 1.0" into it, which sank a location-
+        blocked role to Skip and out of every queue, undoing #180."""
+        prompt = build_system_prompt("cv", "profile", "MODES_PROFILE")
+        assert "but not the score bands, the decision rule or the hard-stop rule" in prompt
+
+    def test_decision_and_status_rules_use_the_same_lines(self):
+        prompt = build_system_prompt("cv", "profile")
+        apply_, skip = _batch_common.APPLY_MIN_SCORE, _batch_common.SKIP_BELOW
+        assert f'"Apply" at {apply_:.1f} and above' in prompt
+        assert f'"Skip" below {skip:.1f}' in prompt
+        assert f'"NO APLICAR" if score < {skip:.1f}' in prompt
+
+    def test_hard_stops_cap_the_decision_not_the_score(self):
+        """#180 demotes an out-of-area role and keeps its score, and the digest
+        marks it rather than hiding it; a prompt that sank the score for location
+        would undo both."""
+        prompt = build_system_prompt("cv", "profile")
+        assert "A location hard stop caps the decision, not the score" in prompt
+        # ...while a credential they cannot hold still lowers the score
+        assert "(a licence, credential or clearance) lowers the score as well" in prompt
+
+
 class TestTargetRolesInPrompt:
     """The archetype list is the candidate's own target roles (#209), not
     career-ops' six AI-engineering defaults."""

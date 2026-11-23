@@ -16,7 +16,9 @@ import os
 import re
 from pathlib import Path
 
-from pipeline._batch_common import atomic_write_text, normalize_company, read_report, read_text
+from pipeline._batch_common import (
+    APPLY_MIN_SCORE, atomic_write_text, normalize_company, read_report, read_text,
+)
 from pipeline import role_select as queue
 from pipeline.candidate_profile import ApplyProfile
 from pipeline.stdio import line_buffer_stdout
@@ -196,7 +198,7 @@ def generate_for_job(career_ops: Path, job, *, caller=None,
 def run(
     career_ops: Path,
     *,
-    min_score: float = 4.0,
+    min_score: float = APPLY_MIN_SCORE,
     limit: int = 0,
     force: bool = False,
     provider: str | None = None,
@@ -246,5 +248,5 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv(ROOT / ".env")
     co = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "career-ops"
-    ms = float(sys.argv[2]) if len(sys.argv) > 2 else 4.0
+    ms = float(sys.argv[2]) if len(sys.argv) > 2 else APPLY_MIN_SCORE
     run(co.resolve(), min_score=ms, force=True)

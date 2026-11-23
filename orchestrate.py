@@ -29,7 +29,7 @@ from pipeline.search_config import (  # noqa: E402
 
 from pipeline import scrape, filter as filter_step, screen, bridge, batch_prep, batch_evaluate, notify  # noqa: E402
 # env_float is shared with batch_evaluate's timeout/budget knobs.
-from pipeline._batch_common import MERGE_NOT_CLEAN_LINE, env_float  # noqa: E402
+from pipeline._batch_common import APPLY_MIN_SCORE, MERGE_NOT_CLEAN_LINE, env_float  # noqa: E402
 # Only the board vocabulary is needed at arg-parse time; handoff.run itself is
 # still lazy-imported below to keep the hot pipeline path free of its tailoring
 # deps. This module-level import is cheap (handoff pulls only _batch_common + app.data).
@@ -79,7 +79,7 @@ def main() -> int:
                          "gets ready-to-upload files")
     ap.add_argument("--handoff-tailor-min-score", type=float, default=None,
                     help="With --handoff-tailor: only pre-tailor rows scoring >= "
-                         "this (default: APPLY_TAILOR_MIN_SCORE env, else 4.0)")
+                         f"this (default: APPLY_TAILOR_MIN_SCORE env, else {APPLY_MIN_SCORE})")
     ap.add_argument("--recheck-liveness", action="store_true",
                     help="Re-check liveness of evaluated tracker roles and mark "
                          "closed/gone ones Discarded. Off by default; the daily "

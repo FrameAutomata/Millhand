@@ -966,12 +966,9 @@ ${criteria.targetRoles.slice(0, 3).map((role) => {
 
 **Timezone:** ${info.timezone || 'UTC-6'} — comfortable with async teams
 
-**In evaluations (scoring):**
-- **Remote roles:** Score 5.0 (ideal)
-- **Preferred location (${info.location}):** Score 5.0 (already there)
-- **Hybrid, US-based with <20% on-site:** Score 4.0 (flexible)
-- **Hybrid, non-US with on-site required:** Score 2.0 (visa complexity)
-- **On-site 4-5 days/week, no exceptions:** Score 1.0 (not viable)
+**In evaluations:**
+- **Remote roles, and roles in the places you search:** no location concern.
+- **A role that requires recurring presence anywhere else (on-site or hybrid):** a hard stop. It caps the decision, not the score.
 
 ## Deal-breakers
 

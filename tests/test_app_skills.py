@@ -114,6 +114,13 @@ def test_capabilities_provider_with_missing_key_not_available(client, monkeypatc
     assert caps["api"]["available"] is False
 
 
+def test_capabilities_serves_the_score_lines(client):
+    """The board's score pill reads the evaluator's lines from the server (#208)."""
+    from pipeline._batch_common import APPLY_MIN_SCORE, SKIP_BELOW
+    caps = client.get("/api/capabilities").json()
+    assert caps["score_lines"] == {"apply": APPLY_MIN_SCORE, "skip": SKIP_BELOW}
+
+
 def test_capabilities_lists_skills(client):
     caps = client.get("/api/capabilities").json()
     by_id = {s["id"]: s for s in caps["skills"]}
