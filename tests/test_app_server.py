@@ -1593,3 +1593,47 @@ class TestProxiedLoopbackIsNotLocalAdmin:
         detail = c.post("/api/reset", json={}).json()["detail"]
         for path in lan.module._LAN_MUTABLE:
             assert path in detail
+
+
+class TestAddJobIncompleteEvaluation:
+    """#204: an answer that is not a whole evaluation is a failure on both
+    Add-Job routes, and writes nothing. It used to come back as
+    {"ok": true, "score": null} for a role that would never reach the tracker."""
+
+    # The prompt's one sanctioned tagless answer: the model's own failure.
+    TAGLESS = ('<evaluation><summary>{"status": "failed", "error": "the posting '
+               'page was empty"}</summary></evaluation>')
+    BODY = {"url": "https://x.example/jobs/7", "company": "Initech", "role": "Analyst"}
+
+    @pytest.fixture
+    def evaluating(self, client, monkeypatch):
+        from pipeline.app import server
+        monkeypatch.setattr(server, "_detect_provider", lambda: "anthropic")
+        monkeypatch.setattr(server, "_fetch_jd", lambda url, timeout=20: "JD text")
+        monkeypatch.setattr(server, "_load_eval_system_prompt", lambda: "SYSTEM")
+        monkeypatch.setattr(server, "_build_caller", lambda provider, model: None)
+        monkeypatch.setattr(server, "_call_with_retry", lambda caller, system, user: self.TAGLESS)
+        merges = []
+        monkeypatch.setattr(server, "run_merge_tracker", lambda co: merges.append(co) or True)
+        co = server._career_ops_local()
+        written = lambda: (sorted(p.name for p in (co / "reports").glob("*")),
+                           sorted(p.name for p in (co / "batch" / "tracker-additions").glob("*")))
+        return server, written, merges
+
+    def test_the_sync_route_is_a_502_and_writes_nothing(self, client, evaluating):
+        _, written, merges = evaluating
+        r = client.post("/api/jobs/add", json=self.BODY)
+        assert r.status_code == 502
+        assert r.json()["detail"] == ("LLM evaluation was incomplete: the model reported "
+                                      "a failed evaluation (26-char reason withheld)")
+        assert written() == (["001-acme.md"], [])      # only the fixture's own report
+        assert merges == []
+
+    def test_the_background_route_reports_why(self, client, evaluating):
+        server, written, merges = evaluating
+        server._run_add_job("t-204", self.BODY["url"], "Initech", "Analyst")
+        r = client.get("/api/jobs/add-status/t-204")
+        assert r.json() == {"status": "error", "error": "the model reported a failed "
+                                                        "evaluation (26-char reason withheld)"}
+        assert written() == (["001-acme.md"], [])
+        assert merges == []

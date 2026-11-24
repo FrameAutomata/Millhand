@@ -285,8 +285,10 @@ def _is_transient_provider_error(exc: BaseException) -> bool:
 # retries are one attempt — and deliberately not an env knob.
 MAX_ATTEMPTS = 3
 
-# The failures that count are exactly the IncompleteResponse a caller raises
-# when it knows why an answer ended (cut off, refused). Not the complement of
+# The failures that count are exactly the IncompleteResponse raised at one of
+# two places: a caller that knows why an answer ended (cut off, refused), and
+# write_job_result for an answer missing a tag, whatever the provider (#204).
+# Not the complement of
 # _is_transient_provider_error: "empty content" is transient THERE (retry once,
 # fail over to a sibling model) and stays so — IncompleteResponse keeps that
 # wording — while a bare empty answer that ended naturally (a degraded endpoint
@@ -390,9 +392,10 @@ ANTHROPIC_EFFORTS = ("low", "medium", "high")
 _warned_efforts: set[str] = set()
 
 # A response that ended any other way (max_tokens, refusal, or a stop reason
-# added later) is incomplete: returned, a truncated report missing its closing
-# tags would be recorded as completed and the role lost — #204's failure, here
-# caught where only the caller can see why the answer ended.
+# added later) is incomplete. write_job_result would reject one that lost a
+# closing tag (#204), but raising here, where only the caller can see why the
+# answer ended, gets it an in-run retry and failover first — and catches a cut
+# that kept every tag, which the writer cannot see.
 _COMPLETE_STOPS = ("end_turn", "stop_sequence")
 # The stop reasons that say the JD itself is what failed — cut off by the
 # output cap, refused, or too long for the context — so the same JD fails the
@@ -757,7 +760,7 @@ def _process_one(
 
         with state_lock:
             state["jobs"][jid]["status"] = "completed"
-            state["jobs"][jid]["report"] = f"reports/{out['report_file']}" if out["report_file"] else None
+            state["jobs"][jid]["report"] = f"reports/{out['report_file']}"
             if out["summary"].get("score") is not None:
                 state["jobs"][jid]["score"] = out["summary"]["score"]
 
@@ -1099,7 +1102,7 @@ def _run_eval(
                     if success:
                         report = state["jobs"][jid].get("report", "")
                         score = state["jobs"][jid].get("score", "?")
-                        print(f"  [{jid}] {meta['company'] or '?'} -> score={score} {report or '(no report)'}")
+                        print(f"  [{jid}] {meta['company'] or '?'} -> score={score} {report}")
                         processed += 1
                     else:
                         print(f"  [{jid}] FAILED: {err}")

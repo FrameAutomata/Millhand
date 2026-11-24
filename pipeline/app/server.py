@@ -38,6 +38,7 @@ from pipeline import gemini_limits
 from pipeline._batch_common import (
     APPLY_MIN_SCORE,
     SKIP_BELOW,
+    IncompleteResponse,
     build_user_message,
     load_state,
     eval_system_prompt,
@@ -1809,7 +1810,11 @@ def add_job(req: AddJobRequest) -> JSONResponse:
     # Write report .md and tracker-additions .tsv.
     reports_dir.mkdir(parents=True, exist_ok=True)
     tracker_dir.mkdir(parents=True, exist_ok=True)
-    result = write_job_result(response_text, job_meta, reports_dir, tracker_dir, today)
+    try:
+        result = write_job_result(response_text, job_meta, reports_dir, tracker_dir, today)
+    except IncompleteResponse as exc:
+        # Nothing was written (#204).
+        raise HTTPException(status_code=502, detail=f"LLM evaluation was incomplete: {exc}")
 
     # Merge into applications.md. Failure is non-fatal — the tracker-additions
     # file is written and the next pipeline run will pick it up.

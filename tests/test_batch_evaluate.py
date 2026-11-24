@@ -628,8 +628,8 @@ class TestAnthropicCaller:
         ([THINKING], "end_turn"),
     ])
     def test_an_incomplete_answer_is_empty_content(self, monkeypatch, content, stop_reason):
-        # Partial text must never reach write_job_result (#204), so it gets the
-        # empty-content treatment: failover, and at most one retry.
+        # Raised before write_job_result rejects it (#204), so it gets the
+        # empty-content treatment first: failover, and at most one retry.
         call, _ = self._caller(monkeypatch, content, stop_reason=stop_reason)
         with pytest.raises(RuntimeError, match=f"empty content.*{stop_reason}") as exc:
             call("s", "u")
@@ -725,8 +725,7 @@ class TestFailureAllowance:
     MAX_ATTEMPTS runs, then abandoned. Driven end to end through run() with a
     fake provider, one call per run, against one state file."""
 
-    # Every tag the writer reads, so this stays a success once #204's
-    # completeness check lands.
+    # Both tags the writer requires (#204).
     ANSWER = ("<evaluation><report># Report</report>"
               "<tracker_tsv>1\t2026-11-22\tGlobex\tDev\tEvaluated\t4.0/5\t\t"
               "[001](reports/001-globex-2026-11-22.md)\t</tracker_tsv>"
@@ -742,14 +741,15 @@ class TestFailureAllowance:
         monkeypatch.setenv("LLM_JOB_BUDGET", "0")
         monkeypatch.setattr(eval_mod, "eval_system_prompt", lambda co: "SYSTEM")
         monkeypatch.setattr(eval_mod, "run_merge_tracker", lambda co: True)
-        h = SimpleNamespace(career_ops=_queued_career_ops(tmp_path), failing={}, calls=[])
+        h = SimpleNamespace(career_ops=_queued_career_ops(tmp_path), failing={}, calls=[],
+                            answers={})
 
         def caller(system, user):
             company = "Acme" if "Acme" in user else "Globex"
             h.calls.append(company)
             if company in h.failing:
                 raise h.failing[company]
-            return self.ANSWER
+            return h.answers.get(company, self.ANSWER)
 
         monkeypatch.setattr(eval_mod, "_build_caller", lambda provider, model: caller)
         state_path = h.career_ops / "batch" / "batch-api-state.json"
@@ -859,6 +859,23 @@ class TestFailureAllowance:
         with pytest.raises(SystemExit):
             h.run()
         assert h.jobs()["1"]["attempts"] == 1
+
+    def test_an_incomplete_answer_is_a_counted_failure(self, h):
+        """#204: an answer missing <report> or <tracker_tsv> was recorded as
+        completed, so nothing ever re-queued it. It is now this job's failure,
+        counted like a cut-off, and it leaves no report behind."""
+        # Failed before, so in this two-job queue the failure is the job's, not
+        # the run's (#206's fresh-failures rule).
+        h.seed({"1": {"status": "failed", "error": "earlier"}})
+        h.answers = {"Acme": "<evaluation><report># R</report><summary>{}</summary></evaluation>"}
+        h.run()
+        job = h.jobs()["1"]
+        assert (job["status"], job["attempts"]) == ("failed", 1)
+        assert "no <tracker_tsv>" in job["error"]
+        assert h.jobs()["2"]["status"] == "completed"
+        # Globex's report only: Acme's half-answer wrote nothing.
+        assert [p.name.split("-")[:2] for p in (h.career_ops / "reports").glob("*")] == [
+            ["002", "globex"]]
 
     def test_a_revival_is_saved_even_when_the_run_stops_early(self, h, monkeypatch):
         """The log line says the jobs are back; an early return (an expired key)
