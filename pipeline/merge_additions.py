@@ -3,13 +3,21 @@ recovering the rows a previous merge refused, and sanitizing every row first.
 
 The step `run.sh`/`run.ps1` run once `batch-runner.sh` returns. That runner
 merges its own additions as its last act, inside career-ops with no Python in
-the process tree, so a row the agent CLI wrote with a bare `4.2` is refused and
-archived into `merged/` before anything here can see it — and from there nothing
-retries it. `run_merge_tracker` is the one place that knows how to pull such a
-row back, repair it, and merge it; this module exists so the wrappers can reach
-it after the runner, which nothing else in the pipeline does.
+the process tree, so a row the agent CLI wrote with a bare `4.2` is refused
+before anything here can see it — archived into `merged/` before
+career-ops#5862, where nothing retries it, and kept in the queue since, where a
+re-run refuses it again. `run_merge_tracker` is the one place that knows how to
+repair either kind (pulling an archived one back first) and merge it again; this
+module exists so the wrappers can reach it after the runner, which nothing else
+in the pipeline does.
 
 Also the right entry point for a manual retry: `python -m pipeline.merge_additions`.
+
+Exits 1 unless the merge was clean (`run_merge_tracker`'s True): a partial merge,
+or one where merge-tracker refused an addition, is not a success, and the log
+above the exit names each one. That is what ends `run.sh`/`run.ps1 --batch` in
+failure; `--evaluate-batch` ends the same way on the same result, through
+orchestrate's exit code (`batch_evaluate.EvalRun`).
 """
 
 import sys

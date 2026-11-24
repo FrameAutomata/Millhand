@@ -514,6 +514,13 @@ async function pollLocalRun() {
     }
   } else if (localRun.wasCancelled) {
     localRun.wasCancelled = false;         // cancel already showed its message
+  } else if (s.merge_not_clean) {
+    // Every stage ran and what did merge is in the tracker, so show it; the
+    // log names what did not.
+    try { await loadJobs(); } catch (_) { /* the message below is the point */ }
+    showAction("Local pipeline run finished, but the tracker merge was not clean — "
+      + "see the log below the toolbar for what did not merge.", "error");
+    localRun.panel.hidden = false;
   } else {
     showAction(`Local pipeline run failed (exit ${s.exit_code}) — see the log below the toolbar.`, "error");
     localRun.panel.hidden = false;

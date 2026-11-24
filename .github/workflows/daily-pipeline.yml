@@ -358,6 +358,13 @@ jobs:
           # easy_apply pass) in a single daily run. --recheck-liveness re-checks
           # the tracker's still-open roles once a day and Discards any whose
           # posting has since closed.
+          #
+          # orchestrate exits 1 when the tracker merge was not clean, after
+          # every stage has run, and that failing this step is the point: the
+          # queue is not cached, so a refused addition is never retried, and
+          # the digest's failure notice is how the person hears of it. Keep it
+          # the last command here — under bash -e anything after it is skipped
+          # on that exit.
           python orchestrate.py --evaluate-batch \
             --recheck-liveness \
             --batch-concurrency "$BATCH_CONCURRENCY"

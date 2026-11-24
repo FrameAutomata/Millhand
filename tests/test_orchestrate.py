@@ -6,12 +6,15 @@ the pipeline (and therefore in the cloud workflow that invokes orchestrate),
 and stays OFF by default so existing runs are unchanged.
 """
 
+import json
 import sys
 
 import pytest
 
 import orchestrate
-from pipeline import recheck
+from pipeline import batch_evaluate, handoff, recheck
+from pipeline._batch_common import MERGE_NOT_CLEAN_LINE
+from tests.conftest import evaluate_without_a_provider
 
 
 @pytest.fixture
@@ -82,3 +85,96 @@ class TestRecheckWiring:
         monkeypatch.setattr(sys, "argv", _argv(cfg, "--recheck-liveness"))   # no --recheck-drain
         orchestrate.main()
         assert len(ran) == 1 and not drained
+
+
+class TestUncleanMergeExitCode:
+    """--evaluate-batch's tracker merge decides the exit code, at the END: a
+    merge that was not clean (`run_merge_tracker` False) still lets every later
+    stage run, then exits 1 with one line saying why — which is what fails the
+    cloud daily's evaluate step, where a refused addition is never retried. Both
+    merges batch_evaluate runs count: the heal sweep of an earlier run's queue,
+    and the merge after evaluating."""
+
+    @staticmethod
+    def _queue(co, *, evaluated: bool):
+        """One job in the batch queue. `evaluated`: already done, with its
+        addition still queued — the heal sweep's case; otherwise pending, and
+        evaluated by a stand-in that makes no provider call."""
+        batch = co / "batch"
+        (batch / "tracker-additions").mkdir(parents=True)
+        (batch / "batch-input.tsv").write_text(
+            "id\turl\tsource\tnotes\n1\thttps://a.com\tAcme\tEng\n", encoding="utf-8")
+        (co / "cv.md").write_text("# CV", encoding="utf-8")
+        if evaluated:
+            (batch / "batch-api-state.json").write_text(
+                json.dumps({"jobs": {"1": {"status": "completed"}}}), encoding="utf-8")
+            (batch / "tracker-additions" / "1.tsv").write_text("1\t2026-06-01\tAcme\n",
+                                                                encoding="utf-8")
+
+    @pytest.fixture
+    def stages(self, monkeypatch):
+        """The order things happened in: the merge, then the later stages."""
+        events = []
+        monkeypatch.setattr(recheck, "run", lambda *a, **k: events.append("recheck"))
+        monkeypatch.setattr(handoff, "run", lambda *a, **k: events.append("handoff") or 0)
+        return events
+
+    @pytest.mark.parametrize("site", ["heal sweep", "after evaluating"])
+    @pytest.mark.parametrize("clean", [True, False])
+    def test_the_merge_decides_the_exit_code_after_every_stage(
+            self, quiet_pipeline, monkeypatch, capsys, stages, site, clean):
+        cfg, co = quiet_pipeline
+        self._queue(co, evaluated=site == "heal sweep")
+        if site == "after evaluating":
+            evaluate_without_a_provider(monkeypatch)
+        monkeypatch.setattr(batch_evaluate, "run_merge_tracker",
+                            lambda career_ops: stages.append("merge") or clean)
+        monkeypatch.setattr(sys, "argv", _argv(cfg, "--evaluate-batch", "--batch-provider",
+                                               "anthropic", "--recheck-liveness", "--handoff"))
+        assert orchestrate.main() == (0 if clean else 1)
+        assert stages == ["merge", "recheck", "handoff"]   # nothing stopped early
+        err = capsys.readouterr().err
+        if clean:
+            assert MERGE_NOT_CLEAN_LINE not in err
+        else:
+            # One line, and the last thing the run says.
+            assert err.rstrip().splitlines()[-1].startswith(MERGE_NOT_CLEAN_LINE)
+            assert err.count(MERGE_NOT_CLEAN_LINE) == 1
+
+    def test_a_failed_handoff_is_not_reported_as_only_the_merge(
+            self, quiet_pipeline, monkeypatch, capsys, stages):
+        # The UI reads MERGE_NOT_CLEAN_LINE as "the run finished, only the merge
+        # was not clean"; with a handoff failure as well, that would hide it.
+        cfg, co = quiet_pipeline
+        self._queue(co, evaluated=True)
+        monkeypatch.setattr(batch_evaluate, "run_merge_tracker",
+                            lambda career_ops: stages.append("merge") or False)
+        monkeypatch.setattr(handoff, "run", lambda *a, **k: stages.append("handoff") or 2)
+        monkeypatch.setattr(sys, "argv", _argv(cfg, "--evaluate-batch", "--batch-provider",
+                                               "anthropic", "--handoff"))
+        assert orchestrate.main() == 2
+        err = capsys.readouterr().err
+        assert not any(line.startswith(MERGE_NOT_CLEAN_LINE) for line in err.splitlines())
+        assert "also: the tracker merge was not clean" in err
+
+    def test_nothing_to_merge_exits_zero(self, quiet_pipeline, monkeypatch, stages):
+        # Every job evaluated and nothing queued: no merge runs, which is not a
+        # failure.
+        cfg, co = quiet_pipeline
+        self._queue(co, evaluated=True)
+        (co / "batch" / "tracker-additions" / "1.tsv").unlink()
+        monkeypatch.setattr(batch_evaluate, "run_merge_tracker",
+                            lambda career_ops: stages.append("merge") or False)
+        monkeypatch.setattr(sys, "argv", _argv(cfg, "--evaluate-batch", "--batch-provider",
+                                               "anthropic"))
+        assert orchestrate.main() == 0
+        assert stages == []
+
+    def test_no_queue_at_all_exits_zero(self, quiet_pipeline, monkeypatch, stages):
+        cfg, _ = quiet_pipeline                 # no batch/ under career-ops
+        monkeypatch.setattr(batch_evaluate, "run_merge_tracker",
+                            lambda career_ops: stages.append("merge") or False)
+        monkeypatch.setattr(sys, "argv", _argv(cfg, "--evaluate-batch", "--batch-provider",
+                                               "anthropic"))
+        assert orchestrate.main() == 0
+        assert stages == []

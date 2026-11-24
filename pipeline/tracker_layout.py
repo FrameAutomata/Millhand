@@ -104,7 +104,7 @@ _ALIAS_FILE = "tracker-aliases.json"
 _contract_cache: dict[str, tuple[int, object]] = {}
 
 
-def load_contract(relpath: str, parse, fallback):
+def load_contract(relpath: str, parse, fallback, root: Path | None = None):
     """Read a career-ops contract file, cached until its mtime changes.
 
     The shared shape behind every "career-ops ships this as data" read: resolve
@@ -114,13 +114,15 @@ def load_contract(relpath: str, parse, fallback):
     parser dependency. It never raises: a contract we cannot read must degrade to
     the constant, never take the caller down.
 
-    `parse(text)` returns the loaded value, or None to decline it.
+    `parse(text)` returns the loaded value, or None to decline it. `root` is the
+    checkout to read under, for a caller already holding one; by default, the
+    one `career_ops_dir()` names.
 
     Two performance rules are load-bearing, because callers reach this once per
     tracker ROW, not once per parse. The stat is on a memoized path STRING —
     rebuilding the Path was 76% of the call — and a declined parse caches the
     fallback rather than re-reading a file that will fail again on the next row."""
-    key = f"{career_ops_dir()}/{relpath}"
+    key = f"{career_ops_dir() if root is None else root}/{relpath}"
     try:
         mtime = os.stat(key).st_mtime_ns
     except OSError:
