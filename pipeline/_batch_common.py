@@ -618,13 +618,14 @@ _TRACKER_TSV_COLUMNS = len(ADDITION_COLUMNS)
 # and the one `write_job_result` puts above every row it writes for a checkout
 # that reads it (`reads_labelled_additions`), because career-ops#6062 refuses a
 # headerless addition outright. Its first nine labels are ADDITION_COLUMNS in
-# order — the only reason the positional chain can address the data row beneath
-# it (`_positional_addition`). The tenth is the `url` column the worker fills
-# and our writer leaves empty: the posting URL lives in Notes, where every
-# reader here looks for it, and a URL cell on a tracker with no URL column only
-# makes merge-tracker warn that its URL dedup is inactive. One copy, which the
-# tests import; `tests/test_merge_tracker_contract.py` holds it to the prompt
-# wherever a checkout is at hand.
+# order — the order the positional chain addresses a headed data row in, and
+# the one `_positional_addition` puts a headed file in any other order into.
+# The tenth is the `url` column the worker fills and our writer leaves empty:
+# the posting URL lives in Notes, where every reader here looks for it, and a
+# URL cell on a tracker with no URL column only makes merge-tracker warn that
+# its URL dedup is inactive. One copy, which the tests import;
+# `tests/test_merge_tracker_contract.py` holds it to the prompt wherever a
+# checkout is at hand.
 ADDITION_LABELS = (*ADDITION_COLUMNS, "url")
 ADDITION_LABEL_LINE = "\t".join(ADDITION_LABELS)
 # Every cell the sanitizers below reach for, resolved from that list rather than
@@ -641,10 +642,12 @@ _PDF_IDX = ADDITION_COLUMNS.index("pdf")
 # The cells merge-tracker's headed parser refuses BLANK ("present but empty —
 # use the documented sentinel"; tracker-parse.mjs's `TSV_REQUIRED_FIELDS`),
 # which its headerless parser never checked: every label but `notes` and `url`.
+# The same list is the labels a headed file must carry at all — a header short
+# of one is refused outright — which is what `_addressable_order` asks of it.
 _REQUIRED_IDXS = [ADDITION_COLUMNS.index(name) for name in (
     "num", "date", "company", "role", "status", "score", "pdf", "report")]
 # What the evaluation prompt tells the model to write in the PDF column
-# (`build_system_prompt`), and so what `labelled_addition` writes into a PDF
+# (`build_system_prompt`), and so what `_fill_required_cells` writes into a PDF
 # cell the model left blank.
 _PDF_CELL = "null"
 
@@ -653,6 +656,14 @@ _PDF_CELL = "null"
 # where they should be. `app/data.py:_realign_cells` anchors on the same cell for
 # the same reason.
 _REPORT_CELL_RE = re.compile(r"^\[\w+\]\([^)]+\)$")
+# The Report value merge-tracker documents for a row with no report — the
+# discarded, never-scored row — and so the one other value a headed row's
+# Report cell may anchor on.
+_REPORT_SENTINEL = "—"
+# A cell that is nothing but a URL: merge-tracker's own test, in
+# `parseHeadedAddition`, for the one TYPED optional column — `\S*`, and any
+# case, as it is written there.
+_BARE_URL_CELL_RE = re.compile(r"https?://\S*", re.I)
 
 # Labels a first line needs before it is READ as a header row at all — the
 # threshold merge-tracker's `looksLikeTsvHeaderRow` uses.
@@ -687,6 +698,25 @@ def _split_addition_line(line: str) -> list[str]:
     return [c.strip() for c in line.split("\t")]
 
 
+def _resolve_labels(cells: list[str]) -> tuple[dict[str, int], list[str]]:
+    """A header row's `{field: column}` and the fields it labels more than
+    once, as upstream's `resolveTsvColumns` (tracker-parse.mjs) resolves them:
+    the first occurrence goes in the map, and a repeat is reported rather than
+    picked."""
+    aliases = header_aliases()
+    fields: dict[str, int] = {}
+    repeated: list[str] = []
+    for i, cell in enumerate(cells):
+        key = aliases.get(cell.strip().lower())
+        if key is None:
+            continue
+        if key in fields:
+            repeated.append(key)
+        else:
+            fields[key] = i
+    return fields, repeated
+
+
 def _addition_lines(text: str) -> tuple[list[str], dict[str, int] | None]:
     """An addition file's non-blank lines, and `{field: column}` when the first
     of them is a HEADER row, else None.
@@ -698,7 +728,7 @@ def _addition_lines(text: str) -> tuple[list[str], dict[str, int] | None]:
     row is accepted until career-ops#6062, so both arrive. Detected by
     merge-tracker's own rule (`looksLikeTsvHeaderRow`) against the alias table
     career-ops ships (`header_aliases`) and resolved by its first-occurrence
-    rule (`resolveTsvColumns`): the first cell is not all digits (a data row
+    rule (`_resolve_labels`): the first cell is not all digits (a data row
     leads with its tracker number) and at least three DISTINCT fields are
     recognised, so a data row would need three header words in three cells to
     be taken for one. Lines split on `\\r?\\n`, as merge-tracker splits them.
@@ -710,12 +740,7 @@ def _addition_lines(text: str) -> tuple[list[str], dict[str, int] | None]:
     cells = _split_addition_line(lines[0])
     if len(cells) < _ADDITION_HEADER_MIN_LABELS or re.fullmatch(r"[0-9]+", cells[0]):
         return lines, None
-    aliases = header_aliases()
-    fields: dict[str, int] = {}
-    for i, cell in enumerate(cells):
-        key = aliases.get(cell.lower())
-        if key is not None:
-            fields.setdefault(key, i)
+    fields, _ = _resolve_labels(cells)
     return lines, (fields if len(fields) >= _ADDITION_HEADER_MIN_LABELS else None)
 
 
@@ -736,20 +761,165 @@ def headed_addition_row(text: str) -> dict[str, str] | None:
 
 def _positional_addition(text: str) -> tuple[str, str] | None:
     """`(header, row)` for the positional sanitize chain: `header` is "" for a
-    headerless addition, or the label line and its newline — to be written back
-    untouched — when the labels are in `ADDITION_COLUMNS` order. That is the
-    order career-ops' batch prompt tells the worker to write, so its data row IS
-    the positional row every step already reads. None for a headed file in any
-    other layout: merge-tracker reads it by name, while this chain rewrites
-    cells by index and would rewrite the wrong ones, so it is left as written.
-    A repaired row goes back out through `_rejoin_addition`."""
+    headerless addition, or a label line and its newline whose first nine
+    labels are `ADDITION_COLUMNS` in order. That is the order career-ops' batch
+    prompt tells the worker to write, so its data row IS the positional row
+    every step already reads, and such a file comes back exactly as it was
+    read. A headed file in any other order is put into that one by name first
+    (`_reordered_addition`): merge-tracker reads it by name, while this chain
+    rewrites cells by index, and in another order index 5 is not the score
+    (#191). None for a headed file the chain must not address — no single data
+    row, or one `_addressable_order` declines, in either order — which is left
+    as written. A repaired row goes back out through `_addition_text`."""
     lines, fields = _addition_lines(text)
     if fields is None:
         return "", text
-    in_place = all(fields.get(name) == i for i, name in enumerate(ADDITION_COLUMNS))
-    if len(lines) != 2 or not in_place:
+    if len(lines) != 2:
         return None
-    return lines[0] + "\n", lines[1]
+    order = _addressable_order(lines[0], lines[1])
+    if order is None:
+        return None
+    if order == list(range(len(order))):        # the nine in place, the rest as written
+        return lines[0] + "\n", lines[1]
+    return _reordered_addition(lines[0], lines[1], order)
+
+
+def _addressable_order(header: str, row: str) -> list[int | None] | None:
+    """Where each cell of a headed addition belongs for the positional chain —
+    the column carrying each of `ADDITION_COLUMNS` (None for an absent `notes`
+    label), then `url`'s, then every other label's in the order written — or
+    None, and the file is left as written. Asked of a file in the batch
+    prompt's order too, so the two readings decline the same files. `url` goes
+    first among the rest because the chain takes the first URL after the nine
+    as the row's own (`_first_url`), and an `apply link` written before it is
+    a careers page, which would route the role to handoff's `other` session.
+
+    The rule is the one `_row_parts` states for a headerless row: the chain
+    must never turn a row merge-tracker refuses into one it merges with cells
+    in the wrong places. A refusal the loss guard names is recoverable; a
+    silently merged garbage row is not. So the file is addressed only when
+    every cell's place is certain, read exactly as `parseHeadedAddition` reads
+    it, and declined:
+
+    - when merge-tracker refuses it whatever is done to its data row: a header
+      that labels a field twice (merge-tracker will not pick which column
+      carries it, and neither does this) or lacks a required label
+      (`_REQUIRED_IDXS`), a row short of a required cell, and a required cell
+      present but blank that `_fill_required_cells` has no value for once the
+      chain's own `N/A` is in the score;
+    - when a bare URL sits under a recognised label other than `url` while the
+      `url` cell is absent — `parseHeadedAddition`'s refusal of a row whose
+      optional cells may have shifted, mirrored exactly. Padding (see
+      `_rejoin_addition`) would make the `url` cell present and the row merge
+      on our guess at which cell was left out;
+    - unless the Report cell is a `[N](path)` link or the `—` sentinel. merge-
+      tracker lets a row stop before its optional cells and reads every
+      present cell by its label, so a row that left out an INTERIOR cell is
+      read one label off from that cell on: the report link under `pdf`, the
+      note under `report`. It catches that only when the shift reaches the
+      score, and the chain's score repair is exactly what would hide it. The
+      Report cell is the one whose shape says it is in place, as `_row_parts`
+      anchors a wide headerless row;
+    - when the row is short of a label merge-tracker recognises (its
+      `shortLabels`; a blank or unknown label cannot make a row short) and
+      the labels from the Report cell to the last recognised one are anything
+      but the batch prompt's own tail — `notes` then `url`, either alone, or
+      neither (`_is_prompt_tail`). The anchor vouches for the cells up to the
+      Report; after it, a short row's cells are certain only when the ones it
+      can have left out are its last. With any other label there — a
+      required one, an optional `via` or `location`, one merge-tracker does
+      not know, or `url` before `notes` — which cell was left out is a guess,
+      and merge-tracker reads the note as the agency, or as the URL, a shift
+      that never reaches the score. The misplaced-URL rule above settles the
+      one ambiguity the prompt's tail leaves: a URL where the note should be.
+
+    Declined too when the row has a non-empty cell past its last label (see
+    the comment below). A pipe row is declined as every step declines one."""
+    if header.startswith("|") or row.startswith("|"):
+        return None
+    labels = header.split("\t")
+    column, repeated = _resolve_labels(labels)
+    cells = _split_addition_line(row)
+    # More cells than labels — a tab inside Notes, say — is the mirror of a
+    # short row: the width alone cannot say whether the extra cell trails the
+    # row or was inserted after the Report cell, so every label from there on
+    # may be one off (the note under `url`). merge-tracker refuses a bare score
+    # on such a row; repairing it would merge the shift.
+    if any(cell.strip() for cell in cells[len(labels):]):
+        return None
+    order = [column.get(name) for name in ADDITION_COLUMNS]
+    required = [order[i] for i in _REQUIRED_IDXS]
+    if repeated or None in required or max(required) >= len(cells):
+        return None
+    url = column.get("url")
+    if url is not None and url >= len(cells) and any(
+            field != "url" and i < len(cells) and _BARE_URL_CELL_RE.fullmatch(cells[i])
+            for field, i in column.items()):
+        return None
+    report = order[_REPORT_IDX]
+    if not (_REPORT_CELL_RE.match(cells[report]) or cells[report] == _REPORT_SENTINEL):
+        return None
+    # Short as merge-tracker's `shortLabels` counts it: a RECOGNISED label with
+    # no cell. A blank or unknown label it skips cannot make a whole row short.
+    last = max(column.values())
+    if last >= len(cells):
+        field_at = {i: field for field, i in column.items()}
+        # Every label from the Report cell to the last recognised one, an
+        # unknown one as None — which no tail contains.
+        if not _is_prompt_tail(field_at.get(i) for i in range(report + 1, last + 1)):
+            return None
+    nine = [cells[i] if i is not None and i < len(cells) else "" for i in order]
+    if _fill_required_cells(_normalize_score_cell("\t".join(nine)).split("\t")) is None:
+        return None
+    placed = set(order)
+    rest = [i for i in range(len(labels)) if i not in placed]
+    if url is not None:             # first after the nine, where `_first_url` looks
+        rest.remove(url)
+        rest.insert(0, url)
+    return order + rest
+
+
+# The labels after the Report cell in the batch prompt's line — the only cells a
+# short headed row may have left out (`_addressable_order`).
+_PROMPT_TAIL = ADDITION_LABELS[_REPORT_IDX + 1:]
+
+
+def _is_prompt_tail(fields) -> bool:
+    """Whether `fields`, in the order written, are `_PROMPT_TAIL` with any of
+    its labels absent — `notes` then `url`, either alone, or neither. Each
+    `in` consumes the iterator up to its match, so a label out of order, or
+    one not in the tail at all, is not found."""
+    tail = iter(_PROMPT_TAIL)
+    return all(field in tail for field in fields)
+
+
+def _reordered_addition(header: str, row: str, order: list[int | None]) -> tuple[str, str]:
+    """A headed addition whose labels are in some other order, as
+    `(label line + newline, data row)` with its cells moved BY NAME as
+    `_addressable_order` places them: `ADDITION_COLUMNS` order, then `url`,
+    then the remaining labels in the order they were written (`via`, `apply
+    link`, an unrecognised label), and the label line rewritten to match.
+
+    The realistic case is an agent CLI following the batch prompt's "add a
+    `via` column" by putting it after `company`, where the tracker's own Via
+    layout has it, and writing a bare `4.2`. The file stays labelled, for the
+    never-scored row `_addition_lines` describes, and once rewritten it is in
+    place, so a second pass reads it as such and changes nothing.
+
+    A missing optional `notes` label is added. A row written short stays
+    short: a missing cell becomes "" only when a later cell needs its place,
+    and padding is left to `_rejoin_addition`, for the reason given there.
+    Cells past the last label, which merge-tracker ignores, are carried at the
+    end."""
+    labels = header.split("\t")
+    cells = row.split("\t")
+    moved: list[str | None] = [cells[i] if i is not None and i < len(cells) else None
+                               for i in order] + cells[len(labels):]
+    while moved and moved[-1] is None:
+        moved.pop()
+    new_labels = [labels[i] if i is not None else "notes" for i in order]
+    return ("\t".join(new_labels) + "\n",
+            "\t".join("" if cell is None else cell for cell in moved))
 
 
 def _rejoin_addition(header: str, row: str) -> str:
@@ -764,9 +934,11 @@ def _rejoin_addition(header: str, row: str) -> str:
     what the chain's URL injection does, is that shape: a row that merged as the
     worker wrote it was refused once repaired. Only the optional tail is padded,
     so a row short of a required cell stays short, and refused. And it is padded
-    here, on the way out, not before the chain: `_row_parts` takes a nine-cell
-    row as it stands but anchors a longer one on a `[N](path)` Report cell, so a
-    padded row carrying the `—` sentinel there lost every repair."""
+    here, on the way out, with the chain given a headed row's nine alone
+    (`_chain_cells`): `_row_parts` takes a nine-cell row as it stands but
+    anchors a longer one on a `[N](path)` Report cell, so a row carrying the `—`
+    sentinel there — padded first, or written ten cells wide as the batch
+    prompt's own row is — lost every repair."""
     if header:
         width = len(_split_addition_line(header.rstrip("\r\n")))
         have = row.count("\t") + 1
@@ -814,11 +986,11 @@ def labelled_addition(tracker_tsv: str) -> str | None:
     by the same rule; labelled as written, a row it used to merge is refused.
 
     The headed parser also refuses a BLANK required cell, which the headerless
-    one never checked, so labels must not turn a blank cell into a refusal. A
-    blank PDF gets what the prompt tells the model to write there (`_PDF_CELL`),
-    and a blank score is `N/A` by the time the chain is done; any other blank
-    required cell declines the row, which a checkout before #6062 then merges
-    headerless as it always did."""
+    one never checked, so labels must not turn a blank cell into a refusal
+    (`_fill_required_cells`): a blank PDF gets what the prompt tells the model
+    to write there, and a blank score is `N/A` by the time the chain is done;
+    any other blank required cell declines the row, which a checkout before
+    #6062 then merges headerless as it always did."""
     parts = _row_parts(tracker_tsv)
     if parts is None or not _REPORT_CELL_RE.match(parts[_REPORT_IDX].strip()):
         return None
@@ -829,11 +1001,35 @@ def labelled_addition(tracker_tsv: str) -> str | None:
         return None
     if is_score_cell(parts[_STATUS_IDX]) and not is_score_cell(parts[_SCORE_IDX]):
         parts[_STATUS_IDX], parts[_SCORE_IDX] = parts[_SCORE_IDX], parts[_STATUS_IDX]
+    parts = _fill_required_cells(parts)
+    if parts is None:
+        return None
+    return _rejoin_addition(ADDITION_LABEL_LINE + "\n", "\t".join(parts))
+
+
+def _fill_required_cells(parts: list[str]) -> list[str] | None:
+    """`parts` — a row's cells, its nine columns in place — with a value in
+    every cell merge-tracker's headed parser requires one in, or None when one
+    is blank that nothing here can fill. The headed parser refuses such a row
+    ("present but empty"), which the headerless parser never did.
+
+    One rule for every labelled row: the ones this repo labels
+    (`labelled_addition`) and the ones a worker labelled (`_addressable_order`
+    declines the rest, `_addition_text` fills the PDF). A blank PDF gets what
+    the prompt tells the model to write there (`_PDF_CELL`). Any other blank
+    required cell has no value the model meant, so the row is declined. A
+    blank score is left to the chain, which writes `N/A` into one
+    (`_normalize_score_cell`) — so by the time a row reaches this, its score
+    is blank only where the chain left it blank on purpose, and that declines
+    too."""
+    if len(parts) <= max(_REQUIRED_IDXS):
+        return None
+    parts = list(parts)
     if not parts[_PDF_IDX].strip():
         parts[_PDF_IDX] = _PDF_CELL
     if any(not parts[i].strip() for i in _REQUIRED_IDXS):
         return None
-    return _rejoin_addition(ADDITION_LABEL_LINE + "\n", "\t".join(parts))
+    return parts
 
 
 # What a merge-tracker that reads labelled additions has and an older one does
@@ -872,13 +1068,44 @@ def _addition_text(header: str, row: str, career_ops: Path) -> str:
     """The file text for a sanitized addition `row` under `header`, written
     into `career_ops`'s queue — the one place labels are decided. A headerless
     row (`header` "") goes under the label line when the checkout reads labels
-    and `labelled_addition` takes it, and out as it stands otherwise; a headed
-    one keeps its own line."""
-    if not header and reads_labelled_additions(career_ops):
-        labelled = labelled_addition(row)
-        if labelled is not None:
-            return labelled
-    return _rejoin_addition(header, row)
+    and `labelled_addition` takes it, and out as it stands otherwise. A headed
+    one keeps the line `_positional_addition` gave it, with a blank PDF filled
+    on `labelled_addition`'s terms (`_fill_required_cells`) — after the chain,
+    so that it counts as the repair it is; `_addressable_order` has already
+    declined a row with any other blank required cell."""
+    if not header:
+        if reads_labelled_additions(career_ops):
+            labelled = labelled_addition(row)
+            if labelled is not None:
+                return labelled
+        return _rejoin_addition(header, row)
+    filled = _fill_required_cells(row.split("\t"))
+    return _rejoin_addition(header, row if filled is None else "\t".join(filled))
+
+
+def _chain_cells(header: str, row: str) -> tuple[str, list[str]]:
+    """`(what the sanitize chain runs on, the cells carried past it)` for a
+    `row` that `_positional_addition` split off under `header`; the caller
+    puts the two back together as `"\\t".join([fixed, *carried])`.
+
+    A HEADERLESS row is the chain's whole, and `_row_parts` decides whether its
+    cells are in place — anchoring a row wider than nine on its `[N](path)`
+    Report link, because a width alone cannot tell a trailing extra cell from
+    an inserted one. A HEADED row's labels have already answered that:
+    `_addressable_order` placed its nine in `ADDITION_COLUMNS` order or
+    declined the file. So the chain gets just those nine, which `_row_parts`
+    takes as they stand, and the cells after them (`url`, `via`, …) come back
+    unchanged. Given the whole row, a wide headed row met the link anchor its
+    labels make redundant, and one with the `—` Report sentinel — the batch
+    prompt's own ten-cell never-scored row among them — got no score fix, URL,
+    req id or mark. This rather than teaching `_row_parts` the sentinel: that
+    guard is called from inside every step with no header in hand, and for a
+    headerless row its anchor is the only thing that makes positions
+    trustworthy, so it stays exactly as it is."""
+    if not header:
+        return row, []
+    cells = row.split("\t")
+    return "\t".join(cells[:_TRACKER_TSV_COLUMNS]), cells[_TRACKER_TSV_COLUMNS:]
 
 
 def _row_parts(tracker_tsv: str) -> list[str] | None:
@@ -898,7 +1125,13 @@ def _row_parts(tracker_tsv: str) -> list[str] | None:
     leaves it at index 7, an inserted one shifts it.
 
     Nine cells are taken as-is — that is our own prompt's shape, and the chain
-    has always operated on it without an anchor check. Fewer than nine is
+    has always operated on it without an anchor check. That includes an 8-cell
+    row `_restore_trailing_cells` has padded, which is why a HEADED row is
+    anchored before the chain ever sees it (`_addressable_order`): read by
+    name, one that left out an interior cell is otherwise exactly the nine
+    cells this takes, one label off from that cell on. A headed row that
+    passes reaches this as its nine alone (`_chain_cells`), since its labels,
+    not this anchor, are what place its cells. Fewer than nine is
     declined by EVERY step, `_strip_role_pipe` included, so a short row cannot
     change on disk and be reported as repaired."""
     # A whitespace-only row splits to nine EMPTY cells — `_restore_trailing_cells`
@@ -1790,8 +2023,30 @@ def _trailing_url(tracker_tsv: str) -> str:
     notes injector uses to ask "already present", or a `HTTPS://` cell would be
     detected here, prepended, and not recognised on the next pass: the chain
     grew a URL per merge."""
-    parts = _row_parts(tracker_tsv)
-    for cell in (parts or [])[_TRACKER_TSV_COLUMNS:]:
+    return _first_url((_row_parts(tracker_tsv) or [])[_TRACKER_TSV_COLUMNS:])
+
+
+def _carried_url(header: str, carried: list[str]) -> str:
+    """The posting URL a row carries past the chain's nine. When the header
+    labels `url`, only THAT cell counts, found by its label: an empty url cell
+    means no URL, never another column's — an `apply link` careers page would
+    send the role to handoff's `other` session and the board's posting link to
+    a careers page. A headerless row, or a header with no url label, falls back
+    to the first URL-shaped carried cell."""
+    if header:
+        url = _resolve_labels(header.split("\t"))[0].get("url")
+        if url is not None:
+            i = url - _TRACKER_TSV_COLUMNS
+            cell = carried[i].strip() if 0 <= i < len(carried) else ""
+            return cell if _NOTES_URL_RE.match(cell) else ""
+    return _first_url(carried)
+
+
+def _first_url(cells: list[str]) -> str:
+    """The first of `cells` that is a URL, on `_trailing_url`'s terms — for
+    the cells a headed row carries past the chain's nine (`_chain_cells`),
+    which `_addressable_order` has put `url` first among."""
+    for cell in cells:
         if _NOTES_URL_RE.match(cell.strip()):
             return cell.strip()
     return ""
@@ -1908,12 +2163,15 @@ def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
     same-numbered files the row meant.
 
     A headed addition (career-ops#3706) is sanitized through its data row, its
-    label line written back, on `_positional_addition`'s terms. A HEADERLESS row
-    goes back under the label line where the writer would put one
-    (`_addition_text`), because career-ops#6062 refuses one without labels:
-    what an older version of this repo wrote, or Add-Job before the writer
-    labelled its rows, would otherwise sit refused in the queue on a checkout
-    that has pulled it.
+    label line written back, on `_positional_addition`'s terms; one labelled in
+    another order is rewritten in the batch prompt's order only when the chain
+    repairs something in it, and one whose cells' places are not certain — or
+    that merge-tracker refuses whatever is repaired — is left exactly as
+    written (`_addressable_order`). A HEADERLESS row goes back under the label line
+    where the writer would put one (`_addition_text`), because career-ops#6062
+    refuses one without labels: what an older version of this repo wrote, or
+    Add-Job before the writer labelled its rows, would otherwise sit refused in
+    the queue on a checkout that has pulled it.
 
     A pipe-delimited row is left alone: every step here splits on tabs and
     no-ops on it, and turning it into a tab row would be a guess at its cells.
@@ -1924,23 +2182,28 @@ def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
     changed = 0
     for f in sorted(tracker_dir.glob("*.tsv")):
         # None: unreadable (one such row must not hold up the other nine), or
-        # headed in a layout the chain cannot address by index.
+        # headed in a shape whose cells' places its labels cannot make certain.
         split = _read_positional(f)
         if split is None:
             continue
         header, row = split
+        chained, carried = _chain_cells(header, row)
         # One resolution per addition, shared by the two passes that need it.
-        report = _row_report(career_ops, row)
-        work_location, decision = _pending_report_marks(row, report)
-        fixed = sanitize_addition(row, urls.get(f.stem, ""),
+        report = _row_report(career_ops, chained)
+        work_location, decision = _pending_report_marks(chained, report)
+        fixed = sanitize_addition(chained, urls.get(f.stem, "") or _carried_url(header, carried),
                                   read_text(jd_cache_path(career_ops, f.stem)),
-                                  report_file=_dead_link_repair(career_ops, row, report),
+                                  report_file=_dead_link_repair(career_ops, chained, report),
                                   work_location=work_location, decision=decision)
-        text = _addition_text(header, fixed, career_ops)
+        text = _addition_text(header, "\t".join([fixed, *carried]), career_ops)
         # Nothing repaired and no label line gained. The ROW, not the file read:
         # rejoining drops a blank line between a header and its row, which
-        # would count an unchanged row as repaired.
-        if fixed == row and text == _rejoin_addition(header, row):
+        # would count an unchanged row as repaired. And the row as the chain's
+        # first step normalises it: the empty Notes cell it gives a row that
+        # stopped before one is not a repair, and for a headed file in another
+        # order, counting it rewrote the file in the prompt's order with
+        # nothing done to it.
+        if fixed == _restore_trailing_cells(chained) and text == _rejoin_addition(header, row):
             continue
         try:
             atomic_write_text(f, text)
@@ -2458,8 +2721,11 @@ def _recover_refused_additions(career_ops: Path, tracker_dir: Path) -> None:
     and doomed gets one retry: after it, the archived copy is the repaired one,
     and the score no longer changes.)
 
-    A headed addition comes back through its data row with its label line kept,
-    on `_sanitize_pending_additions`' terms (`_positional_addition`); a
+    A headed addition comes back through its data row on
+    `_sanitize_pending_additions`' terms (`_positional_addition`): under its
+    own label line when that is in the batch prompt's order, and under one
+    rewritten into that order, its cells moved with their labels, when it is
+    not; one that pass would leave as written stays in `merged/`. A
     headerless one comes back as it was, and that pass labels it if the
     checkout reads labels. A row already back in the queue is left to the merge
     in progress.
@@ -2486,13 +2752,15 @@ def _recover_refused_additions(career_ops: Path, tracker_dir: Path) -> None:
         if split is None:
             continue
         header, row = split
-        full = _restore_trailing_cells(row)
+        chained, carried = _chain_cells(header, row)
+        full = _restore_trailing_cells(chained)
         if _normalize_score_cell(full) == full:
             continue                    # refused for a reason we cannot fix
-        fixed = sanitize_addition(row, urls.get(Path(add["name"]).stem, ""),
-                                  read_text(jd_cache_path(career_ops, Path(add["name"]).stem)))
+        stem = Path(add["name"]).stem
+        fixed = sanitize_addition(chained, urls.get(stem, "") or _carried_url(header, carried),
+                                  read_text(jd_cache_path(career_ops, stem)))
         try:
-            atomic_write_text(dst, _rejoin_addition(header, fixed))
+            atomic_write_text(dst, _rejoin_addition(header, "\t".join([fixed, *carried])))
         except OSError:
             continue
         restored += 1

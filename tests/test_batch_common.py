@@ -2011,6 +2011,14 @@ class TestInjectReqIdIntoNotes:
 
 
 
+# #191's own case: an agent CLI told to "add a `via` column" puts it where the
+# tracker's Via layout has it, after `company`, and writes a bare score. Read by
+# the sanitizer's tests and by recovery's.
+_VIA_LABELS = "num\tdate\tcompany\tvia\trole\tstatus\tscore\tpdf\treport\tnotes\turl"
+_VIA_ROW = ("11\t2026-09-01\tAcme Corp\tHays\tPlatform Engineer | Remote\tEvaluated\t4.2\t"
+            "null\t[229](reports/229-acme.md)\tAPPLY\thttps://own/j/9")
+
+
 class TestSanitizePendingAdditions:
     """career-ops' own evaluators write straight into tracker-additions/, never
     entering Python — so those rows reached a merge with none of the chain
@@ -2297,20 +2305,436 @@ class TestSanitizePendingAdditions:
         cells = (additions / "7.tsv").read_text(encoding="utf-8").split("\n")[1].split("\t")
         assert cells[5] == "4.2/5" and len(cells) == len(ADDITION_LABEL_LINE.split("\t"))
 
-    def test_a_headed_row_in_another_order_is_left_as_written(self, tmp_path, capsys):
+    def test_a_headed_row_in_another_order_is_repaired_still_labelled(self, tmp_path, capsys):
         """merge-tracker reads a headed file by NAME, in any order; the chain
         rewrites cells by INDEX. In this order index 5 is the status, so the
-        score repair would write N/A over `Evaluated` and leave the bare `4.2`
-        it was for — and the Report cell, still at index 7, gets that row past
-        every shape guard. A file the chain cannot address is left for
-        merge-tracker to judge by name."""
+        chain run on the row as written would write N/A over `Evaluated` and
+        leave the bare `4.2` it was for — and the Report cell, still at index 7,
+        gets that row past every shape guard. So this file used to be left as
+        written, and its bare score refused for good (#191). It is now put into
+        the batch prompt's order BY ITS LABELS first, repaired there, and
+        written back labelled — the label line proving the order, the by-name
+        read proving each value went with its label."""
         reordered = ("company\trole\tnum\tdate\tscore\tstatus\tpdf\treport\tnotes\n"
                      "Initech\tPlatform Engineer\t3\t2026-08-25\t4.2\tEvaluated\tnull\t"
                      "[003](reports/003-x.md)\tAPPLY")
         co, additions = self._tree(tmp_path, rows={"7.tsv": reordered})
         _sanitize_pending_additions(co, additions)
-        assert (additions / "7.tsv").read_text(encoding="utf-8") == reordered + "\n"
+        assert _label_line(additions / "7.tsv") == "\t".join(ADDITION_COLUMNS)
+        row = headed_addition_row(read_addition(additions / "7.tsv"))
+        assert (row["num"], row["company"], row["role"], row["status"], row["score"]) == (
+            "3", "Initech", "Platform Engineer", "Evaluated", "4.2/5")
+        assert row["notes"] == "req 88214 — https://x/j/7 — APPLY"
+        assert "sanitized 1 addition" in capsys.readouterr().out
+
+    def test_a_via_column_after_company_goes_after_the_nine(self, tmp_path):
+        """Every cell moves with its label, and the labels that are not among
+        the nine follow them — `url` first, where the chain looks for the
+        row's own URL, then the rest (`via`) in the order they were written."""
+        co, additions = self._tree(
+            tmp_path, rows={"229-acme.tsv": _VIA_LABELS + "\n" + _VIA_ROW}, queued=False)
+        _sanitize_pending_additions(co, additions)
+        assert _label_line(additions / "229-acme.tsv") == "\t".join(
+            [*ADDITION_COLUMNS, "url", "via"])
+        assert self._cells(additions, "229-acme.tsv") == [
+            "11", "2026-09-01", "Acme Corp", "Platform Engineer", "Evaluated", "4.2/5", "null",
+            "[229](reports/229-acme.md)", "https://own/j/9 — APPLY", "https://own/j/9", "Hays"]
+
+    def test_a_reordered_file_is_in_place_on_the_next_pass(self, tmp_path, capsys):
+        """Idempotent after the first rewrite: the file is then in the order
+        the chain addresses, so a second pass reads it as written and neither
+        rewrites nor counts it."""
+        co, additions = self._tree(tmp_path, rows={"7.tsv": _VIA_LABELS + "\n" + _VIA_ROW})
+        _sanitize_pending_additions(co, additions)
+        once = (additions / "7.tsv").read_bytes()
+        # The first pass did reorder it, or two passes over an untouched file
+        # would pass this too.
+        assert once.decode("utf-8").splitlines()[0].startswith("\t".join(ADDITION_COLUMNS))
+        assert "sanitized 1 addition" in capsys.readouterr().out
+        _sanitize_pending_additions(co, additions)
+        assert (additions / "7.tsv").read_bytes() == once
+        assert capsys.readouterr().out == ""
+
+    def test_another_order_with_nothing_to_repair_is_not_rewritten(self, tmp_path, capsys):
+        """The order is not itself a defect — merge-tracker reads it by name —
+        so a file the chain has nothing to do to stays exactly as written."""
+        done = _VIA_ROW.replace("\t4.2\t", "\t4.2/5\t").replace(" | Remote", "").replace(
+            "\tAPPLY\t", "\treq 88214 — https://x/j/7 — APPLY\t")
+        text = _VIA_LABELS + "\n" + done
+        co, additions = self._tree(tmp_path, rows={"7.tsv": text})
+        _sanitize_pending_additions(co, additions)
+        assert (additions / "7.tsv").read_text(encoding="utf-8") == text + "\n"
         assert "sanitized" not in capsys.readouterr().out
+
+    def test_a_missing_notes_label_is_added(self, tmp_path):
+        """`notes` is optional to merge-tracker, but it is where the chain
+        writes the URL and the req id. Added with its cell, so the `via` and
+        `url` cells after it keep their labels."""
+        text = ("num\tdate\tcompany\tvia\trole\tstatus\tscore\tpdf\treport\turl\n"
+                "3\t2026-08-25\tInitech\tHays\tSRE\tEvaluated\t4.2\tnull\t"
+                "[003](reports/003-x.md)\thttps://own/j/9")
+        co, additions = self._tree(tmp_path, rows={"7.tsv": text})
+        _sanitize_pending_additions(co, additions)
+        row = headed_addition_row(read_addition(additions / "7.tsv"))
+        assert _label_line(additions / "7.tsv") == "\t".join([*ADDITION_COLUMNS, "url", "via"])
+        assert (row["score"], row["via"], row["url"]) == ("4.2/5", "Hays", "https://own/j/9")
+        assert row["notes"] == "req 88214 — https://x/j/7"
+
+    def test_a_never_scored_row_keeps_its_order_by_keeping_its_labels(self, tmp_path):
+        """A discarded, never-scored row carries `—` as both its score and its
+        status, which no content rule can order — the headerless parser refuses
+        it, and only a label line says which cell is which (career-ops#3517). So
+        the file is reordered, never flattened: still two lines, the pair under
+        the labels it was written under."""
+        text = ("company\trole\tnum\tdate\tscore\tstatus\tpdf\treport\tnotes\n"
+                "Initech\tSRE\t3\t2026-08-25\t—\t—\tnull\t—\tclosed before scoring")
+        co, additions = self._tree(tmp_path, rows={"7.tsv": text})
+        _sanitize_pending_additions(co, additions)
+        lines = read_addition(additions / "7.tsv").splitlines()
+        assert len(lines) == 2 and lines[0] == "\t".join(ADDITION_COLUMNS)
+        row = headed_addition_row(read_addition(additions / "7.tsv"))
+        assert (row["company"], row["role"], row["status"], row["score"], row["report"]) == (
+            "Initech", "SRE", "—", "—", "—")
+        assert row["notes"] == "req 88214 — https://x/j/7 — closed before scoring"
+
+    @pytest.mark.parametrize("text", [
+        # No `pdf` label: merge-tracker refuses the header outright.
+        "num\tdate\tcompany\tvia\trole\tstatus\tscore\treport\tnotes\n"
+        "3\t2026-08-25\tInitech\tHays\tSRE\tEvaluated\t4.2\t[003](reports/003-x.md)\tAPPLY",
+        # `company` labelled twice: merge-tracker will not pick which one is it.
+        "num\tdate\tcompany\tcompany\trole\tstatus\tscore\tpdf\treport\n"
+        "3\t2026-08-25\tInitech\tGlobex\tSRE\tEvaluated\t4.2\tnull\t[003](reports/003-x.md)",
+        # The nine in place and a label repeated after them: refused the same
+        # way, so the batch prompt's order is no shortcut past it.
+        ADDITION_LABEL_LINE + "\turl\n"
+        "3\t2026-08-25\tInitech\tSRE\tEvaluated\t4.2\tnull\t[003](reports/003-x.md)\tAPPLY\t"
+        "https://x/j/7\thttps://x/j/7",
+        # The row stops before its required `report` cell.
+        "num\tdate\tcompany\tvia\trole\tstatus\tscore\tpdf\treport\tnotes\n"
+        "3\t2026-08-25\tInitech\tHays\tSRE\tEvaluated\t4.2\tnull",
+        # A pipe row under labels in another order: a guess at its cells.
+        "| company | role | num | date | score | status | pdf | report | notes |\n"
+        "| Initech | SRE | 3 | 2026-08-25 | 4.2 | Evaluated | null | [003](reports/003-x.md) | APPLY |",
+    ], ids=["no-pdf-label", "company-twice", "url-twice-in-place", "short-of-report", "pipe"])
+    def test_a_file_merge_tracker_refuses_whatever_is_done_is_left_as_written(
+            self, tmp_path, capsys, text):
+        """Putting a file in order is only for a file whose labels say where
+        every required cell is. One they do not is refused by merge-tracker
+        whatever is done to it, and repairing it by a guess would be the
+        silent column swap headers exist to prevent."""
+        co, additions = self._tree(tmp_path, rows={"7.tsv": text})
+        _sanitize_pending_additions(co, additions)
+        assert (additions / "7.tsv").read_text(encoding="utf-8") == text + "\n"
+        assert "sanitized" not in capsys.readouterr().out
+
+    @pytest.mark.parametrize("text", [
+        # The reviewer's case: labelled in another order, the PDF value left
+        # out. merge-tracker lets a row stop early and reads every present
+        # cell by its label, so it reads the report link as `pdf` and the note
+        # as `report` — and refuses the row only for its bare score. Repaired
+        # here, it merged exactly that way.
+        "company\trole\tnum\tdate\tscore\tstatus\tpdf\treport\tnotes\n"
+        "Initech\tSRE\t3\t2026-08-25\t4.2\tEvaluated\t[003](reports/003-x.md)\tAPPLY",
+        # The same hole in the batch prompt's order: the 8-cell row was padded
+        # to nine by the chain and taken as it stood.
+        ADDITION_LABEL_LINE + "\n"
+        "3\t2026-08-25\tInitech\tSRE\tEvaluated\t4.2\t[003](reports/003-x.md)\tAPPLY",
+        # The Report cell is in place, but a required label comes after it and
+        # the row is short: the score was left out, `null` reads as the score,
+        # and the anchor cannot say so.
+        "num\tdate\tcompany\trole\treport\tstatus\tscore\tpdf\tnotes\n"
+        "3\t2026-08-25\tInitech\tSRE\t[003](reports/003-x.md)\tEvaluated\tnull\tAPPLY",
+    ], ids=["another-order", "prompt-order", "required-after-report"])
+    def test_a_row_that_left_out_an_interior_cell_is_left_as_written(
+            self, tmp_path, capsys, text):
+        """merge-tracker refuses each of these as written, and the chain's
+        score repair is the one thing that would let it through with every
+        later cell under the wrong label. A Report cell that is not a link (or
+        the `—` sentinel) is how a short row says it is short in the middle."""
+        co, additions = self._tree(tmp_path, rows={"7.tsv": text})
+        _sanitize_pending_additions(co, additions)
+        assert (additions / "7.tsv").read_text(encoding="utf-8") == text + "\n"
+        assert "sanitized" not in capsys.readouterr().out
+
+    def test_a_reordered_row_that_stops_before_notes_is_still_repaired(self, tmp_path):
+        """The short row merge-tracker means to allow: only the last, optional
+        cell left out, so the Report cell is still a link and every required
+        cell is ahead of it."""
+        text = ("company\trole\tnum\tdate\tscore\tstatus\tpdf\treport\tnotes\n"
+                "Initech\tSRE\t3\t2026-08-25\t4.2\tEvaluated\tnull\t[003](reports/003-x.md)")
+        co, additions = self._tree(tmp_path, rows={"7.tsv": text})
+        _sanitize_pending_additions(co, additions)
+        row = headed_addition_row(read_addition(additions / "7.tsv"))
+        assert (row["pdf"], row["report"], row["score"]) == (
+            "null", "[003](reports/003-x.md)", "4.2/5")
+        assert row["notes"] == "req 88214 — https://x/j/7"
+
+    @pytest.mark.parametrize("text", [
+        # The reviewer's case: a `location` label before `notes`, and the URL
+        # under `notes` with no `url` cell.
+        "num\tdate\tcompany\trole\tstatus\tscore\tpdf\treport\tlocation\tnotes\turl\n"
+        "3\t2026-08-25\tInitech\tSRE\tEvaluated\t4.2\tnull\t[003](reports/003-x.md)\t"
+        "Dallas\thttps://x/j/7",
+        # The batch prompt's order: the same refusal, the same answer.
+        ADDITION_LABEL_LINE + "\n"
+        "3\t2026-08-25\tInitech\tSRE\tEvaluated\t4.2\tnull\t[003](reports/003-x.md)\t"
+        "HTTPS://x/j/7",
+    ], ids=["another-order", "prompt-order"])
+    def test_a_bare_url_under_another_label_with_no_url_cell_is_left_as_written(
+            self, tmp_path, capsys, text):
+        """merge-tracker refuses this on purpose: a URL under a label that is
+        not `url`, while the `url` cell is absent, means the optional cells may
+        have shifted one left. Repaired, the row would go out padded — its
+        `url` cell present and empty — and merge on our guess at which cell
+        was left out."""
+        co, additions = self._tree(tmp_path, rows={"7.tsv": text})
+        _sanitize_pending_additions(co, additions)
+        assert (additions / "7.tsv").read_text(encoding="utf-8") == text + "\n"
+        assert "sanitized" not in capsys.readouterr().out
+
+    def test_the_same_url_with_its_url_cell_written_empty_is_repaired(self, tmp_path):
+        """What merge-tracker's refusal asks a writer for — "write an empty
+        cell for each optional value you omit" — so the row it then reads by
+        name is repaired here too."""
+        text = ("num\tdate\tcompany\trole\tstatus\tscore\tpdf\treport\tlocation\tnotes\turl\n"
+                "3\t2026-08-25\tInitech\tSRE\tEvaluated\t4.2\tnull\t[003](reports/003-x.md)\t"
+                "Dallas\thttps://x/j/7\t")
+        co, additions = self._tree(tmp_path, rows={"7.tsv": text})
+        _sanitize_pending_additions(co, additions)
+        # By the labels as written, not `headed_addition_row`: `location` is in
+        # career-ops' alias table and not in the fallback, and either way it is
+        # a label after the nine.
+        labels = _label_line(additions / "7.tsv").split("\t")
+        row = dict(zip(labels, self._cells(additions)))
+        assert labels == [*ADDITION_COLUMNS, "url", "location"]
+        assert (row["score"], row["location"], row["url"]) == ("4.2/5", "Dallas", "")
+        assert row["notes"] == "req 88214 — https://x/j/7"
+
+    @pytest.mark.parametrize("label", ["num", "date", "company", "role", "status", "report"])
+    @pytest.mark.parametrize("labels", [
+        ("company", "role", "num", "date", "score", "status", "pdf", "report", "notes"),
+        ADDITION_COLUMNS,
+    ], ids=["another-order", "prompt-order"])
+    def test_a_blank_required_cell_with_no_value_to_give_it_is_left_as_written(
+            self, tmp_path, capsys, label, labels):
+        """merge-tracker refuses a required cell present but blank, whatever
+        else is repaired, so rewriting the file only to have it refused would
+        count a repair that is not one — and recovery would retry it. The rule
+        is `labelled_addition`'s, for the rows this repo labels."""
+        values = dict(zip(ADDITION_COLUMNS, _tracker_row(score="4.2").split("\t")))
+        values[label] = ""
+        text = "\t".join(labels) + "\n" + "\t".join(values[name] for name in labels)
+        co, additions = self._tree(tmp_path, rows={"7.tsv": text})
+        _sanitize_pending_additions(co, additions)
+        assert (additions / "7.tsv").read_text(encoding="utf-8") == text + "\n"
+        assert "sanitized" not in capsys.readouterr().out
+
+    @pytest.mark.parametrize("labels", [
+        ("company", "role", "num", "date", "score", "status", "pdf", "report", "notes"),
+        ADDITION_COLUMNS,
+    ], ids=["another-order", "prompt-order"])
+    def test_a_blank_pdf_gets_what_the_prompt_asks_for(self, tmp_path, capsys, labels):
+        """The one blank required cell that has a value to give it, as
+        `labelled_addition` gives it — in either order — and a repair in its
+        own right, so it is written and counted even with nothing else to do."""
+        values = dict(zip(ADDITION_COLUMNS, _tracker_row(notes="https://x/j/7").split("\t")))
+        values["pdf"] = " "
+        text = "\t".join(labels) + "\n" + "\t".join(values[name] for name in labels)
+        co, additions = self._tree(tmp_path, rows={"229-acme.tsv": text}, queued=False)
+        _sanitize_pending_additions(co, additions)
+        row = headed_addition_row(read_addition(additions / "229-acme.tsv"))
+        assert (row["pdf"], row["score"], row["notes"]) == (
+            _PROMPT_PDF_CELL, "4.2/5", "https://x/j/7")
+        assert "sanitized 1 addition" in capsys.readouterr().out
+
+    def test_a_blank_score_in_another_order_is_the_chains_n_a(self, tmp_path):
+        """As in a headerless row: the chain writes the `N/A` sentinel into a
+        score cell with no number, so a blank one is not a reason to decline."""
+        text = ("company\trole\tnum\tdate\tscore\tstatus\tpdf\treport\tnotes\n"
+                "Initech\tSRE\t3\t2026-08-25\t\tEvaluated\tnull\t[003](reports/003-x.md)\tAPPLY")
+        co, additions = self._tree(tmp_path, rows={"7.tsv": text})
+        _sanitize_pending_additions(co, additions)
+        assert headed_addition_row(read_addition(additions / "7.tsv"))["score"] == "N/A"
+
+    @pytest.mark.parametrize("text", [
+        # A `via` label after Report, its empty cell left out: nine cells, and
+        # merge-tracker reads the note as the agency. The Report link is in
+        # place, no required label follows it and no URL is misplaced, so
+        # nothing else here sees it.
+        "num\tdate\tcompany\trole\tstatus\tscore\tpdf\treport\tvia\tnotes\turl\n"
+        "3\t2026-08-25\tInitech\tSRE\tEvaluated\t4.2\tnull\t[003](reports/003-x.md)\tAPPLY",
+        # The same with `location`: career-ops' alias table knows it and the
+        # fallback does not, and it is declined either way.
+        "num\tdate\tcompany\trole\tstatus\tscore\tpdf\treport\tlocation\tnotes\turl\n"
+        "3\t2026-08-25\tInitech\tSRE\tEvaluated\t4.2\tnull\t[003](reports/003-x.md)\tAPPLY",
+        # `url` before `notes`, the url left out: the note is read as the URL,
+        # and it is under `url`, so the misplaced-URL rule cannot see it.
+        "num\tdate\tcompany\trole\tstatus\tscore\tpdf\treport\turl\tnotes\n"
+        "3\t2026-08-25\tInitech\tSRE\tEvaluated\t4.2\tnull\t[003](reports/003-x.md)\tAPPLY",
+        # An unrecognised label there is no better: merge-tracker drops its
+        # cell, and which cell that was is the same guess.
+        "num\tdate\tcompany\trole\tstatus\tscore\tpdf\treport\tsource\tnotes\n"
+        "3\t2026-08-25\tInitech\tSRE\tEvaluated\t4.2\tnull\t[003](reports/003-x.md)\tAPPLY",
+        # The `via` case in another order.
+        "company\trole\tnum\tdate\tscore\tstatus\tpdf\treport\tvia\tnotes\n"
+        "Initech\tSRE\t3\t2026-08-25\t4.2\tEvaluated\tnull\t[003](reports/003-x.md)\tAPPLY",
+    ], ids=["via", "location", "url-before-notes", "unrecognised", "via-another-order"])
+    def test_a_short_row_with_another_label_after_report_is_left_as_written(
+            self, tmp_path, capsys, text):
+        """A row may stop before its optional cells, and merge-tracker reads
+        every present cell by its label — so a short row whose labels after
+        the Report cell are anything but the batch prompt's own tail (`notes`,
+        then `url`) may have left out an INTERIOR optional cell, and is then
+        read one label off from it. The shift never reaches the score, so
+        merge-tracker refuses the row only for the bare score the chain would
+        repair: repaired, it merged with the note under `via`."""
+        co, additions = self._tree(tmp_path, rows={"7.tsv": text})
+        _sanitize_pending_additions(co, additions)
+        assert (additions / "7.tsv").read_text(encoding="utf-8") == text + "\n"
+        assert "sanitized" not in capsys.readouterr().out
+
+    @pytest.mark.parametrize("text", [
+        # The batch prompt's labels, the row stopping before `url`.
+        ADDITION_LABEL_LINE + "\n"
+        "3\t2026-08-25\tInitech\tSRE\tEvaluated\t4.2\tnull\t[003](reports/003-x.md)\tAPPLY",
+        # ...and before `notes`: both trailing cells left out, in order.
+        ADDITION_LABEL_LINE + "\n"
+        "3\t2026-08-25\tInitech\tSRE\tEvaluated\t4.2\tnull\t[003](reports/003-x.md)",
+        # No `notes` label, the row stopping before `url`: the only cell it
+        # can have left out.
+        "\t".join([*ADDITION_COLUMNS[:-1], "url"]) + "\n"
+        "3\t2026-08-25\tInitech\tSRE\tEvaluated\t4.2\tnull\t[003](reports/003-x.md)",
+        # Another order before the Report cell, the prompt's tail after it.
+        "company\trole\tnum\tdate\tscore\tstatus\tpdf\treport\tnotes\turl\n"
+        "Initech\tSRE\t3\t2026-08-25\t4.2\tEvaluated\tnull\t[003](reports/003-x.md)\tAPPLY",
+    ], ids=["no-url", "no-notes-no-url", "no-notes-label", "another-order"])
+    def test_a_short_row_with_the_prompts_tail_after_report_is_repaired(self, tmp_path, text):
+        """The short row merge-tracker means to allow: its labels after the
+        Report cell are `notes` then `url`, or one of them, so the only cells
+        it can have left out are its last ones, and the misplaced-URL rule
+        settles the one ambiguity left (a URL where the note should be)."""
+        co, additions = self._tree(tmp_path, rows={"7.tsv": text})
+        _sanitize_pending_additions(co, additions)
+        row = headed_addition_row(read_addition(additions / "7.tsv"))
+        assert (row["report"], row["score"]) == ("[003](reports/003-x.md)", "4.2/5")
+        assert row["notes"].startswith("req 88214 — https://x/j/7")
+
+    @pytest.mark.parametrize("labels", [
+        ADDITION_LABELS,
+        ("company", "role", "num", "date", "score", "status", "pdf", "report", "notes", "url"),
+    ], ids=["prompt-order", "another-order"])
+    def test_a_blank_last_label_does_not_make_a_whole_row_short(self, tmp_path, labels):
+        """A label line ending in a tab has a blank last label, which
+        merge-tracker skips. Short is counted as it counts it — against the
+        labels it recognises — so a row with a cell for every one of them is
+        whole, and repaired, however its labels after the Report cell run."""
+        values = dict(zip(ADDITION_LABELS, [*_tracker_row(score="4.2").split("\t"),
+                                            "https://own/j/9"]))
+        text = "\t".join(labels) + "\t\n" + "\t".join(values[name] for name in labels)
+        co, additions = self._tree(tmp_path, rows={"7.tsv": text})
+        _sanitize_pending_additions(co, additions)
+        row = headed_addition_row(read_addition(additions / "7.tsv"))
+        assert (row["score"], row["url"]) == ("4.2/5", "https://own/j/9")
+        assert row["notes"] == "req 88214 — https://x/j/7 — note"
+
+    @pytest.mark.parametrize("text", [
+        # Stops before its optional `notes` cell.
+        "company\trole\tnum\tdate\tscore\tstatus\tpdf\treport\tnotes\n"
+        "Initech\tSRE\t3\t2026-08-25\t4.2/5\tEvaluated\tnull\t[003](reports/003-x.md)",
+        # Carries no `notes` label at all.
+        "company\trole\tnum\tdate\tscore\tstatus\tpdf\treport\n"
+        "Initech\tSRE\t3\t2026-08-25\t4.2/5\tEvaluated\tnull\t[003](reports/003-x.md)",
+    ], ids=["notes-left-out", "no-notes-label"])
+    def test_another_order_with_no_notes_cell_and_nothing_to_repair_is_not_rewritten(
+            self, tmp_path, capsys, text):
+        """Put in order, such a row has no Notes cell, and the chain's first
+        step gives it an empty one — which is the chain normalising the row,
+        not repairing it. Counted as a repair, the file was rewritten in the
+        batch prompt's order with nothing done to it."""
+        co, additions = self._tree(tmp_path, rows={"229-acme.tsv": text}, queued=False)
+        _sanitize_pending_additions(co, additions)
+        assert (additions / "229-acme.tsv").read_text(encoding="utf-8") == text + "\n"
+        assert "sanitized" not in capsys.readouterr().out
+
+    @pytest.mark.parametrize("labels", [
+        ADDITION_LABELS,
+        ("num", "date", "company", "via", "role", "status", "score", "pdf", "report", "notes",
+         "url"),
+    ], ids=["prompt-order", "via-after-company"])
+    def test_a_row_wider_than_nine_with_the_report_sentinel_gets_the_whole_chain(
+            self, tmp_path, labels):
+        """The chain's own guard takes a row wider than nine only when its
+        Report cell is a `[N](path)` link — for a headerless row, the anchor
+        that says its nine are in place. A headed row's labels have already
+        said so, so its nine are what the chain is given: the batch prompt's
+        own ten-cell row with the `—` sentinel used to get only its PDF
+        filled, with no score fix, no URL and no req id."""
+        values = {"num": "3", "date": "2026-08-25", "company": "Initech", "via": "Hays",
+                  "role": "SRE | Remote", "status": "Discarded", "score": "4.2", "pdf": "null",
+                  "report": "—", "notes": "closed", "url": "https://own/j/9"}
+        text = "\t".join(labels) + "\n" + "\t".join(values[name] for name in labels)
+        co, additions = self._tree(tmp_path, rows={"7.tsv": text}, queued=False)
+        _sanitize_pending_additions(co, additions)
+        row = headed_addition_row(read_addition(additions / "7.tsv"))
+        assert (row["role"], row["score"], row["report"], row["url"]) == (
+            "SRE", "4.2/5", "—", "https://own/j/9")
+        assert row["notes"] == "req 88214 — https://own/j/9 — closed"
+        if "via" in labels:
+            assert row["via"] == "Hays"
+
+    @pytest.mark.parametrize("labels", [
+        (*ADDITION_COLUMNS, "apply link", "url"),
+        ("company", "role", "num", "date", "score", "status", "pdf", "report", "notes",
+         "apply link", "url"),
+    ], ids=["prompt-order", "another-order"])
+    def test_the_url_cell_is_the_url_the_row_carries_into_notes(self, tmp_path, labels):
+        """With no queued URL, a row's own URL goes into Notes, where handoff
+        routes the role by it — and of a row's cells after the nine the first
+        URL is taken. An `apply link` written before `url` is a careers page,
+        which would send the role to the 'other' site session, so `url` is put
+        first among them."""
+        values = dict(zip(ADDITION_COLUMNS, _tracker_row(score="4.2").split("\t")))
+        values.update({"apply link": "https://careers.initech.example/apply/9",
+                       "url": "https://www.linkedin.com/jobs/view/9"})
+        text = "\t".join(labels) + "\n" + "\t".join(values[name] for name in labels)
+        co, additions = self._tree(tmp_path, rows={"229-acme.tsv": text}, queued=False)
+        _sanitize_pending_additions(co, additions)
+        assert _label_line(additions / "229-acme.tsv") == "\t".join(
+            [*ADDITION_COLUMNS, "url", "apply link"])
+        assert self._cells(additions, "229-acme.tsv")[ADDITION_COLUMNS.index("notes")] == (
+            "https://www.linkedin.com/jobs/view/9 — note")
+
+    @pytest.mark.parametrize("labels", [
+        (*ADDITION_COLUMNS, "apply link", "url"),
+        ("company", "role", "num", "date", "score", "status", "pdf", "report", "notes",
+         "url", "apply link"),
+    ], ids=["prompt-order-apply-link-first", "another-order"])
+    def test_an_empty_url_cell_is_no_url_not_the_apply_link(self, tmp_path, labels):
+        """When the header labels `url`, that cell alone is the row's own URL:
+        empty means none, not the careers page another column carries."""
+        values = dict(zip(ADDITION_COLUMNS, _tracker_row(score="4.2").split("\t")))
+        values.update({"apply link": "https://careers.initech.example/apply/9", "url": ""})
+        text = "\t".join(labels) + "\n" + "\t".join(values[name] for name in labels)
+        co, additions = self._tree(tmp_path, rows={"229-acme.tsv": text}, queued=False)
+        _sanitize_pending_additions(co, additions)
+        notes = headed_addition_row(read_addition(additions / "229-acme.tsv"))["notes"]
+        assert "careers.initech" not in notes and notes == "note"
+
+    @pytest.mark.parametrize("labels", [
+        ADDITION_LABELS,
+        ("company", "role", "num", "date", "score", "status", "pdf", "report", "notes", "url"),
+    ], ids=["prompt-order", "another-order"])
+    def test_a_cell_past_the_last_label_is_left_as_written(self, tmp_path, labels):
+        """A tab inside Notes gives one cell more than the labels — the mirror
+        of a short row: which label each cell after the Report belongs to is a
+        guess, so the file is left for merge-tracker to refuse, not repaired."""
+        values = dict(zip(ADDITION_COLUMNS, _tracker_row(score="4.2").split("\t")))
+        values.update({"notes": "note a\tnote b", "url": "https://www.linkedin.com/jobs/view/1"})
+        text = "\t".join(labels) + "\n" + "\t".join(values[name] for name in labels)
+        co, additions = self._tree(tmp_path, rows={"229-acme.tsv": text})
+        before = (additions / "229-acme.tsv").read_bytes()
+        _sanitize_pending_additions(co, additions)
+        assert (additions / "229-acme.tsv").read_bytes() == before
 
     def test_a_blank_line_under_the_labels_is_not_a_repair(self, tmp_path, capsys):
         """merge-tracker drops blank lines before it looks, so a blank line
@@ -2569,6 +2993,54 @@ class TestRecoverRefusedAdditions:
         lines = (additions / "7.tsv").read_text(encoding="utf-8").split("\n")
         assert lines[0] == ADDITION_LABEL_LINE
         assert lines[1].split("\t")[5] == "4.2/5"
+        assert "recovered 1 evaluation" in capsys.readouterr().out
+
+    def test_a_refused_headed_row_in_another_order_comes_back_in_order(self, tmp_path, capsys):
+        """#191: merge-tracker refuses the bare score of a file labelled in any
+        order, by name. Recovery read only the batch prompt's order, so a
+        `via` column after `company` kept the refusal in the archive for good;
+        it now comes back put in order, still labelled, the score repaired."""
+        co, additions = self._tree(tmp_path, {"7.tsv": _VIA_LABELS + "\n" + _VIA_ROW})
+        _recover_refused_additions(co, additions)
+        assert _label_line(additions / "7.tsv") == "\t".join([*ADDITION_COLUMNS, "url", "via"])
+        row = headed_addition_row(read_addition(additions / "7.tsv"))
+        assert (row["company"], row["role"], row["score"], row["via"]) == (
+            "Acme Corp", "Platform Engineer", "4.2/5", "Hays")
+        assert "recovered 1 evaluation" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("text", [
+        _VIA_LABELS + "\n" + _VIA_ROW.replace("\tEvaluated\t", "\t\t"),     # a blank status
+        # The PDF value left out: the 8-cell row, put in order, is padded to
+        # nine by the chain and taken as it stands.
+        "company\trole\tnum\tdate\tscore\tstatus\tpdf\treport\tnotes\n"
+        "Acme Corp\tPlatform Engineer\t11\t2026-09-01\t4.2\tEvaluated\t"
+        "[229](reports/229-acme.md)\tAPPLY",
+    ], ids=["blank-status", "pdf-left-out"])
+    def test_a_headed_row_refused_whatever_is_repaired_is_not_retried(
+            self, tmp_path, capsys, text):
+        """Its bare score would change — the rule that lets a row back — but
+        merge-tracker refuses a blank status whatever is repaired, and a row
+        that left out its PDF would merge with its report link under `pdf`.
+        Neither is the sanitizer's to touch, so neither comes back."""
+        co, additions = self._tree(tmp_path, {"7.tsv": text})
+        _recover_refused_additions(co, additions)
+        assert not (additions / "7.tsv").exists()
+        assert "recovered" not in capsys.readouterr().out
+
+    def test_a_refused_headed_row_with_the_report_sentinel_comes_back(self, tmp_path, capsys):
+        """The batch prompt's ten-cell row with `—` for its Report. The chain's
+        own guard declines a row that wide without a `[N](path)` link, so its
+        bare score read as one the fix would not change and it stayed in the
+        archive; its labels have placed its nine, which is what the score rule
+        is now asked of."""
+        text = (ADDITION_LABEL_LINE + "\n"
+                "3\t2026-08-25\tInitech\tSRE\tDiscarded\t4.2\tnull\t—\tclosed\thttps://own/j/9")
+        co, additions = self._tree(tmp_path, {"7.tsv": text})
+        _recover_refused_additions(co, additions)
+        assert _label_line(additions / "7.tsv") == ADDITION_LABEL_LINE
+        row = headed_addition_row(read_addition(additions / "7.tsv"))
+        assert (row["score"], row["report"], row["url"]) == ("4.2/5", "—", "https://own/j/9")
+        assert row["notes"] == "https://own/j/9 — closed"
         assert "recovered 1 evaluation" in capsys.readouterr().out
 
     def test_a_headed_row_with_a_readable_score_is_not_retried(self, tmp_path, capsys):
