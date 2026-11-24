@@ -25,6 +25,9 @@ career-ops ships as data. The verdict comes from the report's own
 which the evaluation prompt (`_batch_common.py`) asks for in exactly that
 shape; the Notes sentence is the fallback and the tail.
 
+The health line also counts the jobs `--evaluate-batch` has abandoned (#206);
+see `abandoned_count`.
+
 Two rules are load-bearing:
 
   - **Exit code is always 0.** The digest runs `if: always()` after the
@@ -39,7 +42,8 @@ Two rules are load-bearing:
 
 Not a leaf: no third-party imports of its own (urllib, smtplib, email, json,
 re), but it reads the tracker through `pipeline.app.data` and shares
-`env_int`/`env_float`, `LIVENESS_CLOSED_RE` and `RESERVED_REPORT_SUFFIX` with
+`env_int`/`env_float`, `LIVENESS_CLOSED_RE`, `RESERVED_REPORT_SUFFIX` and the
+batch state's `load_state`, `BATCH_API_STATE` and `ABANDONED` with
 `pipeline._batch_common` rather than carrying copies. PyYAML — a pipeline
 dependency — is imported lazily for the Machine Summary and a regex stands in
 when it is missing, so the module imports wherever `pipeline.app.data` does
@@ -71,13 +75,16 @@ from pathlib import Path
 
 from pipeline import run_artifact
 from pipeline._batch_common import (
+    ABANDONED,
     APPLY_MIN_SCORE,
+    BATCH_API_STATE,
     SCORE_BANDS,
     LIVENESS_CLOSED_RE,
     RESERVED_REPORT_SUFFIX,
     _report_int,
     env_float,
     env_int,
+    load_state,
     parse_machine_summary,
 )
 from pipeline.app import data
@@ -112,6 +119,29 @@ RUN_VARS = ("RUN_URL", "RUN_OUTCOME", "RUN_STARTED_AT")
 # The reports directory, relative to `--root`, as the snapshot step's --delta
 # names it. The workflow test asserts it is in the snapshot's list.
 DELTA = "reports"
+# The tracker, relative to `--root`.
+TRACKER = "data/applications.md"
+# Every cached path this module reads, the batch state (#206) included. All
+# three are restored from the daily's state cache, and the YAML comment above
+# the digest step names each of them as read-only: tests/test_workflow_env.py
+# holds this tuple to that comment and to the cache's path set, so a fourth
+# read cannot arrive unsaid.
+CACHED_READS = (DELTA, TRACKER, BATCH_API_STATE)
+# How an abandoned job comes back, named in the line `Digest.content` adds
+# beneath the health line. A digest names only the route that clears ITS
+# count: the cloud's batch state lives in the Actions cache and a local run's
+# on disk, so neither route reaches the other's. The cloud route is the
+# workflow's `name:` and the checkbox on its Run-workflow form, which GitHub
+# labels with the boolean input's `description`, not its id — so the hint
+# quotes RETRY_LABEL, and RETRY_INPUT is only how the guard finds that input
+# and what it forwards. The local route is the flag. tests/test_workflow_env.py
+# holds the workflow name, the label, the input and the flag to
+# daily-pipeline.yml.
+RETRY_WORKFLOW = "Daily Job Pipeline"
+RETRY_INPUT = "retry_abandoned"
+RETRY_LABEL = ("Re-queue evaluations abandoned after repeated failures "
+               "(--retry-abandoned)")
+RETRY_FLAG = "--retry-abandoned"
 
 DEFAULT_SMTP_PORT = 587
 DEFAULT_NEXT_STEP = ("Next: open your triage UI (./run-ui.sh or run-ui.ps1), "
@@ -365,6 +395,28 @@ The rows arrive with `area` already derived (`build_digest` parses the
     return items[:limit], items[limit:]
 
 
+def abandoned_count(root: Path) -> int:
+    """How many jobs `--evaluate-batch` has set aside (#206): status
+    `abandoned` in the batch state, where they stay until a run with
+    --retry-abandoned. The total at digest time, not this run's, because every
+    one of them needs that run to come back, and nothing else that reaches the
+    person says they exist.
+
+    `load_state` already reads a missing, empty or malformed file as an empty
+    state, but hands back valid JSON of any other shape as it is and raises on
+    a file that is not UTF-8; those count 0 too, with a log line — never a
+    reason the failure notice does not go. A single job entry that is not a
+    mapping is skipped rather than zeroing the count: one stray value must
+    not hide the real abandoned jobs beside it."""
+    try:
+        jobs = load_state(Path(root) / BATCH_API_STATE).get("jobs", {}).values()
+        return sum(1 for job in jobs
+                   if isinstance(job, dict) and job.get("status") == ABANDONED)
+    except Exception as exc:
+        _log(f"batch state unreadable ({exc!r}); counting no abandoned jobs")
+        return 0
+
+
 # ── The digest itself ────────────────────────────────────────────────────────
 
 @dataclass
@@ -387,6 +439,7 @@ class Digest:
     next_step: str = DEFAULT_NEXT_STEP
     attachment_name: str = ""
     attachment_text: str = ""
+    abandoned: int = 0          # `abandoned_count` at digest time
 
     @property
     def evaluated_text(self) -> str:
@@ -396,6 +449,12 @@ class Digest:
     def health(self) -> str:
         line = (f"{self.evaluated_text} evaluated this run · {self.qualifying} at "
                 f"≥ {self.min_score:.1f} · {self.open} open in your queue")
+        # Only when there are some: a "· 0 abandoned" on every healthy day is
+        # wallpaper, and the line stays byte-identical for a copy that never
+        # abandons a job. Beside the queue count it qualifies, ahead of the
+        # minutes clause, whose warning runs to the end of the line.
+        if self.abandoned > 0:
+            line += f" · {self.abandoned} abandoned"
         if self.duration_min is not None and self.monthly_estimate is not None:
             line += (f" · run took {self.duration_min:.0f} min ≈ "
                      f"{self.monthly_estimate:,} min/month at this pace, this copy's "
@@ -413,12 +472,36 @@ class Digest:
 
     @property
     def should_send(self) -> bool:
+        # `abandoned` is not a reason of its own: with DIGEST_ALWAYS off a
+        # quiet day stays quiet, and the count, a running total, rides the
+        # next digest that does go.
         return bool(self.items) or self.failed or self.always
 
     @property
     def failure_line(self) -> str:
         where = self.run_url or f"the Actions tab (outcome: {self.run_outcome or '?'})"
         return f"Today's run failed — open {where}"
+
+    @property
+    def abandoned_line(self) -> str:
+        """What the health line's `· N abandoned` means and how they come back,
+        on a line of its own so the health line stays a glance. "" when none.
+
+        It names the one route that clears THIS count. A digest with a
+        `run_url` follows the cloud daily, whose batch state lives only in the
+        Actions cache, so only a dispatch of that workflow reaches it; a local
+        digest counts the local state, which only a local run clears. Naming
+        both would send half the readers to a route that changes nothing."""
+        n = self.abandoned
+        if n <= 0:
+            return ""
+        if self.run_url:
+            route = (f"run {RETRY_WORKFLOW} by hand (Actions tab → Run workflow) "
+                     f'with "{RETRY_LABEL}" ticked')
+        else:
+            route = f"run ./run.sh (or run.ps1) --evaluate-batch {RETRY_FLAG}"
+        return (f"{n} role{'s' if n != 1 else ''} abandoned after repeated failed "
+                f"evaluations — to retry, {route}")
 
     def content(self) -> str:
         """The message body above the embeds / the email's lead."""
@@ -431,6 +514,8 @@ class Digest:
         else:
             lines.append(self.heartbeat)
         lines.append(self.health)
+        if self.abandoned_line:
+            lines.append(self.abandoned_line)
         if self.run_url and not self.failed:
             lines.append(self.run_url)
         if self.next_step:
@@ -478,18 +563,19 @@ def build_digest(root: Path, manifest: Path, *, min_score: float, limit: int,
                  always: bool = True, attach: bool = True, next_step: str = "",
                  commutable=None, now: datetime | None = None) -> Digest:
     """Compute the digest — no I/O beyond reading the manifest, the reports
-    directory and the tracker. Every env-resolved setting is a kwarg so tests
-    pass values instead of setting the environment — `commutable` (the #180
-    commutable metros) included, which is why it is a kwarg here and resolved
-    by `data.parse_applications` rather than by this module: the digest
-    resolving its own config is how the two surfaces could disagree."""
+    directory, the tracker and the batch state (`CACHED_READS`). Every
+    env-resolved setting is a kwarg so tests pass values instead of setting
+    the environment — `commutable` (the #180 commutable metros) included,
+    which is why it is a kwarg here and resolved by `data.parse_applications`
+    rather than by this module: the digest resolving its own config is how
+    the two surfaces could disagree."""
     root = Path(root)
     now = now or datetime.now(timezone.utc)
     date = now.strftime("%Y-%m-%d")
 
     manifest_files = load_manifest(manifest, root)
     new_files = report_number_map(new_report_files(root, manifest_files))
-    tracker = root / "data" / "applications.md"
+    tracker = root / TRACKER
     try:
         rows = data.parse_applications(tracker, commutable=commutable)
     except Exception as exc:
@@ -512,11 +598,14 @@ def build_digest(root: Path, manifest: Path, *, min_score: float, limit: int,
         duration_min=duration, monthly_estimate=monthly,
         items=shown, dropped=dropped, always=always,
         next_step=(next_step or "").strip() or DEFAULT_NEXT_STEP,
+        abandoned=abandoned_count(root),
     )
     if attach and shown:
         digest.attachment_name, digest.attachment_text = build_attachment(shown, root, date)
 
     _log(digest.health)
+    if digest.abandoned_line:
+        _log(digest.abandoned_line)
     for item in shown:
         _log(f"  {item.title}")
     if dropped:

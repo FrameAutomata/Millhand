@@ -296,6 +296,13 @@ def process_lock_active(path: Path, *, max_age: float) -> bool:
     return not _lock_reclaimable(path, max_age)
 
 
+# The `--evaluate-batch` state, relative to the career-ops root: per-job
+# metadata, report/tracker numbers and status. The evaluator writes it, the
+# UI's Add-Job reads the numbers it has assigned, the start-over reset wipes
+# it, and the daily digest reads it for the abandoned count (#206).
+BATCH_API_STATE = "batch/batch-api-state.json"
+
+
 def load_state(state_path: Path) -> dict:
     if state_path.exists():
         try:
@@ -1416,10 +1423,17 @@ def assign_job_numbers(
     return jobs
 
 
+# The status of a job that failed the countable way on
+# `batch_evaluate.MAX_ATTEMPTS` runs (#206): `_charge_failed_runs` writes it,
+# `load_pending` keeps it out of the queue, `--retry-abandoned` clears it, and
+# the daily digest counts it.
+ABANDONED = "abandoned"
+
+
 def load_pending(
     batch_input: Path,
     state: dict,
-    done_statuses: frozenset = frozenset({"completed", "abandoned"}),
+    done_statuses: frozenset = frozenset({"completed", ABANDONED}),
 ) -> list[dict]:
     """Return rows from batch-input.tsv whose IDs are not in done_statuses.
 

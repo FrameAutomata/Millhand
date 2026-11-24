@@ -335,11 +335,14 @@ class TestVerdict:
 
 # ── Content + health ─────────────────────────────────────────────────────────
 
+HEALTH = "3 evaluated this run · 2 at ≥ 4.0 · 5 open in your queue"
+
+
 class TestContent:
     def test_health_line(self, world):
         root, manifest = world
         d = _build(root, manifest, run_url="https://gh/run/1")
-        assert d.health == "3 evaluated this run · 2 at ≥ 4.0 · 5 open in your queue"
+        assert d.health == HEALTH
         assert "https://gh/run/1" in d.content()
         assert dd.DEFAULT_NEXT_STEP in d.content()
 
@@ -395,6 +398,133 @@ class TestContent:
         assert d.attachment_text.index("Evaluacion: Acme") < d.attachment_text.index("Evaluacion: Globex")
         assert "Evaluacion: Initech" not in d.attachment_text
         assert _build(root, manifest, attach=False).attachment_text == ""
+
+
+# ── Abandoned evaluations (#206) ─────────────────────────────────────────────
+
+def _state(root: Path, jobs) -> Path:
+    """The batch state as batch_evaluate saves it: `{"jobs": {id: {...}}}`."""
+    return _write(root / dd.BATCH_API_STATE, json.dumps({"jobs": jobs}, indent=2))
+
+
+# How the line under the health line says abandoned jobs come back, per
+# digest: written out rather than built from daily_digest's constants, so a
+# reworded hint is a deliberate change here too.
+CLOUD_ROUTE = ("to retry, run Daily Job Pipeline by hand (Actions tab → Run "
+               'workflow) with "Re-queue evaluations abandoned after repeated '
+               'failures (--retry-abandoned)" ticked')
+LOCAL_ROUTE = ("to retry, run ./run.sh (or run.ps1) --evaluate-batch "
+               "--retry-abandoned")
+
+
+class TestAbandoned:
+    """A job `--evaluate-batch` abandoned stays out of the queue until a run
+    with --retry-abandoned, and the digest is the one surface that reaches the
+    person — so it counts them, from the batch state, at digest time."""
+
+    def test_none_leaves_the_health_line_byte_identical(self, world):
+        """No abandoned job gives exactly the line a copy that never abandons
+        one always had, and no line beneath it."""
+        root, manifest = world
+        d = _build(root, manifest)
+        assert (d.abandoned, d.health, d.abandoned_line) == (0, HEALTH, "")
+        assert "abandoned" not in d.content()
+
+    def test_only_abandoned_counts(self, world):
+        root, manifest = world
+        _state(root, {"1": {"status": "abandoned", "attempts": 3, "error": "cut off"},
+                      "2": {"status": "abandoned", "attempts": 3},
+                      "3": {"status": "failed", "attempts": 2},
+                      "4": {"status": "completed"},
+                      "5": {"status": "pending"},
+                      "6": {"status": "Abandoned"},     # not what the writer writes
+                      "7": {}})
+        d = _build(root, manifest)
+        assert d.abandoned == 2
+        assert d.health == HEALTH + " · 2 abandoned"
+        assert d.to_json()["abandoned"] == 2
+
+    def test_the_count_sits_with_the_queue_not_after_the_minutes_warning(self, world):
+        root, manifest = world
+        _state(root, {"1": {"status": "abandoned"}})
+        d = _build(root, manifest, run_started_at=str(int(NOW.timestamp()) - 61 * 60))
+        assert d.health.startswith(HEALTH + " · 1 abandoned · run took 61 min")
+        assert d.health.count("abandoned") == 1
+
+    @pytest.mark.parametrize("run_url, route, absent", [
+        ("https://gh/run/1", CLOUD_ROUTE, "--evaluate-batch"),
+        ("", LOCAL_ROUTE, "Daily Job Pipeline"),
+    ], ids=["cloud", "local"])
+    @pytest.mark.parametrize("n, roles", [(1, "1 role"), (2, "2 roles")],
+                             ids=["one", "two"])
+    def test_the_hint_names_the_route_that_clears_this_count(
+            self, world, run_url, route, absent, n, roles):
+        """The health line stays a glance; the line under it says how they
+        come back, by the one route that reaches THIS count. The cloud's batch
+        state lives only in the Actions cache and a local run's on disk, so a
+        digest with a run URL names the dispatch — and the checkbox as the
+        Run-workflow form labels it, the input's description — and a local one
+        names the flag; neither names the other's."""
+        root, manifest = world
+        _state(root, {str(j): {"status": "abandoned"} for j in range(1, n + 1)})
+        content = _build(root, manifest, run_url=run_url).content()
+        lines = content.splitlines()
+        i = lines.index(f"{HEALTH} · {n} abandoned")
+        assert lines[i + 1] == (f"{roles} abandoned after repeated failed "
+                                f"evaluations — {route}")
+        assert absent not in content
+
+    def test_named_on_a_quiet_day_and_a_failed_one(self, world):
+        root, manifest = world
+        _state(root, {"1": {"status": "abandoned"}})
+        quiet = _build(root, manifest, min_score=5.0).content()
+        assert "1 role abandoned after" in quiet
+        failed = _build(root, manifest, run_outcome="failure").content().splitlines()
+        assert failed[0].startswith("Today's run failed")
+        assert any(l.startswith("1 role abandoned after") for l in failed)
+
+    @pytest.mark.parametrize("raw", [
+        b"{not json",                          # load_state reads it as empty
+        b"[]",                                 # valid JSON, not a state
+        b'{"jobs": null}',
+        b'{"jobs": ["abandoned"]}',            # jobs that are not a mapping
+        b'\xff\xfe{"jobs": {}}',               # not UTF-8: load_state raises on it
+    ], ids=["malformed", "list", "jobs-null", "jobs-not-a-dict", "not-utf8"])
+    def test_an_unreadable_state_is_zero_and_never_raises(self, world, raw):
+        root, manifest = world
+        path = root / dd.BATCH_API_STATE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+        d = _build(root, manifest)
+        assert (d.abandoned, d.health) == (0, HEALTH)
+
+    def test_a_stray_job_entry_costs_only_itself(self, world):
+        """One job entry that is not a mapping is skipped, not a reason to
+        count none: the real abandoned jobs beside it still need retrying."""
+        root, manifest = world
+        _state(root, {"1": {"status": "abandoned"}, "2": "abandoned",
+                      "3": {"status": "abandoned"}})
+        assert _build(root, manifest).health == HEALTH + " · 2 abandoned"
+
+    def test_a_directory_where_the_state_belongs_is_zero(self, world):
+        root, manifest = world
+        (root / dd.BATCH_API_STATE).mkdir(parents=True)
+        assert _build(root, manifest).health == HEALTH
+
+    def test_a_corrupt_state_on_a_failed_run_still_sends_the_notice(
+            self, world, monkeypatch, capsys):
+        root, manifest = world
+        path = root / dd.BATCH_API_STATE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\xff\xfe garbage")
+        monkeypatch.setenv("RUN_OUTCOME", "failure")
+        monkeypatch.setenv("DIGEST_DISCORD_WEBHOOK", "https://discord.test/hook")
+        calls = []
+        monkeypatch.setattr(dd.urllib.request, "urlopen", _fake_urlopen(calls))
+        assert dd.main(["--root", str(root), "--manifest", str(manifest)]) == 0
+        assert "[digest] batch state unreadable" in capsys.readouterr().out
+        payload, _ = _payload(calls[0][0])
+        assert payload["content"].startswith("Today's run failed — open")
 
 
 # ── Discord ──────────────────────────────────────────────────────────────────

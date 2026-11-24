@@ -15,6 +15,7 @@ import json
 import shutil
 from pathlib import Path
 
+from pipeline._batch_common import BATCH_API_STATE
 from pipeline.app import gh
 
 CLOUD_CACHE_PREFIX = "pipeline-state-v1"
@@ -23,7 +24,7 @@ CLOUD_CACHE_PREFIX = "pipeline-state-v1"
 _CO_FILES = [
     "data/applications.md", "data/scan-history.tsv", "data/pipeline.md",
     "data/recheck-state.tsv", "data/easy-apply-urls.txt", "data/follow-ups.md",
-    "batch/batch-input.tsv", "batch/batch-state.tsv", "batch/batch-api-state.json",
+    "batch/batch-input.tsv", "batch/batch-state.tsv", BATCH_API_STATE,
 ]
 # career-ops DIRS whose contents to clear (keep the dir + its .gitkeep so the
 # pipeline can write fresh). These hold reports, generated PDFs, cached JDs, etc.

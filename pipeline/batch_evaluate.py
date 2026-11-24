@@ -51,6 +51,8 @@ from pathlib import Path
 from typing import Callable
 
 from pipeline._batch_common import (
+    ABANDONED,
+    BATCH_API_STATE,
     MAX_TOKENS,
     IncompleteResponse,
     acquire_process_lock,
@@ -831,7 +833,7 @@ def _charge_failed_runs(jobs_state: dict, failures: dict[str, bool], processed: 
         job = jobs_state[jid]
         job["attempts"] = job.get("attempts", 0) + 1
         if job["attempts"] >= MAX_ATTEMPTS:
-            job["status"] = "abandoned"
+            job["status"] = ABANDONED
             abandoned.append(jid)
             print(f"  [{jid}] ABANDONED after {MAX_ATTEMPTS} failed runs: "
                   f"{job.get('company') or '?'} — {job.get('error')}")
@@ -933,7 +935,7 @@ def _run_eval(
     today = datetime.now().strftime("%Y-%m-%d")
 
     batch_input = career_ops / "batch" / "batch-input.tsv"
-    state_path = career_ops / "batch" / "batch-api-state.json"
+    state_path = career_ops / BATCH_API_STATE
     reports_dir = career_ops / "reports"
     tracker_dir = career_ops / "batch" / "tracker-additions"
     applications_md = career_ops / "data" / "applications.md"
@@ -949,7 +951,7 @@ def _run_eval(
         # the fresh allowance for the run that does reach it.
         revived = 0
         for job in state.get("jobs", {}).values():
-            if job.get("status") == "abandoned":
+            if job.get("status") == ABANDONED:
                 job["status"], job["attempts"] = "failed", 0
                 revived += 1
         if revived and not dry_run:
