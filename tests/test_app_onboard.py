@@ -15,7 +15,7 @@ import pytest
 import yaml
 
 from pipeline import daily_digest
-from pipeline.agent_cli import AGENT_CLIS
+from pipeline.agent_cli import AGENT_CLIS, APPLY_ONLY_LABEL
 from pipeline.app import onboard
 from pipeline.handoff import SUBMIT_POLICIES
 from pipeline.sites import SUPPORTED_SITES
@@ -1136,11 +1136,24 @@ class TestOnboardHtmlAgentClis:
     order-agnostic — the surface may later render it from `/api/onboard/providers`
     and keep a static fallback, and either shape must still satisfy this."""
 
-    def test_cli_select_options_equal_the_registry(self, html):
+    @staticmethod
+    def _cli_options(html):
+        """#local-cli-select's options as [(value, text)]. Text included, so a
+        test reading the labels can't pass because this stopped matching."""
         m = re.search(r'<select id="local-cli-select">(.*?)</select>', html, re.S)
         assert m, "no #local-cli-select in onboard.html"
-        offered = set(re.findall(r'<option\b[^>]*\bvalue="([^"]+)"', m.group(1)))
-        assert offered == set(AGENT_CLIS)
+        return re.findall(r'<option\b[^>]*\bvalue="([^"]+)"[^>]*>([^<]*)</option>', m.group(1))
+
+    def test_cli_select_options_equal_the_registry(self, html):
+        assert {cid for cid, _ in self._cli_options(html)} == set(AGENT_CLIS)
+
+    def test_apply_only_labels_exactly_the_clis_batch_cannot_run(self, html):
+        """Picking an apply-only CLI here used to cost a whole scrape before
+        `--batch` died at the runner (#187); the label is what tells the person
+        first, so it follows the registry's `batch` field, both ways. (onboard.js
+        renders the same words from the providers payload's `batch_note`.)"""
+        marked = {cid for cid, text in self._cli_options(html) if APPLY_ONLY_LABEL in text}
+        assert marked == {c.id for c in AGENT_CLIS.values() if not c.batch}
 
 
 class TestOnboardHtmlSubmitPolicy:

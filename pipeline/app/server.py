@@ -1179,14 +1179,16 @@ def get_providers() -> JSONResponse:
     })
     # The registry's view of every agent CLI. `name`/`available` are the
     # fields onboard.js read first; the rest let the wizard render the tier
-    # (free/paid), the tier note verbatim, the install line and which one is
-    # the default without a second copy of any of it in the markup.
+    # (free/paid), the tier note verbatim, the install line, which one is the
+    # default and the "apply only" note on a CLI --batch can't run, without a
+    # second copy of any of it in the markup.
     cli_tools = [
         {
             "name": c.id, "available": agent_cli.cli_available(c),
             "id": c.id, "label": c.label, "tier": c.tier, "tier_note": c.tier_note,
             "install_hint": c.install_hint, "installed": agent_cli.cli_available(c),
             "default": c.id == agent_cli.DEFAULT_CLI,
+            "batch_note": "" if c.batch else agent_cli.APPLY_ONLY_LABEL,
         }
         for c in agent_cli.AGENT_CLIS.values()
     ]

@@ -793,7 +793,9 @@ async function loadLocalProviders() {
       for (const c of d.cli_tools) {
         const opt = document.createElement("option");
         opt.value = c.id || c.name;
+        // `batch_note`: set on a CLI career-ops' batch runner can't run (#187).
         opt.textContent = `${c.label || opt.value} — ${c.tier || "?"}`
+          + (c.batch_note ? `, ${c.batch_note}` : "")
           + (c.installed ? " ✓ installed" : " (not installed)");
         cliSelect.appendChild(opt);
       }

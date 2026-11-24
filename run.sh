@@ -6,11 +6,6 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [ ! -f "$root/career-ops/config/profile.yml" ]; then
-  echo "Profile not found — running first-time setup..."
-  node "$root/setup-profile.mjs"
-fi
-
 # Parse flags — while/case required to consume value arguments.
 #
 # Anything not matched here goes to orchestrate.py, which calls parse_args and
@@ -46,6 +41,21 @@ done
 if [[ ${#batch_passthrough[@]} -gt 0 && "$run_batch" != "true" ]]; then
   echo "run.sh: ${batch_passthrough[0]} applies to batch evaluation; pass --batch too." >&2
   exit 2
+fi
+
+# Before the first-run profile gate and the scrape, not after them: career-ops'
+# runner rejects a CLI it does not know only once the whole run has been spent
+# (#187), and a fresh copy would sit through the setup interview first. It needs
+# only the flags parsed above — the CLI comes from BATCH_CLI and .env, neither
+# of which the profile gate writes. The rule is the registry's
+# (pipeline/agent_cli.py); this only asks it, and it says why.
+if [[ "$run_batch" == "true" ]]; then
+  ( cd "$root" && "$root/.venv/bin/python" -m pipeline.agent_cli --check-batch )
+fi
+
+if [ ! -f "$root/career-ops/config/profile.yml" ]; then
+  echo "Profile not found — running first-time setup..."
+  node "$root/setup-profile.mjs"
 fi
 
 "$root/.venv/bin/python" "$root/orchestrate.py" "${orchestrate_args[@]}"
