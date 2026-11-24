@@ -39,7 +39,9 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from pipeline._batch_common import _report_location_mark, read_text, resolve_report
+from pipeline._batch_common import (
+    _MACHINE_SUMMARY_RE, _report_location_mark, read_text, resolve_report,
+)
 from pipeline.app import data
 from pipeline.remote_signal import REMOTE_SIGNAL_RE
 from pipeline.stdio import line_buffer_stdout
@@ -295,6 +297,16 @@ def location_from_policy(prose: str) -> WorkLocation:
     return WorkLocation(mode=mode, metro=place.metro, state=place.state) if place else WorkLocation()
 
 
+# A Machine Summary `work_location` key, whatever it holds. Read on the raw block,
+# so a block PyYAML cannot parse still counts as one written with the field.
+_WORK_LOCATION_KEY_RE = re.compile(r"^\s*work_location\s*:", re.M)
+
+
+def _evaluated_with_the_field(report_text: str) -> bool:
+    m = _MACHINE_SUMMARY_RE.search(report_text or "")
+    return bool(m and _WORK_LOCATION_KEY_RE.search(m.group(1)))
+
+
 def mark_for_report(report_text: str) -> str:
     """The `Work location:` mark for one report.
 
@@ -304,9 +316,20 @@ def mark_for_report(report_text: str) -> str:
     must not become a third. `plan` selects on an unmarked tracker ROW, which is
     not the same set as a pre-#180 report: a `--batch` row merged before the
     mark shipped, or one whose Notes an older merge-tracker replaced, has the
-    field in its report already. Prose is the fallback, not the first resort."""
-    return _report_location_mark(report_text) or location_mark(
-        location_from_policy(read_policy(report_text)))
+    field in its report already.
+
+    Prose is the fallback ONLY for a report with no `work_location` key at all —
+    the pre-#180 report this module exists for. A report that has the key was
+    evaluated with the field, so its answer stands even when it is blank: blank
+    is the evaluator saying the posting does not say where the job is, and since
+    #205 it is also what the prompt requires for a place only the job board
+    names, which Block A may still spell out ("On-site (Chicago, IL per job
+    board)"). Parsing that prose would record exactly the metro the live path is
+    forbidden to record, and #180's gate would demote on a headquarters
+    address."""
+    if _evaluated_with_the_field(report_text):
+        return _report_location_mark(report_text)
+    return location_mark(location_from_policy(read_policy(report_text)))
 
 
 def plan(career_ops: Path, commutable) -> tuple[list[dict], Counter]:

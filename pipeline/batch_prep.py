@@ -3,13 +3,20 @@
 Runs after bridge. Assigns sequential IDs continuing from whatever is already
 in batch-input.tsv (so repeated runs append rather than overwrite), deduplicates
 by URL against the existing file, and writes the TSV header if the file is new.
+
+Beside each row it caches what the evaluator reads that the four-column TSV
+cannot carry: the description as `batch/jds/<id>.txt`, and the job board's own
+location and salary as `batch/jds/<id>.board.json`
+(`_batch_common.board_meta_path`, #205).
 """
 
 import csv
 import sys
 from pathlib import Path
 
-from pipeline._batch_common import read_batch_input
+from pipeline._batch_common import (
+    atomic_write_text, board_meta_json, board_meta_path, jd_cache_path, read_batch_input,
+)
 from pipeline.stdio import line_buffer_stdout
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,6 +42,21 @@ def _load_existing(batch_input: Path) -> tuple[int, set[str]]:
     return max_id, seen
 
 
+def _cache_job_file(path: Path, content: str) -> None:
+    """Write one of a new job's batch/jds files, or remove one left under its id.
+
+    This run reuses an id only when batch-input.tsv was cleared and batch/jds
+    was not, and a file left there would hand this job another posting's
+    description or location — so a job with nothing to cache is made to have no
+    file, not merely left without a new one. (A sidecar also records its posting
+    URL, which `read_board_meta` checks, for the ids a hand-edited queue reuses;
+    the description has only this.)"""
+    if content:
+        atomic_write_text(path, content)
+    else:
+        path.unlink(missing_ok=True)
+
+
 def run(career_ops_path: Path, new_offers: list[dict]) -> int:
     """Append new_offers to batch-input.tsv. Returns number of rows added."""
     if not new_offers:
@@ -44,9 +66,6 @@ def run(career_ops_path: Path, new_offers: list[dict]) -> int:
     batch_input.parent.mkdir(parents=True, exist_ok=True)
 
     max_id, seen_urls = _load_existing(batch_input)
-
-    jds_dir = career_ops_path / "batch" / "jds"
-    jds_dir.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict] = []
     for offer in new_offers:
@@ -61,9 +80,11 @@ def run(career_ops_path: Path, new_offers: list[dict]) -> int:
             "source": (offer.get("company") or "").strip(),
             "notes": (offer.get("title") or "").strip(),
         })
-        desc = (offer.get("description") or "").strip()
-        if desc:
-            (jds_dir / f"{max_id}.txt").write_text(desc, encoding="utf-8")
+        jid = str(max_id)
+        _cache_job_file(jd_cache_path(career_ops_path, jid),
+                        (offer.get("description") or "").strip())
+        _cache_job_file(board_meta_path(career_ops_path, jid),
+                        board_meta_json(url, offer.get("board")))
 
     if not rows:
         print("[batch-prep] no new offers to add to batch-input.tsv")

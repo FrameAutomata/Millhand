@@ -3,6 +3,7 @@
 import contextlib
 import csv
 import json
+import math
 import os
 import re
 import subprocess
@@ -1355,7 +1356,8 @@ def build_user_message(job_meta: dict, today: str) -> str:
         f"**Evaluation Date:** {today}\n"
         f"**URL:** {job_meta.get('url', '')}\n"
         f"**Company (source field):** {job_meta.get('company') or 'unknown'}\n"
-        f"**Role (source field):** {job_meta.get('role') or 'unknown'}\n\n"
+        f"**Role (source field):** {job_meta.get('role') or 'unknown'}\n"
+        f"{_board_lines(job_meta.get('board'))}\n"
         f"**Job Description:**\n{job_meta.get('jd_text') or '(no JD cached — infer from the URL and source fields)'}"
     )
 
@@ -1365,6 +1367,171 @@ def jd_cache_path(career_ops: Path, job_id: str) -> Path:
     same id that names its tracker addition, which is what lets the merge-time
     sanitizer find the JD for a row it did not write."""
     return career_ops / "batch" / "jds" / f"{job_id}.txt"
+
+
+# What the job BOARD said about a posting (#205) — its location and its salary
+# columns, read from filtered_jobs.csv, which carries every column scrape got
+# from JobSpy — kept in a sidecar beside the cached JD rather than a fifth
+# column in batch-input.tsv: that file is career-ops' format, and its
+# batch-runner.sh reads it with `read -r id url source notes`, which folds any
+# extra column into `notes`. Inside batch/jds it rides the state cache's existing
+# path set. Only `--evaluate-batch` reads it; the `--batch` worker builds its own
+# prompt. The board's remote flag is deliberately not carried: JobSpy's
+# `is_remote` is a keyword guess (on LinkedIn over the title, the location and a
+# description still empty at scrape time), wrong in both directions, so the
+# description alone decides remote, as it did before #205.
+def board_meta_path(career_ops: Path, job_id: str) -> Path:
+    """Where batch_prep keeps a job's board fields — beside its cached JD, keyed
+    on the same queue id."""
+    return career_ops / "batch" / "jds" / f"{job_id}.board.json"
+
+
+_BLANK_CELLS = frozenset({"", "nan", "none", "null"})
+_BOARD_AMOUNT_KEYS = ("min_amount", "max_amount")
+_BOARD_UNIT_KEYS = ("currency", "interval")
+# The filtered_jobs.csv columns the board fields are read from. They are
+# JobSpy's names, so tests/test_jobspy_contract.py pins them, and the value below,
+# against the installed library.
+BOARD_COLUMNS = ("location", "salary_source", *_BOARD_AMOUNT_KEYS, *_BOARD_UNIT_KEYS)
+# JobSpy's `salary_source` for a figure it parsed out of the description
+# (`SalarySource.DESCRIPTION`), rather than one the board supplied.
+SALARY_FROM_DESCRIPTION = "description"
+
+
+def _board_text(value) -> str:
+    """A text cell, whitespace collapsed to one line, or "" when it carries
+    nothing — pandas' NaN spelled out included, since "nan" in a prompt reads as
+    a place. Strings only: a CSV cell is one, and so is every text value a
+    sidecar this module wrote holds."""
+    if not isinstance(value, str):
+        return ""
+    text = " ".join(value.split())
+    return "" if text.lower() in _BLANK_CELLS else text
+
+
+def _board_amount(value):
+    """A salary cell as a number (int when whole), or None. pandas writes the
+    columns as floats ("60000.0") and leaves a missing one blank; anything that
+    is not a positive finite number is no figure at all."""
+    try:
+        n = float(str(value).strip().replace(",", ""))
+    except ValueError:
+        return None
+    if not math.isfinite(n) or n <= 0:
+        return None
+    return int(n) if n.is_integer() else n
+
+
+def normalize_board_meta(raw) -> dict:
+    """The board fields' one shape, from a dict of any provenance: a known key
+    with a usable value is kept and everything else dropped, a reversed range is
+    put in order, and a currency or interval with no figure beside it goes too —
+    so a malformed or hand-edited sidecar degrades key by key to the message the
+    job would have had without one, and never raises. The posting URL a sidecar
+    records is `read_board_meta`'s to check, not a field."""
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    if location := _board_text(raw.get("location")):
+        out["location"] = location
+    low, high = (_board_amount(raw.get(key)) for key in _BOARD_AMOUNT_KEYS)
+    if low is not None and high is not None and low > high:
+        low, high = high, low
+    if low is None and high is None:
+        return out
+    for key, amount in zip(_BOARD_AMOUNT_KEYS, (low, high)):
+        if amount is not None:
+            out[key] = amount
+    for key in _BOARD_UNIT_KEYS:
+        if unit := _board_text(raw.get(key)):
+            out[key] = unit
+    return out
+
+
+def board_meta_from_row(row) -> dict:
+    """A filtered_jobs.csv row's board fields, in the sidecar's shape.
+
+    A salary JobSpy parsed out of the description (`salary_source` is
+    "description") is dropped: the model reads that figure in the JD itself,
+    where it is the posting stating pay, and labelling it the board's would
+    demote it to an estimate. Every other figure is shown as the board's — an
+    employer-stated board salary and Indeed's own estimate both arrive as
+    "direct_data", so nothing here can tell them apart."""
+    if _board_text(row.get("salary_source")).lower() == SALARY_FROM_DESCRIPTION:
+        return normalize_board_meta({"location": row.get("location")})
+    return normalize_board_meta(row)
+
+
+def board_meta_json(url: str, board) -> str:
+    """A sidecar's text: the board fields and the posting URL they were read
+    for, which `read_board_meta` checks; "" when there are no fields, so a job
+    with nothing to say gets no sidecar."""
+    board = normalize_board_meta(board)
+    if not board:
+        return ""
+    return json.dumps({"url": url, **board}, ensure_ascii=False, sort_keys=True) + "\n"
+
+
+def read_board_meta(career_ops: Path, job_id: str, url: str) -> dict:
+    """A queued job's board fields, or {} — for a job queued before the sidecar
+    existed (every cached cloud queue at the time), for one that cannot be read
+    or parsed, and for one not written for `url`, the queue row's posting. An id
+    is reused when batch-input.tsv is cleared or hand-edited and batch/jds is
+    not, and another posting's location must never be attached to this job; a
+    sidecar recording no URL cannot show it was written for this one. Each
+    evaluates exactly as it would with no sidecar."""
+    try:
+        raw = json.loads(board_meta_path(career_ops, job_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not url or not isinstance(raw, dict) or raw.get("url") != url:
+        return {}
+    return normalize_board_meta(raw)
+
+
+def _board_amount_text(*amounts) -> str:
+    """One figure, or a range's two joined by an en dash, at ONE precision: two
+    decimals on every figure when any is fractional ("18.50–25.00", never
+    "18.50–25"). `_board_amount` already made a whole figure an int."""
+    spec = ",.2f" if any(isinstance(n, float) for n in amounts) else ","
+    return "–".join(format(n, spec) for n in amounts)
+
+
+def _board_salary(board: dict) -> str:
+    """The salary line's text — "60,000–75,000 CAD / yearly", "from 18 / hourly",
+    "up to 75,000" — or "" when the board gave no figure, since a currency or an
+    interval alone says nothing."""
+    low, high = board.get("min_amount"), board.get("max_amount")
+    if low is not None and high is not None:
+        text = _board_amount_text(low) if low == high else _board_amount_text(low, high)
+    elif low is not None:
+        text = f"from {_board_amount_text(low)}"
+    elif high is not None:
+        text = f"up to {_board_amount_text(high)}"
+    else:
+        return ""
+    if currency := board.get("currency"):
+        text = f"{text} {currency}"
+    interval = board.get("interval")
+    return f"{text} / {interval}" if interval else text
+
+
+def _board_lines(board) -> str:
+    """The user message's "(job board)" lines, one per field present; "" when
+    there are none, so a job with no sidecar gets a message byte-identical to
+    the one it got before #205."""
+    board = normalize_board_meta(board)
+    lines = []
+    if "location" in board:
+        lines.append(f"**Location (job board):** {board['location']}")
+    if salary := _board_salary(board):
+        lines.append(f"**Salary (job board):** {salary}")
+    return "".join(f"{line}\n" for line in lines)
+
+
+# Keys of a job's in-memory metadata that never reach batch-api-state.json:
+# both are re-read from batch/jds every run, and the JD is tens of KB.
+_NOT_PERSISTED = frozenset({"jd_text", "board"})
 
 
 def assign_job_numbers(
@@ -1379,7 +1546,8 @@ def assign_job_numbers(
 
     Pre-assigns sequential report and tracker numbers to pending jobs so
     parallel workers don't conflict on numbering. Mutates `state["jobs"]` to
-    record each job's metadata (excluding jd_text to keep state small).
+    record each job's metadata, excluding the `_NOT_PERSISTED` keys, which
+    `load_jd_text` reads from batch/jds into the returned metadata only.
 
     The entry is rebuilt from scratch each run, so a job's count of failed
     runs is carried over from the previous entry, or the allowance it enforces
@@ -1405,9 +1573,11 @@ def assign_job_numbers(
         }
         if load_jd_text:
             meta["jd_text"] = read_text(jd_cache_path(career_ops, jid))
+            if board := read_board_meta(career_ops, jid, meta["url"]):
+                meta["board"] = board
         jobs.append(meta)
 
-        state_entry = {k: v for k, v in meta.items() if k != "jd_text"}
+        state_entry = {k: v for k, v in meta.items() if k not in _NOT_PERSISTED}
         prior = state["jobs"].get(jid, {})
         if "attempts" in prior:
             state_entry["attempts"] = prior["attempts"]
@@ -2653,7 +2823,7 @@ Adapt framing to the detected archetype.
 
 **Block D - Comp & Demand**
 Use training-knowledge salary benchmarks (Glassdoor/Levels.fyi estimates - label as such).
-Score comp 1-5: 5=top quartile, 1=well below market. When the posting states no pay, the comp score is an estimate: report it, but it does not move the Global band.
+Score comp 1-5: 5=top quartile, 1=well below market. When the posting states no pay, the comp score is an estimate: report it, but it does not move the Global band. A "(job board)" salary may inform the comp score - say it is the board's figure - but it is not the posting stating pay, and a range the description states wins.
 
 **Block E - Personalization Plan**
 Table of top 5 CV changes + top 5 LinkedIn changes.
@@ -2679,10 +2849,10 @@ What counts against a role, for the bands:
 
 Judge the role at the level it is posted at: an entry-level role is not marked down because the candidate is early in their career. Use the whole scale. A role that clears a band's bar earns that band without being perfect.
 
-`final_decision` follows the band, unless a hard stop caps it (below): "Apply" at {APPLY_MIN_SCORE} and above, "Consider" from {SKIP_BELOW} to {APPLY_MIN_SCORE - 0.1:.1f}, "Skip" below {SKIP_BELOW}. Use "Research first" only when the band turns on a fact the posting leaves out.
+`final_decision` follows the band, unless a hard stop or a job-board location outside the candidate's area caps it (below): "Apply" at {APPLY_MIN_SCORE} and above, "Consider" from {SKIP_BELOW} to {APPLY_MIN_SCORE - 0.1:.1f}, "Skip" below {SKIP_BELOW}. Use "Research first" only when the band turns on a fact the posting leaves out.
 
-**Hard stops** - `hard_stops` is what makes the candidate unable to HOLD the role, not what they merely lack. Anything they could learn, be trained on, or argue around is a soft gap. Name every hard stop you find and cap `final_decision` at "Consider" when there is one. A location hard stop caps the decision, not the score: being unable to be where the role is says nothing about fit, so record it here and in `work_location`. A requirement the candidate cannot meet (a licence, credential or clearance) lowers the score as well.
-Geography is the one most often missed. A role requiring recurring physical presence - on-site OR hybrid, however few the office days - in a metro the candidate has not said they can work in is a hard stop, whatever the fit. Read the candidate's own stated locations from the profile above. Do not invent flexibility the posting does not state: "may offer remote", "could relocate" and "remote coordination may be possible" are not in the JD. Work that is inherently local - community-based, field, in-home, canvassing, site-based - requires presence even where the posting also uses the word remote.
+**Hard stops** - `hard_stops` is what makes the candidate unable to HOLD the role, not what they merely lack. Anything they could learn, be trained on, or argue around is a soft gap. Name every hard stop you find and cap `final_decision` at "Consider" when there is one. A location hard stop caps the decision, not the score: being unable to be where the role is says nothing about fit, so record it here and in `work_location`. A place only the job board names is never one (below). A requirement the candidate cannot meet (a licence, credential or clearance) lowers the score as well.
+Geography is the one most often missed. A role requiring recurring physical presence - on-site OR hybrid, however few the office days - in a metro the candidate has not said they can work in is a hard stop, whatever the fit. Read the candidate's own stated locations from the profile above. When the description says neither where the job is nor that it is remote, a "(job board)" location naming a metro is the evidence for the decision only (`metro` and `state` stay ""): inside the candidate's area it confirms the location; outside, it is not a hard stop - a board often lists the headquarters - but a soft gap naming it ("only the board says <place>") that caps `final_decision` at "Consider", not "Research first", and leaves the score alone. A broader one - a country, a state, or one saying remote - is no location at all: only the description decides remote, and it wins any disagreement with the board. Do not invent flexibility the posting does not state: "may offer remote", "could relocate" and "remote coordination may be possible" are not in the JD. Work that is inherently local - community-based, field, in-home, canvassing, site-based - requires presence even where the posting also uses the word remote.
 
 **Machine Summary** YAML block:
 ```yaml
@@ -2762,7 +2932,7 @@ TRACKER_NUM	DATE	COMPANY	ROLE	STATUS	SCORE/5	PDF	[REPORT_NUM](reports/REPORT_NUM
 </summary>
 </evaluation>
 
-work_location rules: `mode` is what the posting REQUIRES of the person, not what it prefers - any required office days at all are "hybrid", never "remote". `metro` is where that presence is required (the work site, not the employer's headquarters) and `state` is that metro's 2-letter state/province code; both are "" for a fully remote role and "" when the posting does not say. Never guess a metro from the company's address.
+work_location rules: `mode` is what the posting REQUIRES of the person, not what it prefers - any required office days at all are "hybrid", never "remote". `metro` is where that presence is required (the work site, not the employer's headquarters) and `state` is that metro's 2-letter state/province code; both are "" for a fully remote role and "" when the posting does not say, whatever place the job board names. Never guess a metro from the company's address.
 
 Tracker TSV rules (one row of 9 tab-separated columns, no header line - the column labels are added when the file is written):
 - Col 1 TRACKER_NUM: use the Tracker Number from the user message

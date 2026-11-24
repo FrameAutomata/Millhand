@@ -25,6 +25,23 @@ def _report(policy: str, *, spanish: bool = False, table: bool = False) -> str:
     return f"# Evaluacion: Acme - Role\n\n## A) Resumen del Rol\n\n{row}\n\nmore prose\n"
 
 
+# Machine Summary blocks written WITH the field that say nothing about where
+# the job is — the last one unparseable by PyYAML, which still counts.
+BLANK_FIELD_BLOCKS = [
+    'work_location:\n  mode: ""\n  metro: ""\n  state: ""\n',
+    "work_location:\n",
+    'work_location:\n  mode: ""\nnext_action: "x": y\n',
+]
+
+
+def _board_only_report(block: str) -> str:
+    """A report evaluated with the field whose Block A names a place the job
+    board gave (#205)."""
+    return ("# Evaluacion\n\n## Machine Summary\n\n```yaml\n"
+            f'final_decision: "Consider"\n{block}```\n\n'
+            "- **Remote policy:** On-site (Chicago, IL per job board)\n")
+
+
 class TestReadPolicy:
     """Block A's row, in every shape the real corpus uses."""
 
@@ -143,6 +160,13 @@ class TestPlan:
             self._row(1, "Acme", "Evaluated", "https://x.example/1 — APPLY")], {})
         planned, tally = bf.plan(co, DFW)
         assert planned == [] and tally["no_report"] == 1
+
+    def test_a_report_evaluated_with_the_field_is_declined_not_prose_parsed(self, tmp_path):
+        co = self._world(tmp_path, [
+            self._row(1, "Acme", "Evaluated", "https://x.example/1 — CONSIDER")],
+            {"001-acme-2026-09-14.md": _board_only_report(BLANK_FIELD_BLOCKS[0])})
+        planned, tally = bf.plan(co, DFW)
+        assert planned == [] and tally["declined"] == 1
 
 
 class TestApply:
@@ -314,6 +338,15 @@ class TestStructuredFieldWins:
     def test_prose_is_the_fallback(self):
         report = _report("On-site (Chicago, IL)")
         assert bf.mark_for_report(report) == "Work location: On-site Chicago, IL"
+
+    @pytest.mark.parametrize("block", BLANK_FIELD_BLOCKS)
+    def test_a_blank_field_is_the_answer_not_a_cue_for_prose(self, block):
+        """#205: the evaluator leaves `metro`/`state` blank for a place only the
+        job board names, which is often the headquarters — and Block A may still
+        name it. Falling back to that prose recorded the very metro the live
+        path is forbidden to record, so #180's gate demoted on the board's
+        address. Prose is for reports with no field at all."""
+        assert bf.mark_for_report(_board_only_report(block)) == ""
 
 
 class TestCandidateAside:
