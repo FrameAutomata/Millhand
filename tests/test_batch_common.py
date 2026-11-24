@@ -3244,6 +3244,83 @@ class TestGeographyRuleInThePrompt:
         assert "REQUIRES" in p
         assert "headquarters" in p.lower()
 
+    def _sentences_with(self, p, phrase):
+        return [s for s in p.split(". ") if phrase in s]
+
+    def test_a_board_location_never_fills_metro_or_state(self):
+        """#205. A board location is often the employer's headquarters, and a
+        metro recorded from it is what #180's out-of-area gate demotes on — so a
+        place only the board names never fills the two fields the gate reads,
+        whether or not the candidate can work there. Said in the work_location
+        rules AND beside the geography rule, which is where a model deciding
+        that a board location is "confirmed" reads it."""
+        p = self._prompt()
+        i = p.index("work_location rules:")
+        [rule] = self._sentences_with(p[i:], "whatever place the job board names")
+        assert 'both are "" for a fully remote role and "" when the posting does not say, ' \
+            "whatever place the job board names" in rule
+        [geo] = self._sentences_with(p, "location naming a metro is the evidence")
+        assert 'for the decision only (`metro` and `state` stay "")' in geo
+        # The reason sits in the geography rule, once.
+        assert "a board often lists the headquarters" in geo
+
+    def test_a_board_only_place_outside_the_area_is_a_soft_gap_capped_at_consider(self):
+        """#205. A board location inside the candidate's area confirms the
+        location the description left out. One outside it is NOT a hard stop —
+        it may be the headquarters — but a soft gap naming the board's place,
+        and it caps the decision at Consider (what a description-silent role
+        got before #205), not the score — and not at "Research first", which
+        the decision rule otherwise offers for a fact the posting leaves out.
+        The decision rule, the hard-stop paragraph, the geography rule and the
+        work_location rules must all say one thing, or the model reads one of
+        them as overriding the others: a decision rule capping on "a location
+        only the job board names" read as capping the candidate's OWN metro too,
+        which is #205's harm."""
+        p = self._prompt()
+        [rule] = self._sentences_with(p, "location naming a metro is the evidence")
+        assert "says neither where the job is nor that it is remote" in rule
+        assert "inside the candidate's area it confirms the location" in rule
+        assert "outside, it is not a hard stop" in rule
+        assert "but a soft gap naming it" in rule
+        assert ('caps `final_decision` at "Consider", not "Research first", '
+                "and leaves the score alone") in rule
+        assert "confirm\")" not in rule
+        hard_stops = p[p.index("**Hard stops**"):p.index("Geography is the one most often missed")]
+        assert "A place only the job board names is never one" in hard_stops
+        assert ("unless a hard stop or a job-board location outside the candidate's area "
+                "caps it") in p
+        assert "a location only the job board names caps it" not in p
+
+    def test_a_board_location_broader_than_a_metro_is_no_location(self):
+        """#205. JobSpy's location is often not a metro — LinkedIn's usual one
+        for a remote role is "United States", Indeed's can be "Texas" or
+        "Remote" — and read by the two-case rule as "not in the candidate's
+        area" each would cap a role on nothing. It is no location at all, and
+        the word remote in it does not make a role remote either: the board's
+        remote flag was dropped on purpose, and this must not re-admit it."""
+        p = self._prompt()
+        sentences = p.split(". ")
+        [i] = [n for n, s in enumerate(sentences)
+               if "location naming a metro is the evidence" in s]
+        broader = sentences[i + 1]  # "one" is the board location just named
+        assert broader.startswith("A broader one - a country, a state, or one saying remote - ")
+        assert "is no location at all: only the description decides remote" in broader
+        assert "it wins any disagreement with the board" in broader
+
+    def test_a_board_salary_is_not_the_posting_stating_pay(self):
+        """A board salary may be Indeed's own estimate — it arrives labelled
+        direct data like an employer's figure — so it may inform the comp score
+        but must not move the band the way stated pay does."""
+        p = self._prompt()
+        assert '"(job board)" salary may inform the comp score' in p
+        assert "it is not the posting stating pay" in p
+        assert "a range the description states wins" in p
+
+    def test_the_board_remote_flag_is_not_mentioned(self):
+        """#205 dropped it: JobSpy's is_remote is a keyword guess, wrong in both
+        directions, so the description alone decides remote."""
+        assert "Remote (job board)" not in self._prompt()
+
 
 class TestWorkLocationMark:
     """#180's storage half: the evaluation records WHERE the role is on the row,

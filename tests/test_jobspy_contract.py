@@ -228,3 +228,27 @@ def test_indeeds_groups_match_the_precedence_chain():
         "MUTEX_GROUPS['indeed'] no longer mirrors _build_filters' branches. Each "
         "branch is one group; options sharing a branch share a group."
     )
+
+
+class TestTheBoardColumnsTheSidecarReads:
+    """#205's board sidecar reads JobSpy's output columns by name out of
+    filtered_jobs.csv. A renamed column would not fail anything else: the field
+    would silently stop reaching the evaluator — or, for `salary_source`, a
+    salary JobSpy parsed out of the description would start being shown to the
+    model as the board's figure."""
+
+    def test_every_column_is_in_jobspys_output(self):
+        from jobspy.util import desired_order
+
+        from pipeline._batch_common import BOARD_COLUMNS
+
+        assert set(BOARD_COLUMNS) <= set(desired_order), (
+            set(BOARD_COLUMNS) - set(desired_order)
+        )
+
+    def test_a_description_parsed_salary_is_still_spelled_description(self):
+        from jobspy.model import SalarySource
+
+        from pipeline._batch_common import SALARY_FROM_DESCRIPTION
+
+        assert SalarySource.DESCRIPTION.value == SALARY_FROM_DESCRIPTION

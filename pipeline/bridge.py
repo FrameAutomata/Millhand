@@ -14,7 +14,9 @@ import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from pipeline._batch_common import parse_date_posted, read_url_set, recheck_discarded
+from pipeline._batch_common import (
+    board_meta_from_row, parse_date_posted, read_url_set, recheck_discarded,
+)
 from pipeline.app.data import _load_states
 from pipeline.rowio import read_rows
 from pipeline.tracker_layout import data_rows
@@ -332,6 +334,9 @@ def run(career_ops_path: Path) -> list[dict]:
             "company": company,
             "description": description,
             "date_posted": date_posted_str,
+            # The board's location and salary (#205), for batch_prep's
+            # sidecar. pipeline.md and scan-history never read it.
+            "board": board_meta_from_row(row),
         })
 
     append_easy_apply_urls(career_ops_path, easy_apply_urls)
