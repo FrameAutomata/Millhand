@@ -23,7 +23,7 @@ from pipeline.daily_digest import SECRET_VARS as _DIGEST_SECRET_VARS
 # (_load_yaml_or_empty), how to read a sub-section (_dsect), and what a yes/no in
 # THIS file means (_as_bool — a quoted "false" is a truthy string). Private names,
 # but two readers of one file must not carry two policies for it.
-from pipeline.handoff import _as_bool, _dsect, _load_yaml_or_empty
+from pipeline.handoff import _as_bool, _dsect, _load_yaml_or_empty, target_roles
 from pipeline.sites import SUPPORTED_SITES, keep_supported, normalize_pass, resolve_sites
 
 # US states (50 + DC) and Canadian provinces — mirror of the sets in
@@ -254,15 +254,9 @@ def derive_from_profile(profile: dict) -> dict:
                 continue
             _put(out, form_key, src.get(yaml_key))
 
-    # target_roles.archetypes holds every role the user named, in order and
-    # verbatim (`primary` is the same list truncated to two), so it round-trips
-    # the form field where `primary` would silently drop roles 3+ on the next save.
-    roles = _dsect(profile, "target_roles")
-    archetypes = [
-        a.get("name") for a in (roles.get("archetypes") or [])
-        if isinstance(a, dict) and a.get("name")
-    ]
-    _put(out, "target_roles", archetypes or roles.get("primary"))
+    # Every role the user named (handoff.target_roles); the evaluator and the
+    # PROFILE.md seed read the same list (#209).
+    _put(out, "target_roles", [r["name"] for r in target_roles(profile)])
 
     # Booleans, where BOTH values are answers — so they're keyed on the key being
     # present rather than on the value being non-blank, and serialized the way the

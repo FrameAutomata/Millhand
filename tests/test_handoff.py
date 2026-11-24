@@ -1335,6 +1335,47 @@ class TestProfileRobustToMalformedYaml:
         assert "US Citizen — no sponsorship required" in md
 
 
+class TestTargetRoles:
+    """handoff.target_roles — the candidate's own role families, read by the
+    evaluator (archetype detection, North Star), the PROFILE.md seed and the
+    wizard's prefill."""
+
+    def test_archetypes_win_over_the_truncated_primary(self):
+        p = {"target_roles": {"primary": ["A", "B"], "archetypes": [
+            {"name": "A", "fit": "primary", "level": "mid/junior"},
+            {"name": "B", "fit": "secondary"}, {"name": "C", "fit": "adjacent"}]}}
+        assert handoff.target_roles(p) == [
+            {"name": "A", "fit": "primary"},
+            {"name": "B", "fit": "secondary"},
+            {"name": "C", "fit": "adjacent"}]
+
+    def test_primary_when_there_are_no_archetypes(self):
+        assert handoff.target_roles({"target_roles": {"primary": ["Data analyst"]}}) == [
+            {"name": "Data analyst", "fit": ""}]
+        # a scalar primary is one role, not one per character
+        assert [r["name"] for r in handoff.target_roles(
+            {"target_roles": {"primary": "Data analyst"}})] == ["Data analyst"]
+
+    def test_bare_name_archetypes_are_read(self):
+        p = {"target_roles": {"archetypes": ["Outreach", " ", None, {"fit": "primary"}]}}
+        assert [r["name"] for r in handoff.target_roles(p)] == ["Outreach"]
+
+    @pytest.mark.parametrize("profile", [
+        {}, {"target_roles": None}, {"target_roles": ["AI Engineer"]},
+        {"target_roles": {"archetypes": "Outreach"}},     # scalar, not a list
+        {"target_roles": {"archetypes": {"name": "X"}}},  # mapping, not a list
+    ])
+    def test_malformed_degrades_to_nothing(self, profile):
+        assert handoff.target_roles(profile) == []
+
+    def test_the_profile_seed_lists_every_role(self):
+        """A seeded PROFILE.md used to read `primary`, which setup truncates to
+        two, so roles 3+ never reached the browser agent's master (#209)."""
+        md = handoff.render_profile_md(profile={"target_roles": {
+            "primary": ["A", "B"], "archetypes": [{"name": "A"}, {"name": "B"}, {"name": "C"}]}})
+        assert "- **Target roles:** A, B, C" in md
+
+
 class TestProfileRicherSources:
     """3a: the seed is comprehensive AND accurate because it folds in ALL grounded
     career-ops sources — not just cv.md + profile.yml, but article-digest.md (hero

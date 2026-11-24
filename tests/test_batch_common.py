@@ -1063,19 +1063,22 @@ class TestEvalSystemPrompt:
     point shared by the batch (`--evaluate-batch`) and UI add-job eval paths, so
     they can never disagree: PROFILE.md wins when present, else the seed files."""
 
-    def _career_ops(self, tmp_path):
+    def _career_ops(self, tmp_path, profile_yml="PROFILEYAML_XYZ"):
         co = tmp_path / "career-ops"
         (co / "config").mkdir(parents=True)
         (co / "cv.md").write_text("MYCV_XYZ", encoding="utf-8")
-        (co / "config" / "profile.yml").write_text("PROFILEYAML_XYZ", encoding="utf-8")
+        (co / "config" / "profile.yml").write_text(profile_yml, encoding="utf-8")
         return co
 
-    def test_uses_profile_master_when_present(self, tmp_path, monkeypatch):
-        co = self._career_ops(tmp_path)
+    def _master(self, tmp_path, monkeypatch):
         handoff_dir = tmp_path / "handoff"
         handoff_dir.mkdir()
         (handoff_dir / "PROFILE.md").write_text("LIVING MASTER PROFILE", encoding="utf-8")
         monkeypatch.setenv("HANDOFF_OUT_DIR", str(handoff_dir))
+
+    def test_uses_profile_master_when_present(self, tmp_path, monkeypatch):
+        co = self._career_ops(tmp_path)
+        self._master(tmp_path, monkeypatch)
         result = eval_system_prompt(co)
         assert "LIVING MASTER PROFILE" in result
         assert "MYCV_XYZ" not in result            # master supersedes the seeds
@@ -1090,6 +1093,72 @@ class TestEvalSystemPrompt:
         assert "MYCV_XYZ" in result
         assert "PROFILEYAML_XYZ" in result
         assert "EVALUATION FRAMEWORK" in result
+
+    def test_target_roles_come_from_profile_yml_under_a_master(self, tmp_path, monkeypatch):
+        """PROFILE.md supersedes profile.yml as the candidate profile, but a master
+        seeded before #209 names only two target roles, so the list still comes
+        from profile.yml (#209). The one level setup guesses for every role is
+        not stated."""
+        co = self._career_ops(tmp_path, (
+            "target_roles:\n  primary: [Outreach, Translation]\n  archetypes:\n"
+            "    - {name: Outreach, level: staff/principal, fit: primary}\n"
+            "    - {name: Translation, level: staff/principal, fit: secondary}\n"
+            "    - {name: Youth programs, level: staff/principal, fit: secondary}\n"))
+        self._master(tmp_path, monkeypatch)
+        prompt = eval_system_prompt(co)
+        for line in ("- Outreach (primary)\n", "- Translation (secondary)\n",
+                     "- Youth programs (secondary)\n"):
+            assert line in prompt
+        assert "staff/principal" not in prompt
+
+    @pytest.mark.parametrize("profile_yml", [
+        "target_roles: [unclosed\n",
+        # PyYAML raises a plain ValueError, not a YAMLError, for an impossible date
+        "available_from: 2026-02-30\ntarget_roles:\n  primary: [Outreach]\n",
+    ])
+    def test_a_malformed_profile_yml_falls_back_to_the_profile(self, tmp_path, monkeypatch, profile_yml):
+        co = self._career_ops(tmp_path, profile_yml)
+        monkeypatch.setenv("HANDOFF_OUT_DIR", str(tmp_path / "nowhere"))
+        assert "The candidate profile above states their target roles" in eval_system_prompt(co)
+
+
+class TestTargetRolesInPrompt:
+    """The archetype list is the candidate's own target roles (#209), not
+    career-ops' six AI-engineering defaults."""
+
+    AI_ARCHETYPES = ("AI Platform", "LLMOps", "Forward Deployed", "AI Transformation")
+
+    def test_candidate_roles_replace_the_ai_archetypes(self):
+        prompt = build_system_prompt("cv", "profile", target_roles=[
+            {"name": "Bilingual community outreach", "fit": "primary"},
+            {"name": "Policy analyst", "fit": ""}])
+        assert not [ai for ai in self.AI_ARCHETYPES if ai in prompt]
+        assert "fit: primary = the role they most want" in prompt
+        assert "- Bilingual community outreach (primary)\n" in prompt
+        assert "- Policy analyst\n" in prompt          # no empty "()" without a fit
+        assert '"Outside target roles (<' in prompt     # an answer, not a failure
+        assert "it is newer: use those" in prompt     # a master's own list wins
+
+    def test_the_outside_marker_parses_unquoted(self):
+        """The Machine Summary is YAML. A marker carrying ": " fails to parse
+        when a model leaves the value unquoted, which loses work_location and
+        with it the #180 out-of-area gate."""
+        import yaml
+        prompt = build_system_prompt("cv", "profile")
+        hint = re.search(r'archetype: "([^"]*)"', prompt).group(1)
+        marker = hint.split(", or ", 1)[1].replace("<function>", "community outreach")
+        assert yaml.safe_load(f"archetype: {marker}") == {"archetype": marker}
+
+    def test_no_fit_legend_when_no_role_has_a_fit(self):
+        prompt = build_system_prompt("cv", "profile", target_roles=[{"name": "Policy analyst", "fit": ""}])
+        assert "The candidate's target roles, as they named them at setup:\n- Policy analyst\n" in prompt
+
+    def test_without_target_roles_points_at_the_profile(self):
+        """A hand-written profile.yml with no target_roles still gets a usable
+        instruction: a PROFILE.md master states them in prose."""
+        prompt = build_system_prompt("cv", "profile")
+        assert "The candidate profile above states their target roles" in prompt
+        assert not [ai for ai in self.AI_ARCHETYPES if ai in prompt]
 
 
 def _tracker_row(score="4.2/5", status="Evaluated", notes="note", role="SRE"):
@@ -2616,8 +2685,9 @@ class TestNoUnredactedProfileReads:
             "resolve_profile_md; both prompt consumers redact on the way out",
         "return _read_or_empty(_career_ops_dir(career_ops) / HANDOFF_PROFILE)":
             "resolve_profile_md's fallback arm, same reason",
-        'read_text(career_ops / "config" / "profile.yml"),':
-            "eval_system_prompt; build_system_prompt redacts both inputs",
+        'profile_yml = read_text(career_ops / "config" / "profile.yml")':
+            "eval_system_prompt; build_system_prompt redacts both inputs, and "
+            "only target_roles' names and fit are parsed out of it",
     }
 
     def test_every_raw_read_is_redacted_or_declared(self):
