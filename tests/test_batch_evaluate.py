@@ -4,11 +4,13 @@ import csv
 import json
 import os
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
 
 from pipeline import batch_evaluate as eval_mod
+from pipeline._batch_common import IncompleteResponse
 from pipeline import gemini_limits as gl
 from tests.conftest import evaluate_without_a_provider, fake_clock, real_pacers_on_fake_clock
 from pipeline.batch_evaluate import (
@@ -387,6 +389,26 @@ class TestTransientProviderErrors:
         call = _build_failover_caller("deepinfra", ["primary", "backup"])
         assert call("s", "u") == "from-backup"
 
+    def test_a_cut_off_lead_is_still_counted_behind_an_overloaded_sibling(self, monkeypatch):
+        """The last member's error decides retry and backoff; a cut-off earlier
+        in the chain rides as its cause, so the job is still charged (#206)."""
+        from pipeline.batch_evaluate import _build_failover_caller
+        cut = IncompleteResponse("anthropic returned empty content (stop_reason=max_tokens)")
+        busy = RuntimeError("Error code: 429 - rate limit exceeded")
+        def raise_(e):
+            def f(system, user):
+                raise e
+            return f
+        monkeypatch.setattr(
+            "pipeline.batch_evaluate._build_single_caller",
+            lambda provider, model, disable_thinking=False:
+                raise_(cut) if model == "primary" else raise_(busy))
+        with pytest.raises(RuntimeError, match="429") as exc:
+            _build_failover_caller("anthropic", ["primary", "backup"])("s", "u")
+        assert exc.value.__cause__ is cut
+        assert eval_mod._is_countable_failure(exc.value)
+        assert eval_mod._is_rate_limit_error(exc.value)   # backoff unchanged
+
     def test_failover_swaps_on_500(self, monkeypatch):
         from pipeline.batch_evaluate import _build_failover_caller
         def dead(system, user):
@@ -613,29 +635,35 @@ class TestAnthropicCaller:
             call("s", "u")
         assert eval_mod._is_empty_content_error(exc.value)
         assert eval_mod._is_transient_provider_error(exc.value)
+        # Counted against the job (#206) only for a reason that says the JD is
+        # what failed; an empty end_turn is the endpoint's fault, and a reason
+        # the API adds later is not assumed to be the JD's.
+        assert eval_mod._is_countable_failure(exc.value) is (stop_reason in ("max_tokens", "refusal"))
+
+
+def _queued_career_ops(tmp_path, *, state_jobs=None, additions=None):
+    """A career-ops with two queued jobs — 1 Acme, 2 Globex — and a CV."""
+    career_ops = tmp_path / "career-ops"
+    batch = career_ops / "batch"
+    (batch / "tracker-additions").mkdir(parents=True)
+    with open(batch / "batch-input.tsv", "w", newline="", encoding="utf-8") as f:
+        f.write("id\turl\tsource\tnotes\n1\thttps://a.com\tAcme\tEng\n2\thttps://b.com\tGlobex\tDev\n")
+    (career_ops / "cv.md").write_text("# CV", encoding="utf-8")
+    if state_jobs is not None:
+        (batch / "batch-api-state.json").write_text(
+            json.dumps({"jobs": state_jobs}), encoding="utf-8")
+    for name in (additions or []):
+        (batch / "tracker-additions" / name).write_text("1\t2026-06-01\tAcme\n", encoding="utf-8")
+    return career_ops
 
 
 class TestMergeAndConcurrency:
     """The interrupted-eval merge gap (#4) and the BATCH_CONCURRENCY=0 floor."""
 
-    def _career_ops(self, tmp_path, *, state_jobs=None, additions=None):
-        career_ops = tmp_path / "career-ops"
-        batch = career_ops / "batch"
-        (batch / "tracker-additions").mkdir(parents=True)
-        with open(batch / "batch-input.tsv", "w", newline="", encoding="utf-8") as f:
-            f.write("id\turl\tsource\tnotes\n1\thttps://a.com\tAcme\tEng\n2\thttps://b.com\tGlobex\tDev\n")
-        (career_ops / "cv.md").write_text("# CV", encoding="utf-8")
-        if state_jobs is not None:
-            (batch / "batch-api-state.json").write_text(
-                json.dumps({"jobs": state_jobs}), encoding="utf-8")
-        for name in (additions or []):
-            (batch / "tracker-additions" / name).write_text("1\t2026-06-01\tAcme\n", encoding="utf-8")
-        return career_ops
-
     def test_merge_runs_when_unmerged_additions_and_zero_pending(self, tmp_path, monkeypatch):
         # Both jobs "completed" → 0 pending, but a TSV is still unmerged (an
         # interrupted prior run). The early return must heal it by merging.
-        career_ops = self._career_ops(
+        career_ops = _queued_career_ops(
             tmp_path,
             state_jobs={"1": {"status": "completed"}, "2": {"status": "completed"}},
             additions=["1.tsv"],
@@ -648,7 +676,7 @@ class TestMergeAndConcurrency:
         assert called == [career_ops]
 
     def test_no_merge_when_zero_pending_and_no_additions(self, tmp_path, monkeypatch):
-        career_ops = self._career_ops(
+        career_ops = _queued_career_ops(
             tmp_path,
             state_jobs={"1": {"status": "completed"}, "2": {"status": "completed"}},
             additions=[],
@@ -663,7 +691,7 @@ class TestMergeAndConcurrency:
     def test_an_unclean_heal_sweep_is_reported(self, tmp_path, monkeypatch):
         # The heal sweep's result is the run's: a kept refusal from an earlier
         # run is merged again here, refused again, and must not read as clean.
-        career_ops = self._career_ops(
+        career_ops = _queued_career_ops(
             tmp_path,
             state_jobs={"1": {"status": "completed"}, "2": {"status": "completed"}},
             additions=["1.tsv"],
@@ -673,7 +701,7 @@ class TestMergeAndConcurrency:
 
     @pytest.mark.parametrize("clean", [True, False])
     def test_the_post_evaluation_merge_is_reported(self, tmp_path, monkeypatch, clean):
-        career_ops = self._career_ops(tmp_path)
+        career_ops = _queued_career_ops(tmp_path)
         evaluate_without_a_provider(monkeypatch)
         called = []
         monkeypatch.setattr("pipeline.batch_evaluate.run_merge_tracker",
@@ -685,10 +713,180 @@ class TestMergeAndConcurrency:
         # BATCH_CONCURRENCY=0 would crash ThreadPoolExecutor(max_workers=0); the
         # floor keeps the eval stage from tracebacking after the expensive
         # earlier stages. Verified via the dry-run worker count.
-        career_ops = self._career_ops(tmp_path)
+        career_ops = _queued_career_ops(tmp_path)
         monkeypatch.setenv("BATCH_PROVIDER", "anthropic")
         run(career_ops, provider="anthropic", concurrency=0, dry_run=True)
         assert "workers=1" in capsys.readouterr().out
+
+
+class TestFailureAllowance:
+    """#206: a job whose evaluation fails the countable way — an answer cut off
+    or refused, which repeats on the same JD — is re-queued on at most
+    MAX_ATTEMPTS runs, then abandoned. Driven end to end through run() with a
+    fake provider, one call per run, against one state file."""
+
+    # Every tag the writer reads, so this stays a success once #204's
+    # completeness check lands.
+    ANSWER = ("<evaluation><report># Report</report>"
+              "<tracker_tsv>1\t2026-11-22\tGlobex\tDev\tEvaluated\t4.0/5\t\t"
+              "[001](reports/001-globex-2026-11-22.md)\t</tracker_tsv>"
+              '<summary>{"score": 4.0}</summary></evaluation>')
+
+    CUT_OFF = IncompleteResponse("anthropic returned empty content (stop_reason=max_tokens)")
+
+    @pytest.fixture
+    def h(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+        # A zero job budget: a transient failure gives up instead of backing
+        # off, so each job costs one call per run and nothing sleeps.
+        monkeypatch.setenv("LLM_JOB_BUDGET", "0")
+        monkeypatch.setattr(eval_mod, "eval_system_prompt", lambda co: "SYSTEM")
+        monkeypatch.setattr(eval_mod, "run_merge_tracker", lambda co: True)
+        h = SimpleNamespace(career_ops=_queued_career_ops(tmp_path), failing={}, calls=[])
+
+        def caller(system, user):
+            company = "Acme" if "Acme" in user else "Globex"
+            h.calls.append(company)
+            if company in h.failing:
+                raise h.failing[company]
+            return self.ANSWER
+
+        monkeypatch.setattr(eval_mod, "_build_caller", lambda provider, model: caller)
+        state_path = h.career_ops / "batch" / "batch-api-state.json"
+        h.seed = lambda jobs: state_path.write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
+        h.jobs = lambda: json.loads(state_path.read_text(encoding="utf-8"))["jobs"]
+        h.run = lambda **kw: run(h.career_ops, provider="anthropic", concurrency=1, **kw)
+        return h
+
+    def test_a_countable_failure_is_abandoned_on_the_third_run(self, h, capsys):
+        # Acme has failed before (a run that did not count). In this two-job
+        # queue a FRESH failure is half the run and would be read as the run's
+        # trouble on its first run; in a real queue of many it is a lone one.
+        h.seed({"1": {"status": "failed", "error": "earlier"}})
+        exc = h.failing["Acme"] = self.CUT_OFF
+        for n in (1, 2):
+            h.run()
+            assert h.jobs()["1"]["status"] == "failed"
+            assert h.jobs()["1"]["attempts"] == n
+        assert h.jobs()["2"]["status"] == "completed"
+        capsys.readouterr()
+
+        h.run()                    # one job ran and failed: still counted
+        job = h.jobs()["1"]
+        assert (job["status"], job["attempts"]) == ("abandoned", eval_mod.MAX_ATTEMPTS) == ("abandoned", 3)
+        assert job["error"] == str(exc)
+        out = capsys.readouterr().out
+        assert f"[1] ABANDONED after 3 failed runs: Acme — {exc}" in out
+        assert "abandoned=1" in out
+
+        assert h.run().processed == 0        # out of the queue for good
+        assert h.calls.count("Acme") == 3
+
+    def test_a_queue_of_only_stuck_jobs_is_counted(self, h):
+        """Every job fails, and nothing succeeds — but all of them had failed
+        before, so it is the jobs, not the run. "Nothing succeeded" alone
+        exempted this queue forever."""
+        h.seed({"1": {"status": "failed", "error": "earlier"},
+                "2": {"status": "failed", "error": "earlier"}})
+        h.failing.update(Acme=self.CUT_OFF, Globex=self.CUT_OFF)
+        for _ in range(eval_mod.MAX_ATTEMPTS):
+            h.run()
+        assert {j: h.jobs()[j]["status"] for j in ("1", "2")} == {"1": "abandoned", "2": "abandoned"}
+
+    def test_a_transient_failure_never_counts(self, h):
+        exc = h.failing["Acme"] = RuntimeError("Error code: 429 - rate limit exceeded")
+        runs = eval_mod.MAX_ATTEMPTS + 1
+        for _ in range(runs):
+            h.run()
+        job = h.jobs()["1"]
+        assert job["status"] == "failed" and "attempts" not in job
+        assert job["error"] == str(exc)
+        assert h.calls.count("Acme") == runs         # still re-queued every run
+
+    def test_a_run_mostly_failing_for_the_first_time_counts_for_nobody(self, h, capsys):
+        # One failure from the cap, and then an effort setting that thinks past
+        # the output cap cuts every answer off, fresh jobs' too: no run like that
+        # may be the one that abandons it.
+        h.seed({"1": {"status": "failed", "attempts": 2, "error": "earlier"}})
+        h.failing.update(Acme=self.CUT_OFF, Globex=self.CUT_OFF)
+        h.run()
+        jobs = h.jobs()
+        assert (jobs["1"]["status"], jobs["1"]["attempts"]) == ("failed", 2)
+        assert "attempts" not in jobs["2"]
+        assert "2 of 2 jobs failed the same way" in capsys.readouterr().out
+
+        # The rule is about the run, not a pardon: once it is the same jobs
+        # failing again, they are counted, and the stuck one is abandoned.
+        h.run()
+        jobs = h.jobs()
+        assert (jobs["1"]["status"], jobs["1"]["attempts"]) == ("abandoned", 3)
+        assert jobs["2"]["attempts"] == 1
+
+    def test_retry_abandoned_brings_a_job_back_with_a_fresh_allowance(self, h, capsys):
+        h.seed({"1": {"status": "abandoned", "attempts": 3, "error": "old"},
+                "2": {"status": "completed"}})
+        h.failing["Acme"] = IncompleteResponse("anthropic returned empty content (stop_reason=refusal)")
+        h.run(retry_abandoned=True)
+        assert "--retry-abandoned: 1 abandoned job(s) back in the queue" in capsys.readouterr().out
+        assert h.calls == ["Acme"]
+        job = h.jobs()["1"]
+        assert (job["status"], job["attempts"]) == ("failed", 1)   # not straight back to 3
+
+        del h.failing["Acme"]
+        assert h.run().processed == 1
+        job = h.jobs()["1"]
+        assert job["status"] == "completed" and "error" not in job
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="SIGINT delivery to the main thread is POSIX")
+    def test_an_interrupted_run_still_charges_what_failed(self, h, monkeypatch):
+        """A run cut short every time (a timeout, a cancel) must still move a
+        stuck job's count, or it is re-queued at the head of the queue forever."""
+        import signal
+        import time
+        h.failing["Acme"] = self.CUT_OFF
+        monkeypatch.setattr(os, "_exit", lambda code: (_ for _ in ()).throw(SystemExit(code)))
+
+        def interrupt_on_globex(system, user):
+            if "Acme" in user:
+                h.calls.append("Acme")
+                raise self.CUT_OFF
+            time.sleep(1.5)                # let the run record Acme's failure first
+            os.kill(os.getpid(), signal.SIGINT)
+            time.sleep(1.0)
+            return self.ANSWER
+
+        monkeypatch.setattr(eval_mod, "_build_caller", lambda provider, model: interrupt_on_globex)
+        with pytest.raises(SystemExit):
+            h.run()
+        assert h.jobs()["1"]["attempts"] == 1
+
+    def test_a_revival_is_saved_even_when_the_run_stops_early(self, h, monkeypatch):
+        """The log line says the jobs are back; an early return (an expired key)
+        must not leave the cached state saying they are not."""
+        h.seed({"1": {"status": "abandoned", "attempts": 3, "error": "old"}})
+        monkeypatch.setattr(eval_mod, "_check_provider", lambda p: "ANTHROPIC_API_KEY not set")
+        h.run(retry_abandoned=True)
+        assert (h.jobs()["1"]["status"], h.jobs()["1"]["attempts"]) == ("failed", 0)
+
+    @pytest.mark.parametrize("exc,countable", [
+        pytest.param(IncompleteResponse("anthropic returned empty content (stop_reason=refusal)"),
+                     True, id="incomplete-response"),
+        pytest.param(RuntimeError("Error code: 429 - rate limit exceeded"), False, id="429"),
+        pytest.param(RuntimeError("Error code: 500 - internal server error"), False, id="500"),
+        pytest.param(RuntimeError("Request timed out."), False, id="timeout"),
+        # A degraded endpoint answering 200 with nothing is not the job's fault,
+        # and neither is a config error, which hits every job.
+        pytest.param(RuntimeError("provider returned empty content"), False, id="bare-empty-content"),
+        pytest.param(RuntimeError("anthropic returned empty content (stop_reason=end_turn)"),
+                     False, id="empty-but-ended-naturally"),
+        pytest.param(RuntimeError("Error code: 404 - model not found"), False, id="config-error"),
+    ])
+    def test_which_failures_count(self, exc, countable):
+        assert eval_mod._is_countable_failure(exc) is countable
+
+    def test_the_module_entry_point_takes_the_flag(self):
+        assert eval_mod._parse_argv(["--retry-abandoned"]).retry_abandoned is True
+        assert eval_mod._parse_argv([]).retry_abandoned is False
 
 
 class TestEvalLock:

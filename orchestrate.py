@@ -61,6 +61,9 @@ def main() -> int:
                          "BATCH_CONCURRENCY env var; floored at 1). Size to your "
                          "provider's limits — e.g. DeepInfra allows 200 concurrent "
                          "requests per model.")
+    ap.add_argument("--retry-abandoned", action="store_true",
+                    help="With --evaluate-batch: re-queue the jobs abandoned after "
+                         f"{batch_evaluate.MAX_ATTEMPTS} failed runs, with a fresh allowance")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print what would be submitted/evaluated without doing it")
     ap.add_argument("--handoff", action="store_true",
@@ -101,6 +104,11 @@ def main() -> int:
     pass_group.add_argument("--no-easy-apply", action="store_true",
                             help="Skip passes with `easy_apply: true`. Used by the daily cloud workflow.")
     args = ap.parse_args()
+    if args.retry_abandoned and not args.evaluate_batch:
+        # It is batch_evaluate's flag. Without --evaluate-batch the run would
+        # scrape, filter and bridge and leave the abandoned jobs where they are,
+        # exiting 0 with nothing said; `--batch --retry-abandoned` is the easy slip.
+        ap.error("--retry-abandoned needs --evaluate-batch (it re-queues jobs that run abandoned)")
 
     only_passes: list[str] | None = None
     if args.only_pass:
@@ -165,6 +173,7 @@ def main() -> int:
             model=args.batch_model,
             concurrency=args.batch_concurrency,
             dry_run=args.dry_run,
+            retry_abandoned=args.retry_abandoned,
         ).merge_clean
 
     if args.recheck_liveness:

@@ -50,6 +50,15 @@ on:
   schedule:
     - cron: '0 12 * * *'   # noon UTC = 7 AM CDT
   workflow_dispatch:
+    inputs:
+      retry_abandoned:
+        # A job whose evaluation failed the countable way on MAX_ATTEMPTS runs
+        # is `abandoned` in the cached batch state and no longer re-queued
+        # (#206). The cache is the only copy of that state, so this is the cloud's
+        # one way to put such jobs back. Scheduled runs never set it.
+        description: "Re-queue evaluations abandoned after repeated failures (--retry-abandoned)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -368,7 +377,8 @@ jobs:
           # on that exit.
           python orchestrate.py --evaluate-batch \
             --recheck-liveness \
-            --batch-concurrency "$BATCH_CONCURRENCY"
+            --batch-concurrency "$BATCH_CONCURRENCY" \
+            ${{ inputs.retry_abandoned && '--retry-abandoned' || '' }}
 
       # Tell the candidate what this run found worth their attention — one
       # Discord message and/or one email naming the roles at or above
