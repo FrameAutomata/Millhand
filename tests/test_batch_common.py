@@ -12,6 +12,7 @@ import pytest
 
 from pipeline._batch_common import (
     ADDITION_COLUMNS,
+    IncompleteResponse,
     ADDITION_LABEL_LINE,
     ADDITION_LABELS,
     _HEADED_PARSER_MARKER,
@@ -507,15 +508,72 @@ class TestWriteJobResult:
         out = write_job_result(self._make_response(score=3.7), meta, reports, tracker, "2026-01-01")
         assert out["summary"]["score"] == 3.7
 
-    def test_handles_missing_tags(self, tmp_path):
-        reports = tmp_path / "reports"
-        tracker = tmp_path / "tracker"
+    # `{n}` is the response's length: the reason quotes it instead of the text.
+    @pytest.mark.parametrize("response, reason", [
+        pytest.param("<evaluation><summary>{}</summary></evaluation>",
+                     "the response carried no <report> or <tracker_tsv> ({n} chars)", id="neither"),
+        pytest.param("<evaluation><report># R</report><summary>{}</summary></evaluation>",
+                     "the response carried no <tracker_tsv> ({n} chars)", id="no-row"),
+        pytest.param("<evaluation><tracker_tsv>a row</tracker_tsv><summary>{}</summary></evaluation>",
+                     "the response carried no <report> ({n} chars)", id="no-report"),
+        pytest.param('<evaluation><summary>{"status": "failed", "error": "JD\\n  was empty"}'
+                     "</summary></evaluation>",
+                     "the model reported a failed evaluation (14-char reason withheld)",
+                     id="model-failed"),
+        pytest.param("I could not evaluate this posting.",
+                     "the response carried no <report> or <tracker_tsv> ({n} chars)", id="prose"),
+    ])
+    def test_an_incomplete_evaluation_raises_and_writes_nothing(self, tmp_path, response, reason):
+        """#204: a response with either tag missing used to be written as far as
+        it went and returned normally, so the job was recorded completed — never
+        re-queued — and the role never reached the tracker. The check comes
+        before any write, and the reason names what was missing (or the model's
+        own error), never the response, which can carry profile text."""
+        reports, tracker = tmp_path / "reports", tmp_path / "tracker"
         reports.mkdir()
         tracker.mkdir()
         meta = {"id": "99", "report_num": "002", "company": "Globex"}
-        out = write_job_result("<evaluation><summary>{}</summary></evaluation>", meta, reports, tracker, "2026-01-01")
-        assert out["report_file"] is None
-        assert out["tracker_file"] is None
+        with pytest.raises(IncompleteResponse) as exc:
+            write_job_result(response, meta, reports, tracker, "2026-01-01")
+        assert str(exc.value) == reason.format(n=len(response))
+        assert list(reports.iterdir()) == [] and list(tracker.iterdir()) == []
+
+    def test_both_tags_win_over_a_failed_status(self, tmp_path):
+        # The tags are the evaluation; a stray "failed" in a summary beside them
+        # must not turn a whole one into a counted failure.
+        reports, tracker = tmp_path / "reports", tmp_path / "tracker"
+        reports.mkdir()
+        tracker.mkdir()
+        meta = {"id": "42", "report_num": "001", "company": "Acme"}
+        response = self._make_response().replace('"status": "completed"', '"status": "failed"')
+        assert '"status": "failed"' in response
+        out = write_job_result(response, meta, reports, tracker, "2026-01-01")
+        assert (reports / out["report_file"]).exists() and (tracker / "42.tsv").exists()
+
+    @pytest.mark.parametrize("summary", ['["completed"]', '"done"', "7"])
+    def test_a_summary_that_is_not_an_object_is_no_summary(self, tmp_path, summary):
+        reports, tracker = tmp_path / "reports", tmp_path / "tracker"
+        reports.mkdir()
+        tracker.mkdir()
+        meta = {"id": "42", "report_num": "001", "company": "Acme"}
+        response = self._make_response().split("<summary>")[0] + f"<summary>{summary}</summary></evaluation>"
+        out = write_job_result(response, meta, reports, tracker, "2026-01-01")
+        assert out["summary"] == {} and (tracker / "42.tsv").exists()
+
+    def test_a_row_that_cannot_be_built_leaves_no_report(self, tmp_path, monkeypatch):
+        # The row is built before anything is written: a report left behind
+        # would share its number with the re-queued job's next one.
+        reports, tracker = tmp_path / "reports", tmp_path / "tracker"
+        reports.mkdir()
+        tracker.mkdir()
+
+        def broken(*a, **k):
+            raise ValueError("a row the sanitizer cannot read")
+        monkeypatch.setattr(_batch_common, "sanitize_addition", broken)
+        with pytest.raises(ValueError):
+            write_job_result(self._make_response(), {"id": "42", "report_num": "001"},
+                             reports, tracker, "2026-01-01")
+        assert list(reports.iterdir()) == [] and list(tracker.iterdir()) == []
 
     def test_slugifies_company_name(self, tmp_path):
         reports = tmp_path / "reports"
@@ -548,17 +606,6 @@ class TestWriteJobResult:
         cells = _data_cells(tracker / "42.tsv")
         assert cells[7] == "[271](reports/271-baylor-scott-white-health-2026-09-03.md)"
         assert (reports / "271-baylor-scott-white-health-2026-09-03.md").exists()
-
-    def test_report_link_left_as_written_when_no_report_was_written(self, tmp_path):
-        # A response with no <report> writes no file, so there is nothing true to
-        # point the cell at; it keeps the model's link rather than a dead one of ours.
-        reports, tracker = tmp_path / "reports", tmp_path / "tracker"
-        reports.mkdir(); tracker.mkdir()
-        meta = {"id": "42", "report_num": "001", "company": "Acme"}
-        row = "1\t2026-01-01\tAcme\tEng\tEvaluated\t4.0/5\tnull\t[001](reports/001-acme-&-co.md)\tn"
-        write_job_result(self._make_response(report="", tracker=row), meta, reports, tracker, "2026-01-01")
-        cells = _data_cells(tracker / "42.tsv")
-        assert cells[7] == "[001](reports/001-acme-&-co.md)"
 
     def test_url_spliced_into_notes_cell(self, tmp_path):
         # The UI's "Open posting" link reads the URL out of the notes cell.

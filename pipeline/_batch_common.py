@@ -1241,8 +1241,9 @@ def _set_report_link(tracker_tsv: str, report_file: str) -> str:
     The cell is `[N](reports/N-slug-DATE.md)` where N is the file's own leading
     number, so the two agree by construction. `report_file` is a bare filename
     under `reports/`; empty means "nothing known" and leaves the cell alone —
-    a row whose report was never written (a `failed` evaluation) keeps whatever
-    the model put there, which is no worse than before. Declined on a row whose
+    the merge-time pass found nothing to repair it with (`_dead_link_repair`),
+    so the row keeps whatever the model put there, which is no worse than
+    before. Declined on a row whose
     columns are not in place, like every positional step (`_row_parts`)."""
     report_file = (report_file or "").strip()
     num = _report_num_prefix(report_file)
@@ -1269,8 +1270,33 @@ class IncompleteResponse(RuntimeError):
     """A provider answered, but not with a whole evaluation — the JOB's failure,
     not the run's — so it counts against the job's allowance of failed runs
     (`batch_evaluate._is_countable_failure`, #206). Raised by the Claude caller
-    for a cut-off or refused answer; #204 adds the other callers and the
-    tag-completeness check."""
+    for a cut-off or refused answer, and by `write_job_result` for an answer
+    that is not a whole evaluation (#204)."""
+
+
+def _require_whole_evaluation(response_text: str, report: str, tracker_tsv: str,
+                              summary: dict) -> None:
+    """Raise IncompleteResponse unless the response carries both the report and
+    the tracker row (#204). Checked before anything is written, so a failed
+    evaluation leaves no file behind for the re-queued one to collide with.
+
+    Both, not either: without the row the role never reaches the tracker, and
+    without the report the row merges with a score nobody can read and a link
+    to nothing. The prompt's one sanctioned tagless answer, a summary with
+    `"status": "failed"`, is the same failure in the model's own words and is
+    recorded as that. No model output is recorded, the model's own `error`
+    included: it can carry profile text, and the reason lands in the state
+    file, the run log and the cloud's Actions log, so only lengths are quoted."""
+    if report and tracker_tsv:
+        return
+    if str(summary.get("status") or "").strip().lower() == "failed":
+        reason = str(summary.get("error") or "")
+        raise IncompleteResponse("the model reported a failed evaluation "
+                                 f"({len(reason)}-char reason withheld)")
+    missing = " or ".join(f"<{tag}>" for tag, value in
+                          (("report", report), ("tracker_tsv", tracker_tsv)) if not value)
+    raise IncompleteResponse(
+        f"the response carried no {missing} ({len(response_text)} chars)")
 
 
 def write_job_result(
@@ -1280,37 +1306,42 @@ def write_job_result(
     tracker_dir: Path,
     today: str,
 ) -> dict:
-    """Parse XML-tagged response, write report .md and tracker .tsv, return summary dict."""
+    """Parse XML-tagged response, write report .md and tracker .tsv, return
+    summary dict. Raises IncompleteResponse, writing nothing, when the response
+    is not a whole evaluation (`_require_whole_evaluation`)."""
     report_content = extract_tag(response_text, "report")
     tracker_tsv = extract_tag(response_text, "tracker_tsv")
-    summary = parse_json_loose(extract_tag(response_text, "summary")) or {}
+    summary = parse_json_loose(extract_tag(response_text, "summary"))
+    if not isinstance(summary, dict):      # absent, unparseable, or a list/string
+        summary = {}
+    _require_whole_evaluation(response_text, report_content, tracker_tsv, summary)
 
     job_id = job_meta["id"]
     report_num = job_meta.get("report_num") or summary.get("report_num", "000")
     company = summary.get("company") or job_meta.get("company") or "unknown"
     company_slug = _company_slug(company)
-    report_name = f"{report_num}-{company_slug}-{today}.md"
-    report_file = report_name if report_content else None
+    report_file = f"{report_num}-{company_slug}-{today}.md"
 
-    if report_content:
-        (reports_dir / report_name).write_text(report_content, encoding="utf-8")
-    if tracker_tsv:
-        # The Report cell names the file THIS function wrote, not the one the
-        # model guessed at (#162): the prompt gives it only the link's shape.
-        tracker_tsv = sanitize_addition(tracker_tsv, job_meta.get("url", ""),
-                                        job_meta.get("jd_text", ""),
-                                        report_file=report_file or "",
-                                        work_location=_report_location_mark(report_content))
-        # Every caller writes into <career-ops>/batch/tracker-additions, so the
-        # checkout is two up. Atomic, because a merge's sanitizer in another
-        # thread or process reads and rewrites this directory: one that read a
-        # half-written row would "repair" it and replace the whole one.
-        atomic_write_text(tracker_dir / f"{job_id}.tsv",
-                          _addition_text("", tracker_tsv, tracker_dir.parent.parent))
+    # The row is built before anything is written, so a raise while building it
+    # leaves no report behind for the re-queued job to collide with. The Report
+    # cell names the file THIS function writes, not the one the model guessed
+    # at (#162): the prompt gives it only the link's shape. Every caller writes
+    # into <career-ops>/batch/tracker-additions, so the checkout is two up.
+    tracker_tsv = sanitize_addition(tracker_tsv, job_meta.get("url", ""),
+                                    job_meta.get("jd_text", ""),
+                                    report_file=report_file,
+                                    work_location=_report_location_mark(report_content))
+    addition = _addition_text("", tracker_tsv, tracker_dir.parent.parent)
+
+    (reports_dir / report_file).write_text(report_content, encoding="utf-8")
+    # Atomic, because a merge's sanitizer in another thread or process reads and
+    # rewrites this directory: one that read a half-written row would "repair"
+    # it and replace the whole one.
+    atomic_write_text(tracker_dir / f"{job_id}.tsv", addition)
 
     return {
         "report_file": report_file,
-        "tracker_file": f"{job_id}.tsv" if tracker_tsv else None,
+        "tracker_file": f"{job_id}.tsv",
         "summary": summary,
     }
 
