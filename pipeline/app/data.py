@@ -15,8 +15,10 @@ from datetime import date
 from pathlib import Path
 
 from pipeline._batch_common import (
+    _NOTES_URL_RE,
     _REPORT_LINK_RE,
     _addition_lines,
+    _first_url,
     _report_int,
     _report_link,
     ADDITION_COLUMNS,
@@ -627,13 +629,6 @@ def _realign_cells(cells: list[str], columns: list[str]) -> list[str]:
     return cells
 
 
-
-# A bare posting URL inside a tracker row's Notes cell (the link the bridge
-# stores there). Trailing sentence punctuation is trimmed so "...a/b, fits"
-# yields the clean URL.
-_NOTES_URL_RE = re.compile(r"https?://\S+")
-
-
 def extract_url(notes: str) -> str:
     """The posting URL of a Notes cell — the first URL of its newest evaluation
     — or "" if none. Shared by the apply queue (pick a posting to apply to),
@@ -646,13 +641,24 @@ def extract_url(notes: str) -> str:
     (re-Discarding a role the merge had just reopened) and the browser agent
     to a 404. A re-eval clause with no URL of its own — upstream elides notes
     that repeat an existing clause — falls back to the first URL, which is
-    then the same one. The marker is `work_location.REEVAL_MARK_RE`, the one
+    then the same one — except after a `--batch` re-eval, whose notes carry no
+    URL, and after several re-evals, where an intermediate one may have moved
+    the posting: there it is the oldest posting until `_batch_common.
+    _backfill_report_urls` appends the one the row's report names (#190). The
+    fallback is deliberately not "the newest URL in the cell"; that function's
+    docstring says why. The marker is `work_location.REEVAL_MARK_RE`, the one
     spelling of it every Notes reader builds on — `skip_decided` reads the
     newest evaluation through it too."""
     notes = notes or ""
-    start = max((m.end() for m in REEVAL_MARK_RE.finditer(notes)), default=0)
-    m = _NOTES_URL_RE.search(notes, start) or _NOTES_URL_RE.search(notes)
-    return m.group(0).rstrip(".,);]") if m else ""
+    return newest_evaluation_url(notes) or _first_url(notes)
+
+
+def newest_evaluation_url(notes: str) -> str:
+    """The first URL after the last Re-eval marker — anywhere in the cell when
+    there is none — or "": the posting the row's newest evaluation names in
+    Notes itself, before `extract_url` falls back to an older one."""
+    notes = notes or ""
+    return _first_url(notes, max((m.end() for m in REEVAL_MARK_RE.finditer(notes)), default=0))
 
 
 # Sibling of applications.md, written by pipeline/bridge.py — the URLs that came
@@ -1030,20 +1036,37 @@ def set_status_in_text(applications_md_text: str, num: str, new_status: str) -> 
     return _edit_row_cells(applications_md_text, num, status=new_status)
 
 
-def append_note_in_text(applications_md_text: str, num: str, note: str) -> str:
+def append_note_in_text(applications_md_text: str, num: str, note: str, *,
+                        dedupe: bool = True) -> str:
     """Return applications.md text with `note` appended to row `num`'s Notes
-    cell (` — `-joined, the separator this pipeline's own notes use)."""
-    return _edit_row_cells(applications_md_text, num, note=note)
+    cell (` — `-joined, the separator this pipeline's own notes use).
+    `dedupe=False` appends even when `note` is already a clause of the cell —
+    see `_edit_row_cells`."""
+    return _edit_row_cells(applications_md_text, num, note=note, dedupe=dedupe)
 
 
 def _edit_row_cells(applications_md_text: str, num: str, *, status: str | None = None,
-                    note: str | None = None) -> str:
+                    note: str | None = None, dedupe: bool = True) -> str:
     """Rewrite the Status cell and/or append to the Notes cell of row `num`.
 
     Operates at the line level — finds the table row whose first cell (the #
     column) equals `num` and rewrites only the cells asked for, leaving every
     other byte untouched. This avoids re-serializing the whole table (which could
     mangle notes containing special chars) and makes the change a minimal diff.
+    The lines are split on "\\n" alone and rejoined with it, never
+    `splitlines()`: that also breaks a line at U+2028, U+0085, a form feed and
+    the other separators Python honours, so a cell holding one came back as two
+    lines — its row split in two — a "\\r\\n" file came back "\\n" and a trailing
+    blank line was dropped. Split on "\\n", each line keeps its own "\\r" (in the
+    edge cell after the trailing pipe, rejoined as it was), and the file comes
+    back byte for byte except the row edited.
+
+    A note already in the cell as one of its own ` — ` clauses is not appended
+    again (a Push applied twice must not stack its mark); `dedupe=False` is for
+    a caller whose own test of "already there" is narrower than the whole cell:
+    the #190 backfill wants a posting URL after the LAST Re-eval marker, and the
+    same URL earlier in the cell is an older evaluation's, which is exactly the
+    case the dedup would refuse (`_batch_common._backfill_report_urls`).
 
     The row and its cells are located through the table's OWN header, the same
     mapping every read path uses. This is the single MUTATING path, and it was
@@ -1063,7 +1086,7 @@ def _edit_row_cells(applications_md_text: str, num: str, *, status: str | None =
     report_idx = columns.index("report") + 1 if "report" in columns else None
     out_lines = []
     changed = False
-    for line in applications_md_text.splitlines():
+    for line in applications_md_text.split("\n"):
         if not changed and line.lstrip().startswith("|"):
             # Split preserving structure: leading/trailing pipes produce empty
             # edge cells we must keep so indices stay aligned on re-join.
@@ -1085,20 +1108,19 @@ def _edit_row_cells(applications_md_text: str, num: str, *, status: str | None =
                     parts[status_idx_default + shift] = f" {status} "
                 if note and notes_idx_default is not None:
                     idx = notes_idx_default + shift
-                    # The last part is the trailing pipe's "". And a mark already
-                    # in the cell (as its own ` — ` clause) is not appended again:
-                    # a Push applied twice (a cancelled, re-run dispatch) must
-                    # not stack it.
+                    # The last part is what follows the trailing pipe ("", or a
+                    # "\r"). And a mark already in the cell (as its own ` — `
+                    # clause) is not appended again unless `dedupe` is off: a
+                    # Push applied twice (a cancelled, re-run dispatch) must not
+                    # stack it.
                     existing = parts[idx].strip() if idx < len(parts) - 1 else None
-                    if existing is not None and note not in [c.strip() for c in existing.split(" — ")]:
+                    if existing is not None and (
+                            not dedupe or note not in [c.strip() for c in existing.split(" — ")]):
                         parts[idx] = f" {existing} — {note} " if existing else f" {note} "
                 line = "|".join(parts)
                 changed = True
         out_lines.append(line)
-    text = "\n".join(out_lines)
-    if applications_md_text.endswith("\n") and not text.endswith("\n"):
-        text += "\n"
-    return text
+    return "\n".join(out_lines)
 
 
 def load_jobs(career_ops: Path) -> dict:

@@ -9,6 +9,7 @@ import re
 import subprocess
 import threading
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -48,13 +49,36 @@ def parse_date_posted(val: str) -> datetime | None:
     return None
 
 
-def atomic_write_text(path: Path, content: str) -> None:
+def atomic_write_text(path: Path, content: str, newline: str | None = None) -> None:
     """Write content atomically — write to a tmp sibling then os.replace.
-    os.replace is atomic on POSIX and Windows."""
+    os.replace is atomic on POSIX and Windows. `newline` is `open()`'s: the
+    default translates "\\n" to the platform's separator, and `""` writes the
+    text exactly, for a caller that read the file's own separators in.
+
+    The sibling is named per writer (process and thread), because one name
+    shared by every writer of a file is a torn write between two of them: the
+    second truncates the sibling the first is still filling, the first's
+    replace then installs the second's partial text, and the second's fails.
+    `applications.md` has writers in more than one process, from the CLI and
+    inside the UI alike — the Status-cell edits of `data.record_status_changes`
+    (the liveness re-check, handoff's outcome reflection, a merge's reopens),
+    Refresh's pull, a merge's URL backfill — and none of them holds a lock the
+    others take. Two writers still race for the LAST word; what this rules out
+    is a file that is neither's. The `.tmp` suffix is what keeps a sibling
+    caught mid-write out of every reader's pattern (`*.tsv`, `*.md`,
+    `next-roles*.jsonl`, merge-tracker's `.tsv` filter); the leading dot is
+    career-ops' own `writeFileAtomic` convention, and hides it from a listing.
+    Removed when the write fails, since a per-writer name is no longer
+    overwritten by the next one."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(tmp, path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}-{threading.get_native_id()}.tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8", newline=newline)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
 
 
 def read_text(path: Path, default: str = "") -> str:
@@ -548,6 +572,65 @@ def parse_machine_summary(report_text: str) -> dict:
     return {"final_decision": d.group(1).strip()} if d else {}
 
 
+# The `**URL:**` line of a report's header — the posting the evaluation read.
+# Both prompts that write reports put it there (`build_system_prompt` below,
+# and career-ops' batch-prompt.md, which fills it from the queue), and the UI's
+# report pane already falls back to it. Read from the HEADER only, the text
+# between the report's title line and the first `---` rule or `## ` heading
+# after it, because career-ops' reports end
+# with the JD archived verbatim and a JD's own "URL: …" line is the employer's,
+# not the posting's. Tolerant of what a model does to the label — the colon in
+# or out of the bold, the bold dropped, a list bullet — and of the inline
+# `**Score:** 4.1/5 | **URL:** … |` form career-ops' own reader
+# (`reportUrlToken`, tracker-utils.mjs) is written to accept, which is why the
+# label may follow a `|` as well as start a line. The value stops at a `|` as
+# well as at whitespace: it is written into a Notes cell, where a `|` would
+# split the row.
+_REPORT_HEADER_END_RE = re.compile(r"^(?:-{3,}|#{2,}[ \t])", re.M)
+# The title line, and the blank lines around it, that come before the header
+# fields: skipped before the end is looked for, because a model that titles
+# the report `## Evaluation: …` rather than `# …` would otherwise end the
+# header at its own first line.
+_REPORT_TITLE_RE = re.compile(r"\A(?:[ \t]*\n)*(?:[ \t]*#{1,6}[ \t][^\n]*(?:\n|\Z))?")
+_REPORT_URL_RE = re.compile(
+    r"(?:^|\|)[ \t]*(?:[-*+][ \t]+)?\*{0,2}URL[ \t]*\*{0,2}[ \t]*:[ \t]*\*{0,2}[ \t]*([^\s|]+)",
+    re.I | re.M)
+# What a model wraps the value in that no URL ends in: bold or italic closed
+# after it (`**URL: https://x/1**`, `*URL:* https://x/1*`), a code span, an
+# autolink's brackets. And CommonMark's backslash escape of a punctuation
+# character (`https://x/a\_b`), which a model writing markdown puts in front of
+# an underscore. Left in, either one is a URL that 404s — and written after the
+# last Re-eval marker it is the one `extract_url` reads from then on, so the
+# re-check fetches it and Discards a live role.
+_MD_URL_WRAP = "*`<>"
+_MD_ESCAPE_RE = re.compile(r"\\([!-/:-@\[-`{-~])")
+
+
+def report_header_url(report_text: str) -> str:
+    """The posting URL a report's header names, or "" when it names no http(s)
+    URL — no `**URL:**` line, or a value such as `N/A`, a placeholder the model
+    left unfilled or a markdown link. Only the first `**URL:**` line counts, and
+    only above the header's end — the first `---` or `## ` heading after the
+    report's title line, whatever level the title was written at.
+    Unescaped and unwrapped (`_MD_URL_WRAP`), then trimmed of the trailing
+    punctuation `extract_url` trims from a URL it reads out of Notes
+    (`_URL_TRAILING`, `_first_url`) — the wrapper and the punctuation in one
+    strip, since either can sit outside the other (`…/1.**`, `…/1**.`) — so
+    the URL the backfill writes is the one it compares against next pass."""
+    text = report_text or ""
+    # The title is skipped to find where the header ends, not to bound the
+    # search: a URL on the title line itself (`# … | **URL:** … |`) counts.
+    end = _REPORT_HEADER_END_RE.search(text, _REPORT_TITLE_RE.match(text).end())
+    m = _REPORT_URL_RE.search(text, 0, end.start() if end else len(text))
+    if not m:
+        return ""
+    # The backslash in the strip is what the capture keeps of an escaped pipe
+    # (`…/1\|`): it stops at the pipe, and no URL ends in a backslash.
+    token = (_MD_ESCAPE_RE.sub(r"\1", m.group(1)).lstrip(_MD_URL_WRAP)
+             .rstrip(_MD_URL_WRAP + _URL_TRAILING + "\\"))
+    return _first_url(token) if _NOTES_URL_RE.match(token) else ""
+
+
 def max_tracker_num(applications_md: Path, state: dict) -> int:
     max_num = 0
     if applications_md.exists():
@@ -791,7 +874,7 @@ def _addressable_order(header: str, row: str) -> list[int | None] | None:
     None, and the file is left as written. Asked of a file in the batch
     prompt's order too, so the two readings decline the same files. `url` goes
     first among the rest because the chain takes the first URL after the nine
-    as the row's own (`_first_url`), and an `apply link` written before it is
+    as the row's own (`_first_url_cell`), and an `apply link` written before it is
     a careers page, which would route the role to handoff's `other` session.
 
     The rule is the one `_row_parts` states for a headerless row: the chain
@@ -873,7 +956,7 @@ def _addressable_order(header: str, row: str) -> list[int | None] | None:
         return None
     placed = set(order)
     rest = [i for i in range(len(labels)) if i not in placed]
-    if url is not None:             # first after the nine, where `_first_url` looks
+    if url is not None:             # first after the nine, where `_first_url_cell` looks
         rest.remove(url)
         rest.insert(0, url)
     return order + rest
@@ -1278,9 +1361,23 @@ def _normalize_score_cell(tracker_tsv: str) -> str:
 
 
 # Any http(s) URL, and the `req <id>` we write — the two things a notes cell is
-# checked for before something is prepended to it.
+# checked for before something is prepended to it. `app.data` imports the URL
+# pattern rather than keeping a copy: the #190 backfill compares a URL this
+# module read against one `extract_url` read, and two patterns could disagree.
 _NOTES_URL_RE = re.compile(r"https?://\S+")
 _NOTES_REQ_ID_RE = re.compile(r"\breq[\s:#_-]*([A-Za-z0-9_-]+)", re.I)
+
+
+# The sentence punctuation a URL read out of prose loses, so "...a/b, fits"
+# yields the clean URL. One set, for `_first_url` and `report_header_url`.
+_URL_TRAILING = ".,);]"
+
+
+def _first_url(notes: str, start: int = 0) -> str:
+    """The first URL in `notes` from `start`, or "" — how `extract_url` and
+    `report_header_url` both read one, trimmed of `_URL_TRAILING`."""
+    m = _NOTES_URL_RE.search(notes, start)
+    return m.group(0).rstrip(_URL_TRAILING) if m else ""
 
 
 def _prepend_to_notes(tracker_tsv: str, text: str, already_present) -> str:
@@ -2023,7 +2120,7 @@ def _trailing_url(tracker_tsv: str) -> str:
     notes injector uses to ask "already present", or a `HTTPS://` cell would be
     detected here, prepended, and not recognised on the next pass: the chain
     grew a URL per merge."""
-    return _first_url((_row_parts(tracker_tsv) or [])[_TRACKER_TSV_COLUMNS:])
+    return _first_url_cell((_row_parts(tracker_tsv) or [])[_TRACKER_TSV_COLUMNS:])
 
 
 def _carried_url(header: str, carried: list[str]) -> str:
@@ -2039,10 +2136,10 @@ def _carried_url(header: str, carried: list[str]) -> str:
             i = url - _TRACKER_TSV_COLUMNS
             cell = carried[i].strip() if 0 <= i < len(carried) else ""
             return cell if _NOTES_URL_RE.match(cell) else ""
-    return _first_url(carried)
+    return _first_url_cell(carried)
 
 
-def _first_url(cells: list[str]) -> str:
+def _first_url_cell(cells: list[str]) -> str:
     """The first of `cells` that is a URL, on `_trailing_url`'s terms — for
     the cells a headed row carries past the chain's nine (`_chain_cells`),
     which `_addressable_order` has put `url` first among."""
@@ -2147,7 +2244,9 @@ def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
     run end to end: `batch-runner.sh` calls `node merge-tracker.mjs` itself as its
     last step, with no Python in the process tree, so those rows are merged before
     this can see them. Recovering those means going after `tracker-additions/
-    merged/` once the runner has finished; see #156.
+    merged/` once the runner has finished; see #156. The rows it lands arrive
+    with no URL in Notes, which `_backfill_report_urls` reads back out of each
+    row's report (#190).
 
     Recovery of what a foreign row is missing prefers `batch-input.tsv` keyed on
     the addition's filename — the URL the pipeline queued, which is what handoff
@@ -2329,8 +2428,13 @@ def run_merge_tracker(career_ops: Path) -> bool:
         # Recovery first, so a restored row is sanitized and snapshotted with
         # the rest; sanitizing before the snapshot, since it can change the role
         # cell (a pipe suffix), which is half the identity the loss guard
-        # matches on.
+        # matches on. The URL backfill beside recovery, before node: both
+        # repair what a merge we did not run left in place, and here it runs
+        # whatever this merge's own outcome turns out to be. After node would
+        # add only this merge's own rows, and the sanitizer has already put
+        # their URL in Notes.
         _recover_refused_additions(career_ops, tracker_dir)
+        _backfill_report_urls(career_ops)
         _sanitize_pending_additions(career_ops, tracker_dir)
         before = _pending_additions(tracker_dir)
         queued = queued_additions(tracker_dir)
@@ -2767,6 +2871,206 @@ def _recover_refused_additions(career_ops: Path, tracker_dir: Path) -> None:
     if restored:
         print(f"[batch] recovered {restored} evaluation(s) a previous merge refused "
               "for an unreadable score — re-queued with the score repaired")
+
+
+# What the backfill catches rather than let stop the merge it runs ahead of:
+# OSError from a read, a listing or the write, ValueError for a file that is not
+# UTF-8 (UnicodeDecodeError), ImportError for `app.data`, imported lazily.
+_BACKFILL_ERRORS = (OSError, ValueError, ImportError)
+
+
+def _backfill_report_urls(career_ops: Path) -> None:
+    """Write into Notes the posting URL a tracker row's own report names, on a
+    row whose Notes do not name that posting for its newest evaluation (#190).
+
+    The other half of what `batch-runner.sh`'s own merge leaves behind —
+    recovery (above) goes after the additions it refused, this after the ones it
+    LANDED. The batch worker carries the posting URL in a field of its own (the
+    labelled `url` column since career-ops#3706, the optional trailing tenth
+    cell before it) and never in Notes, and merge-tracker stores that field only
+    in a tracker with a URL column, which the tracker `ensure_applications_md`
+    seeds deliberately does not have. So it warns once and drops it, and the row
+    lands with nothing for `extract_url` to find: no site session for the
+    handoff (`board_of`), nothing for the liveness re-check to fetch, no link in
+    the digest or the per-role prompt, and no Easy Apply tag. A merge we run
+    never lands that row, because the sanitizer has put the URL in Notes first.
+
+    **The report, because the row already names it.** Both prompts that write a
+    report put the posting in its header (`report_header_url`), and the Report
+    cell links the evaluation the row holds now: merge-tracker writes the link
+    through on every tier that applies an addition. So the row itself says
+    where its URL is. Resolved as every other report reader resolves a link
+    (`resolve_report`: the link, else its number, `NNN-RESERVED.md` locks
+    skipped), and taken only when it is an http(s) URL.
+
+    **Which rows: the newest evaluation names no posting.** merge-tracker's
+    update tier keeps the old Notes first and appends `Re-eval <date> (a→b):
+    <the addition's notes>`, and `extract_url` reads the first URL after the
+    last marker, else the first URL in the cell. A `--batch` re-eval carries no
+    URL in its notes, so on a row whose earlier evaluation had one, that
+    fallback is the OLD posting while the Report cell links the new report —
+    the re-check fetches a dead posting and the agent is sent to it. A row is
+    therefore read when no URL follows its last marker (or it has none at all)
+    — a model's own URL there stands — and written when its report names a
+    posting other than the one `extract_url` returns; the URL is appended at
+    the end of Notes, after the last clause, which is where `extract_url` then
+    finds it. Appended even when the same URL is already in the cell: there it
+    is an OLDER evaluation's — a second `--batch` re-eval of the posting the
+    first one was given — and the row editor's clause dedup, refusing it, left
+    `extract_url` on the first posting for good while every merge set out to
+    fix it again (`dedupe=False`). `extract_url`'s fallback is deliberately not
+    widened to "the newest URL in the cell" instead: that would change what
+    every consumer reads from every multi-re-eval row, including rows with no
+    report to check it against, to fix the rows this already repairs.
+
+    **A written row reads back, or is not written.** Each edit is checked with
+    the parser every reader uses (`data_rows`): a row is written only if its
+    newest evaluation then names the URL, which is also what keeps it out of
+    the next pass until its next re-eval — so a pass after a written one
+    changes nothing. What fails the check is a cell holding a line separator
+    `data_rows`' `splitlines()` honours (U+2028, a form feed), where the reader
+    and the row editor, which splits on "\\n" alone, see different lines; those
+    rows are named and left as they are.
+
+    **What it cannot reach:** a row with no report — a dealbreaker SKIP, whose
+    Report cell is `-` — has nothing to read and stays without a URL. And a row
+    is written only where the cell read is the cell the row editor writes: its
+    width matches the header's (an injected extra cell moves Notes to where the
+    editor's Report anchor finds them, not where the header does), and no other
+    row shares its number (the editor writes the first row that has it).
+
+    **Written into the tracker the merge runs on, never queued for Push.** The
+    rows this exists for are local: `--batch` runs only here, the cloud tracker
+    has never seen them, and Refresh keeps a local-only row with every cell it
+    has (`data.reconcile_trackers`), so the URL survives. Every merge runs it,
+    the daily's included, so a cloud row is repaired in the cloud and reaches a
+    local copy by Refresh. The override channel is the wrong carrier besides —
+    every value it holds is a STATUS that Push writes into the cloud row, it is
+    keyed by the row number a pending drag of that row already occupies, and
+    the cloud applies it by number alone (#254), where a local-only row's
+    number names no row or someone else's. Written through the row editor every
+    local write uses (`data.append_note_in_text`), byte for byte apart from the
+    rows it edits.
+
+    **Optimistic, because the lock that matters is not ours.** The caller's
+    `_merge_lock` serializes our merges only; career-ops' writers —
+    `batch-runner.sh`'s own merge-tracker among them — take career-ops' tracker
+    lock, and that is not mirrored here: it is a directory lock with owner
+    metadata, stale recovery and a token-checked release (`acquireTrackerLock`,
+    tracker-utils.mjs), and a lock protocol copied by hand is the drift this
+    repo keeps paying for. So the tracker is read again immediately before it
+    is replaced, and one that changed since it was parsed is left alone this
+    pass, with a line saying so: nothing is lost by waiting, and the next merge
+    retries. That narrows the window to the replace itself; it does not close it.
+
+    **Never what stops the merge.** It runs before node on every merge, so a
+    failure here — a report link too long for the filesystem (`is_file()`
+    raises ENAMETOOLONG on Python 3.12), a tracker that cannot be read or is
+    not UTF-8, the lazy import — is one `[batch]` line, and the merge goes
+    ahead. (A tracker that is not UTF-8 then stops it at `_liveness_closed_rows`,
+    as it did before this ran.) A report that cannot be read skips its own row,
+    not the pass.
+
+    **Cost:** one parse of the tracker per pass and one report read per row
+    that lacks a usable URL; after the first pass, only the rows it could not
+    fix, and a dead link among those costs `resolve_report`'s listing of
+    `reports/` as well. A pass that writes walks the tracker once per row it
+    edits, through the row editor, and parses the result once to check it:
+    once per row per `--batch` evaluation. Nothing records that a row was
+    tried, so a row it cannot fix is read again on every merge, and one whose
+    report cannot be read or whose edit would not read back prints its line
+    every time — deliberately: a repeated line on a row someone should look at,
+    rather than a state file the cloud would have to cache."""
+    try:
+        _write_report_urls(career_ops, career_ops / "data" / "applications.md")
+    except _BACKFILL_ERRORS as exc:
+        print(f"[batch] skipped writing posting URLs from reports into the tracker "
+              f"({type(exc).__name__}: {exc}) — merging without them")
+
+
+def _write_report_urls(career_ops: Path, apps: Path) -> None:
+    """`_backfill_report_urls`' body; every exception it lets through is the
+    caller's to log."""
+    from pipeline.app.data import (     # lazy: app.data imports this module
+        append_note_in_text, extract_url, newest_evaluation_url,
+    )
+    # Bytes, decoded here: `read_text`'s universal newlines would hand the row
+    # editor a "\r\n" tracker as "\n", and the bytes are what the tracker is
+    # compared against before it is replaced.
+    raw = apps.read_bytes()
+    text = raw.decode("utf-8")
+    urls: dict[str, str] = {}
+    unread: list[str] = []
+    error: Exception | None = None
+    rows, nums = _url_rows(text)
+    for row in rows:
+        if not row.get("num") or nums[row["num"]] != 1 or newest_evaluation_url(row["notes"]):
+            continue
+        try:
+            num_text, report_path = _report_link(row["report"])
+            report = resolve_report(career_ops, report_path, num_text=num_text,
+                                    company=row.get("company", ""))
+            url = report_header_url(report.read_text(encoding="utf-8")) if report else ""
+        except (OSError, ValueError) as exc:
+            unread.append(row["num"])
+            error = error or exc
+            continue
+        if url and url != extract_url(row["notes"]):
+            urls[row["num"]] = url
+    if unread:
+        print(f"[batch] could not read the report of {len(unread)} tracker row(s) for a "
+              f"posting URL (#{', #'.join(unread)}; {type(error).__name__}: {error}) — "
+              "left as they are")
+    if not urls:
+        return
+
+    def edited(which) -> str:
+        out = text
+        for num in which:
+            out = append_note_in_text(out, num, urls[num], dedupe=False)
+        return out
+
+    new = edited(urls)
+    landed = {row["num"]: newest_evaluation_url(row["notes"]) for row in _url_rows(new)[0]}
+    unseen = [num for num in urls if landed.get(num) != urls[num]]
+    if unseen:
+        print(f"[batch] left {len(unseen)} tracker row(s) without the posting URL its report "
+              f"names (#{', #'.join(unseen)}): written into Notes, it would not read back as "
+              "the row's newest URL — the row is one the tracker's readers split or join "
+              "differently from the row editor (a line separator inside a cell, a row "
+              "missing its closing `|`, …)")
+        new = edited(num for num in urls if num not in unseen)
+    written = len(urls) - len(unseen)
+    if not written:
+        return
+    if apps.read_bytes() != raw:
+        print("[batch] applications.md changed while posting URLs were being read from reports "
+              "— not written this merge; the next one retries")
+        return
+    try:
+        atomic_write_text(apps, new, newline="")
+    except OSError as exc:
+        print(f"[batch] could not write posting URLs into applications.md ({exc}) — "
+              "the next merge retries")
+        return
+    print(f"[batch] wrote the posting URL from its report into the Notes of {written} "
+          "tracker row(s) whose newest evaluation named none — merge-tracker drops an "
+          "addition's url field on a tracker with no URL column")
+
+
+def _url_rows(text: str) -> tuple[list[dict], Counter]:
+    """(every data row of `text` as wide as its header, as {column: cell}; how
+    many data rows carry each number) — no rows when the layout has no Notes or
+    Report column."""
+    rows, nums = [], Counter()
+    for columns, cells in data_rows(text):
+        if "notes" not in columns or "report" not in columns:
+            return [], nums
+        row = dict(zip(columns, cells))
+        nums[row.get("num", "")] += 1
+        if len(cells) == len(columns):
+            rows.append(row)
+    return rows, nums
 
 
 def _warn_on_lost_additions(before: list[dict], queued: set[str], pending: set[str],

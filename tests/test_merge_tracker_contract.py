@@ -52,12 +52,12 @@ from types import SimpleNamespace
 import pytest
 
 from pipeline._batch_common import (
-    ADDITION_COLUMNS, ADDITION_LABEL_LINE, ADDITION_LABELS, _REFUSES_HEADERLESS_MARKER,
-    _REQUIRED_IDXS, _liveness_closed_rows, _pending_additions,
+    ADDITION_COLUMNS, ADDITION_LABEL_LINE, ADDITION_LABELS, APPLICATIONS_HEADER,
+    _REFUSES_HEADERLESS_MARKER, _REQUIRED_IDXS, _liveness_closed_rows, _pending_additions,
     _reopen_reposted, _sanitize_pending_additions, _warn_on_lost_additions,
-    DECISION_SKIP_MARK, closed_by_recheck, jd_cache_path, labelled_addition,
-    liveness_closed_mark, queued_additions, reads_labelled_additions, run_merge_tracker,
-    sanitize_addition,
+    DECISION_SKIP_MARK, by_hand_mark, closed_by_recheck, jd_cache_path, labelled_addition,
+    liveness_closed_mark, queued_additions, reads_labelled_additions, report_header_url,
+    run_merge_tracker, sanitize_addition,
 )
 from pipeline.tracker_layout import career_ops_dir, data_rows
 from pipeline.work_location import work_location_from_notes
@@ -188,13 +188,14 @@ def _merge_env(career_ops, state):
             "CAREER_OPS_BATCH_STATE": str(state)}
 
 
-def _node_merge(career_ops, state):
+def _node_merge(career_ops, state, *flags):
     """One run of the real merge-tracker over a `_stage`d layout, which it
     reads and writes through its own env overrides — the checkout is only its
-    cwd. Returns the completed process. Exit 0 on both sides of #5862: a
-    refusal is a skip there, never a failure."""
+    cwd — with `flags` on its command line. Returns the completed process.
+    Exit 0 on both sides of #5862: a refusal is a skip there, never a
+    failure."""
     r = subprocess.run(
-        ["node", "merge-tracker.mjs"], cwd=str(career_ops_dir()),
+        ["node", "merge-tracker.mjs", *flags], cwd=str(career_ops_dir()),
         capture_output=True, text=True, timeout=120, env=_merge_env(career_ops, state))
     assert r.returncode == 0, r.stderr
     return r
@@ -894,6 +895,194 @@ def test_the_label_line_is_the_one_the_prompt_prescribes():
              if line.strip().startswith("num\\tdate\\t")]
     assert shown, "batch-prompt.md no longer shows a `num\\tdate\\t…` label line"
     assert shown[0].replace("\\t", "\t") == ADDITION_LABEL_LINE
+
+
+def test_the_batch_prompts_report_header_carries_the_url():
+    """`report_header_url` reads the line career-ops' batch prompt tells the
+    worker to put in every report's header — the line the #190 backfill takes a
+    `--batch` row's URL from. Held to the prompt here, where the checkout is: a
+    header that stops carrying it, or moves it below the first rule, fails this
+    rather than leaving the backfill reading a line no report has."""
+    prompt = (career_ops_dir() / "batch" / "batch-prompt.md").read_text(encoding="utf-8")
+    header = re.search(r"Report header:\s*```markdown\n(.*?)```", prompt, re.S)
+    assert header, "batch-prompt.md no longer shows a `Report header:` block"
+    assert report_header_url(header.group(1).replace("{{URL}}", "https://x/j/7")) == \
+        "https://x/j/7"
+
+
+# ── A `--batch` row lands without its URL (#190) ─────────────────────────────
+#
+# Why, and the repair, are on `_backfill_report_urls`. Both addition shapes go
+# through one runner merge: the headed one as the pin's batch-runner.sh merges
+# it, and the headerless one under `--allow-headerless`, the flag a checkout
+# since #6062 needs to merge that shape at all and the default before it — the
+# headed file is read by name either way. (At a checkout that refuses it, a
+# headerless row is kept, and our own merge lands it with its URL:
+# `TestRecoveryAfterTheRunnersOwnMerge`.) Each report's header is the batch
+# prompt's own `**URL:** {{URL}}` line, filled as the runner fills it.
+HEADERLESS_WITH_URL = ("12\t2026-09-01\tGlobex\tSRE\tEvaluated\t4.1/5\tnull\t"
+                       "[230](reports/230-globex.md)\tgood fit\thttps://x/j/8\n")
+
+
+def _batch_report(career_ops, name, url):
+    """A report as career-ops' batch worker writes its header, under reports/."""
+    (career_ops / "reports").mkdir(exist_ok=True)
+    (career_ops / "reports" / name).write_text(
+        "# Evaluation: X — Y\n\n**Date:** 2026-09-01\n**Score:** 4.7/5\n"
+        f"**URL:** {url}\n**Batch ID:** 7\n\nVerdict.\n\n---\n\n## A) Role Summary\n",
+        encoding="utf-8")
+
+
+def _runner_then_two_merges(tmp_path, tracker_text, additions, reports):
+    """The runner's own merge, then `run_merge_tracker` twice — as the wrappers'
+    `merge_additions` would run it after this `--batch` and after the next.
+    `reports` is {filename: url}."""
+    career_ops, additions_dir, state = _stage(tmp_path, tracker_text, additions)
+    for name, url in reports.items():
+        _batch_report(career_ops, name, url)
+    runner = _node_merge(career_ops, state,
+                         *(["--allow-headerless"] if REFUSES_HEADERLESS else []))
+    after_runner = _tracker_after(career_ops)
+    ok, printed = _run_merge_tracker_for_real(career_ops, state)
+    after_backfill = _tracker_after(career_ops)
+    ok_again, printed_again = _run_merge_tracker_for_real(career_ops, state)
+    return SimpleNamespace(runner=runner, after_runner=after_runner, ok=ok, printed=printed,
+                           after_backfill=after_backfill, ok_again=ok_again,
+                           printed_again=printed_again, after_again=_tracker_after(career_ops),
+                           additions=additions_dir)
+
+
+@pytest.fixture(scope="module")
+def batch_urls(tmp_path_factory):
+    return _runner_then_two_merges(
+        tmp_path_factory.mktemp("batch-urls"), APPLICATIONS_HEADER,
+        {"7.tsv": _headed_addition("4.7/5"), "8.tsv": HEADERLESS_WITH_URL},
+        {"229-acme.md": "https://x/j/7", "230-globex.md": "https://x/j/8"})
+
+
+class TestBatchRowsGetTheirUrl:
+    def test_the_real_script_drops_the_url(self, batch_urls):
+        """The premise, off the real script: both rows land, neither with its
+        URL in Notes. If upstream starts folding the field into Notes, this
+        failing is the notification that the backfill has nothing left to do."""
+        b = batch_urls
+        assert sorted(f.name for f in (b.additions / "merged").glob("*.tsv")) == ["7.tsv", "8.tsv"]
+        assert "https://x/j/" not in b.after_runner
+        assert (tracker_row(b.after_runner, "11")["role"],
+                tracker_row(b.after_runner, "12")["role"]) == ("Platform Engineer", "SRE")
+        assert "this tracker has no URL column" in b.runner.stderr
+
+    def test_the_next_merge_writes_each_reports_url_into_its_rows_notes(self, batch_urls):
+        from pipeline.app import data
+        b = batch_urls
+        assert data.extract_url(tracker_row(b.after_backfill, "11")["notes"]) == "https://x/j/7"
+        assert data.extract_url(tracker_row(b.after_backfill, "12")["notes"]) == "https://x/j/8"
+        assert "into the Notes of 2 tracker row(s)" in b.printed
+        assert b.ok is True, b.printed
+
+    def test_a_second_merge_leaves_the_tracker_byte_identical(self, batch_urls):
+        b = batch_urls
+        assert b.after_again == b.after_backfill
+        assert "into the Notes of" not in b.printed_again
+        assert b.ok_again is True, b.printed_again
+
+
+@pytest.fixture(scope="module")
+def batch_reeval(tmp_path_factory):
+    """A `--batch` re-evaluation the update tier folds onto an older row: the
+    `BASE`/`VARIANT` fuzzy pair, the old row's posting in its Notes and its
+    report not on disk (as on a copy whose reports came down one run at a time),
+    so the URL guards have nothing to compare and the fuzzy tier applies it."""
+    addition = (f"{ADDITION_LABEL_LINE}\n" + "\t".join([
+        "11", "2026-09-01", "UT Southwestern Medical Center", VARIANT, "Evaluated", "4.7/5",
+        "null", "[229](reports/229-ut.md)", "APPLY strong", "https://indeed.com/viewjob?jk=new",
+    ]) + "\n")
+    return _runner_then_two_merges(
+        tmp_path_factory.mktemp("batch-reeval"), _tracker(BASE, 200), {"7.tsv": addition},
+        {"229-ut.md": "https://indeed.com/viewjob?jk=new"})
+
+
+class TestBatchReEvalPointsAtTheNewPosting:
+    def test_the_update_tier_leaves_extract_url_on_the_old_posting(self, batch_reeval):
+        """The premise: merge-tracker keeps the old Notes first, appends the
+        re-eval's (no URL in a `--batch` one) and links the new report, so
+        `extract_url` falls back to the posting the OLD evaluation read."""
+        from pipeline.app import data
+        row = tracker_row(batch_reeval.after_runner, "10")
+        assert row["report_num"] == "229" and "Re-eval 2026-09-01" in row["notes"]
+        assert data.newest_evaluation_url(row["notes"]) == ""
+        assert data.extract_url(row["notes"]) == "https://indeed.com/viewjob?jk=old"
+
+    def test_the_next_merge_appends_the_new_reports_url_after_the_marker(self, batch_reeval):
+        from pipeline.app import data
+        before = tracker_row(batch_reeval.after_runner, "10")["notes"]
+        after = tracker_row(batch_reeval.after_backfill, "10")["notes"]
+        assert after == f"{before} — https://indeed.com/viewjob?jk=new"
+        assert data.extract_url(after) == "https://indeed.com/viewjob?jk=new"
+        assert batch_reeval.ok is True, batch_reeval.printed
+
+    def test_a_second_merge_leaves_the_tracker_byte_identical(self, batch_reeval):
+        assert batch_reeval.after_again == batch_reeval.after_backfill
+        assert "into the Notes of" not in batch_reeval.printed_again
+
+
+@pytest.fixture(scope="module")
+def batch_second_reeval(tmp_path_factory):
+    """A SECOND `--batch` re-evaluation of the posting the first was given. The
+    tracker is the one the first left behind: its re-eval clause, the report's
+    URL the backfill wrote after it, and then two ` — ` marks — the re-check
+    Closed the posting and a person set the row back by hand — which make that
+    URL a clause of its own. The second re-eval lands through the update tier
+    (company and title exact, both reports naming the same posting) with, once
+    again, no URL in its notes."""
+    new = "https://indeed.com/viewjob?jk=new"
+    notes = ("https://indeed.com/viewjob?jk=old — APPLY. Re-eval 2026-09-01 (4→4.7): "
+             f"APPLY strong — {new} — {liveness_closed_mark('2026-09-15', 'HTTP 404')} — "
+             f"{by_hand_mark('2026-09-16', 'Evaluated')}")
+    tracker = HEADER + (f"| 10 | 2026-09-01 | UT Southwestern Medical Center | {BASE} | 4.7/5 "
+                        f"| Evaluated | ❌ | [229](../reports/229-ut.md) | {notes} |\n")
+    addition = (f"{ADDITION_LABEL_LINE}\n" + "\t".join([
+        "11", "2026-10-01", "UT Southwestern Medical Center", BASE, "Evaluated", "4.8/5",
+        "null", "[230](reports/230-ut.md)", "APPLY still strong", new,
+    ]) + "\n")
+    return _runner_then_two_merges(
+        tmp_path_factory.mktemp("batch-second-reeval"), tracker, {"7.tsv": addition},
+        {"229-ut.md": new, "230-ut.md": new})
+
+
+class TestASecondBatchReEvalPointsAtThePosting:
+    NEW = "https://indeed.com/viewjob?jk=new"
+
+    def test_the_update_tier_leaves_the_url_a_clause_before_the_last_marker(
+            self, batch_second_reeval):
+        """The premise, off the real script: the newest marker has no URL after
+        it, `extract_url` falls back to the FIRST posting, and the URL that
+        would fix it is already a ` — ` clause of the cell — which the row
+        editor's dedup refuses, so a backfill that went through it left this row
+        on the old posting on every merge."""
+        from pipeline.app import data
+        b = batch_second_reeval
+        row = tracker_row(b.after_runner, "10")
+        assert row["report_num"] == "230" and "Re-eval 2026-10-01" in row["notes"]
+        assert data.newest_evaluation_url(row["notes"]) == ""
+        assert data.extract_url(row["notes"]) == "https://indeed.com/viewjob?jk=old"
+        assert data.append_note_in_text(b.after_runner, "10", self.NEW) == b.after_runner
+
+    def test_the_next_merge_writes_it_after_the_marker_again(self, batch_second_reeval):
+        from pipeline.app import data
+        b = batch_second_reeval
+        before = tracker_row(b.after_runner, "10")["notes"]
+        after = tracker_row(b.after_backfill, "10")["notes"]
+        assert after == f"{before} — {self.NEW}"
+        assert data.extract_url(after) == self.NEW
+        assert "into the Notes of 1 tracker row(s)" in b.printed
+        assert b.ok is True, b.printed
+
+    def test_a_second_merge_leaves_the_tracker_byte_identical(self, batch_second_reeval):
+        b = batch_second_reeval
+        assert b.after_again == b.after_backfill
+        assert "into the Notes of" not in b.printed_again
+        assert b.ok_again is True, b.printed_again
 
 
 class TestRecheckDiscardIsReopenedOnRepost:
