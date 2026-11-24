@@ -71,6 +71,8 @@ from pathlib import Path
 
 from pipeline import run_artifact
 from pipeline._batch_common import (
+    APPLY_MIN_SCORE,
+    SCORE_BANDS,
     LIVENESS_CLOSED_RE,
     RESERVED_REPORT_SUFFIX,
     _report_int,
@@ -99,7 +101,7 @@ SECRET_VARS = (
 # `${{ vars.NAME || '<default>' }}`. The default lives HERE and the workflow
 # test reads it from here, so the two cannot disagree.
 SETTING_VARS = {
-    "DIGEST_MIN_SCORE": "4.0",
+    "DIGEST_MIN_SCORE": f"{APPLY_MIN_SCORE}",   # the prompt's "worth applying" line
     "DIGEST_LIMIT": "10",
     "DIGEST_ALWAYS": "true",
     "DIGEST_ATTACH_REPORTS": "true",
@@ -527,10 +529,10 @@ def build_digest(root: Path, manifest: Path, *, min_score: float, limit: int,
 
 def embed_color(score: float) -> int:
     """A colour per score band: the strongest roles stand out in the channel."""
-    if score >= 4.5:
-        return 0x2ECC71     # green
-    if score >= 4.0:
-        return 0x3498DB     # blue
+    if score >= SCORE_BANDS[0][0]:
+        return 0x2ECC71     # green: the top band
+    if score >= APPLY_MIN_SCORE:
+        return 0x3498DB     # blue: worth applying
     return 0x95A5A6         # grey
 
 

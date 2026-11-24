@@ -854,12 +854,15 @@ class TestHiredStatus:
         assert data.canonical_status(alias) == expected
 
     @staticmethod
-    def _js_list(name):
+    def _js_line(name):
         js = (Path(__file__).resolve().parent.parent
               / "pipeline" / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        line = next(l for l in js.splitlines()
+        return next(l for l in js.splitlines()
                     if l.startswith(f"const {name}") or l.startswith(f"let {name}"))
-        return re.findall(r'"([^"]+)"', line)
+
+    @classmethod
+    def _js_list(cls, name):
+        return re.findall(r'"([^"]+)"', cls._js_line(name))
 
     def test_js_seed_matches_the_python_fallback(self):
         """app.js's STATES is a first-paint SEED — /api/capabilities replaces it
@@ -867,6 +870,15 @@ class TestHiredStatus:
         needs a code change. The seed must still match the Python fallback, or
         the pre-boot board and the server disagree about what is draggable."""
         assert self._js_list("STATES") == data.CANONICAL_STATES
+
+    def test_js_score_lines_match_the_evaluator_bands(self):
+        """The board's score pill colours follow the evaluator's two lines (#208).
+        app.js seeds them for first paint and /api/capabilities replaces them,
+        so the seed must equal the Python constants or the pre-boot board
+        colours a 3.9 as "worth applying"."""
+        from pipeline._batch_common import APPLY_MIN_SCORE, SKIP_BELOW
+        seed = dict(re.findall(r"(\w+):\s*([0-9.]+)", self._js_line("SCORE_LINES")))
+        assert {k: float(v) for k, v in seed.items()} == {"apply": APPLY_MIN_SCORE, "skip": SKIP_BELOW}
 
     def test_states_are_read_from_career_ops(self, tmp_path, monkeypatch):
         """The vocabulary comes from the file career-ops ships, not a copy."""

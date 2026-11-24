@@ -2346,6 +2346,63 @@ def profile_master_for_prompt(path) -> str:
     return redact_profile_master(read_text(path))
 
 
+# ── What a score means (#208) ─────────────────────────────────────────────────
+# career-ops' own bands from 3.5 up (`modes/_shared.md` → "Score interpretation"),
+# with the evidence that puts a role in each, worded for any field. Below 3.5 it
+# departs on purpose: career-ops says "recommend against", here 3.0-3.4 is still
+# Consider and Skip starts at 3.0, the line the tracker's NO APLICAR rule already
+# used (a maintainer decision, 2026-11-22). The two named floors
+# are the lines the rest of the pipeline acts on; defaults elsewhere import them
+# rather than restating 4.0 / 3.0. Why the prompt must define the scale at all:
+# CLAUDE.md, "What a score means is stated in the prompt".
+APPLY_MIN_SCORE = 4.0
+SKIP_BELOW = 3.0
+SCORE_BANDS = (
+    (4.5, "Strong match: apply now",
+     "One of the candidate's target roles, at a level they can be hired at. Meets "
+     "every stated requirement, with evidence in the profile. Nothing in comp, "
+     "culture or red flags argues against it."),
+    (APPLY_MIN_SCORE, "Good match: worth applying",
+     "A target role or a close neighbour of one. Meets the stated requirements, or "
+     "misses one the candidate can credibly cover with related experience."),
+    (3.5, "Decent, not ideal: apply only with a specific reason",
+     "Adjacent to the target roles; or misses two or more stated requirements; or "
+     "posted pay below the candidate's target; or a real red flag."),
+    (SKIP_BELOW, "Long shot",
+     "The candidate could apply but would be a weak applicant, or the role is only "
+     "partly what they are looking for."),
+    (2.0, "Poor fit",
+     "The wrong function or level for this candidate, or several stated requirements "
+     "missing."),
+    (1.0, "No fit",
+     "An unrelated field, or a requirement the candidate cannot meet at all (a "
+     "licence, credential or clearance they do not hold)."),
+)
+
+
+# `- **Remote roles:** Score 5.0 (ideal)` and its siblings: the location-scoring
+# lines setup-profile.mjs wrote into every _profile.md before #208. They assign a
+# Global score by location, which the bands and the hard-stop rule replace, and
+# _profile.md is never regenerated, so they are dropped where the file is read.
+# Matched on the generator's exact shape only; prose the user wrote is kept.
+_LOCATION_SCORE_LINE_RE = re.compile(r"^\s*-\s*\*\*[^*\n]+:\*\*\s*Score\s+\d(?:\.\d)?\s*\(.*\)\s*$")
+
+
+def _drop_location_scores(profile_md: str) -> str:
+    return "\n".join(ln for ln in profile_md.splitlines()
+                     if not _LOCATION_SCORE_LINE_RE.match(ln))
+
+
+def _score_band_table() -> str:
+    rows = []
+    top = 5.0
+    for floor, meaning, evidence in SCORE_BANDS:
+        rows.append(f"| {floor:.1f}-{top:.1f} | {meaning} | {evidence} |")
+        top = round(floor - 0.1, 1)
+    return ("| Global | Meaning | What puts a role there |\n|---|---|---|\n"
+            + "\n".join(rows))
+
+
 def _target_roles_block(target_roles) -> str:
     """The candidate's own role families (handoff.target_roles), for archetype
     detection and North Star; they replaced career-ops' six AI-engineering
@@ -2383,7 +2440,7 @@ def build_system_prompt(cv: str, profile_yml: str, profile_md: str = "", article
     else:
         extra = ""
         if profile_md:
-            extra += f"\n### User Customizations (_profile.md)\n{profile_md}\n"
+            extra += f"\n### User Customizations (_profile.md)\n{_drop_location_scores(profile_md)}\n"
         if article_digest:
             extra += f"\n### Proof Points (article-digest.md)\n{article_digest}\n"
         candidate_profile = (
@@ -2400,7 +2457,7 @@ You have no file system access, cannot generate PDFs, and cannot run real-time w
 {candidate_profile}
 ## EVALUATION FRAMEWORK
 
-Work through blocks A-G in order. Rules in _profile.md override system defaults for scoring.
+Work through blocks A-G in order. Rules in _profile.md override system defaults for how each dimension is weighed, but not the score bands, the decision rule or the hard-stop rule below.
 
 **Archetype Detection** - name the candidate's target role this posting is closest to.
 {_target_roles_block(target_roles)}Use that role's name, or a hybrid of two. When none fits, write "Outside target roles (<the role's actual function, in a few words>)" - that is a finding, not a failure, and it is what North Star Alignment scores.
@@ -2420,7 +2477,7 @@ Adapt framing to the detected archetype.
 
 **Block D - Comp & Demand**
 Use training-knowledge salary benchmarks (Glassdoor/Levels.fyi estimates - label as such).
-Score comp 1-5: 5=top quartile, 1=well below market.
+Score comp 1-5: 5=top quartile, 1=well below market. When the posting states no pay, the comp score is an estimate: report it, but it does not move the Global band.
 
 **Block E - Personalization Plan**
 Table of top 5 CV changes + top 5 LinkedIn changes.
@@ -2434,7 +2491,21 @@ Assess: High Confidence | Proceed with Caution | Suspicious.
 
 **Global Score** table: CV Match, North Star Alignment (how close the role is to the candidate's target roles), Comp, Cultural Signals, Red Flags penalty, Global (all X/5).
 
-**Hard stops** - `hard_stops` is what makes the candidate unable to HOLD the role, not what they merely lack. Anything they could learn, be trained on, or argue around is a soft gap. Name every hard stop you find and cap `final_decision` at "Consider" when there is one.
+The Global score is a holistic judgement of how well this candidate fits this role, not a formula, and each band means one thing:
+
+{_score_band_table()}
+
+What counts against a role, for the bands:
+- **Stated requirements** are the qualifications the posting says a candidate must have ("required", "minimum", "must"). Falling a few months short of a years-of-experience minimum, with closely related experience, is one requirement the candidate can credibly cover.
+- **Duties are not requirements.** What the job does - present to groups, run a program, keep records - is what the hire will be trained to do, above all in an entry-level role. A duty the candidate has not done before is not a gap.
+- **Preferred qualifications** ("preferred", "a plus", "nice to have") never on their own hold a role below {APPLY_MIN_SCORE}.
+- **Pay counts only when the posting states it.** An estimate never moves the band.
+
+Judge the role at the level it is posted at: an entry-level role is not marked down because the candidate is early in their career. Use the whole scale. A role that clears a band's bar earns that band without being perfect.
+
+`final_decision` follows the band, unless a hard stop caps it (below): "Apply" at {APPLY_MIN_SCORE} and above, "Consider" from {SKIP_BELOW} to {APPLY_MIN_SCORE - 0.1:.1f}, "Skip" below {SKIP_BELOW}. Use "Research first" only when the band turns on a fact the posting leaves out.
+
+**Hard stops** - `hard_stops` is what makes the candidate unable to HOLD the role, not what they merely lack. Anything they could learn, be trained on, or argue around is a soft gap. Name every hard stop you find and cap `final_decision` at "Consider" when there is one. A location hard stop caps the decision, not the score: being unable to be where the role is says nothing about fit, so record it here and in `work_location`. A requirement the candidate cannot meet (a licence, credential or clearance) lowers the score as well.
 Geography is the one most often missed. A role requiring recurring physical presence - on-site OR hybrid, however few the office days - in a metro the candidate has not said they can work in is a hard stop, whatever the fit. Read the candidate's own stated locations from the profile above. Do not invent flexibility the posting does not state: "may offer remote", "could relocate" and "remote coordination may be possible" are not in the JD. Work that is inherently local - community-based, field, in-home, canvassing, site-based - requires presence even where the posting also uses the word remote.
 
 **Machine Summary** YAML block:
@@ -2519,7 +2590,7 @@ work_location rules: `mode` is what the posting REQUIRES of the person, not what
 
 Tracker TSV rules (one row of 9 tab-separated columns, no header line - the column labels are added when the file is written):
 - Col 1 TRACKER_NUM: use the Tracker Number from the user message
-- Col 5 STATUS: "Evaluada" normally; "NO APLICAR" if score < 3.0
+- Col 5 STATUS: "Evaluada" normally; "NO APLICAR" if score < {SKIP_BELOW}
 - Col 6 SCORE: format X.X/5
 - Col 7 PDF: {_PDF_CELL} (batch mode)
 - Col 8 report link: [REPORT_NUM](reports/REPORT_NUM-company-slug-DATE.md)

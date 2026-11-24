@@ -77,10 +77,15 @@ function populateStatusFilter() {
   }
 }
 
+// The evaluator's two lines (#208): "worth applying" and Skip. A first-paint
+// SEED that /api/capabilities replaces at boot, like STATES; the seed must track
+// _batch_common.APPLY_MIN_SCORE / SKIP_BELOW (test-enforced).
+let SCORE_LINES = { apply: 4.0, skip: 3.0 };
+
 function scoreClass(v) {
   if (v == null) return "score-none";
-  if (v >= 4) return "score-good";
-  if (v >= 3) return "score-mid";
+  if (v >= SCORE_LINES.apply) return "score-good";
+  if (v >= SCORE_LINES.skip) return "score-mid";
   return "score-low";
 }
 
@@ -884,11 +889,15 @@ let currentSkill = null;  // last skill run; used by Run-in-terminal's relaunch.
 async function loadCaps() {
   try {
     CAPS = await (await fetch("/api/capabilities")).json();
+    // Merged, finite numbers only: a partial payload must not blank a line.
+    for (const [k, v] of Object.entries(CAPS.score_lines || {})) {
+      if (Number.isFinite(v)) SCORE_LINES[k] = v;
+    }
     if (Array.isArray(CAPS.states) && CAPS.states.length) {
       STATES = CAPS.states;
       buildStatusOptions();
-      render();
     }
+    render();
   } catch { /* leave defaults; buttons explain the no-capability case */ }
   renderSkillActions();
 }

@@ -450,6 +450,16 @@ def _digest(items, **kw):
     return d
 
 
+def test_embed_colours_follow_the_score_bands():
+    """Green for the top band, blue from the "worth applying" line, grey below:
+    the colour moves with SCORE_BANDS rather than restating 4.5 / 4.0 (#208)."""
+    from pipeline._batch_common import APPLY_MIN_SCORE, SCORE_BANDS
+    top = SCORE_BANDS[0][0]
+    assert dd.embed_color(top) == dd.embed_color(5.0) == 0x2ECC71
+    assert dd.embed_color(round(top - 0.1, 1)) == dd.embed_color(APPLY_MIN_SCORE) == 0x3498DB
+    assert dd.embed_color(round(APPLY_MIN_SCORE - 0.1, 1)) == 0x95A5A6
+
+
 class TestDiscord:
     def test_payload_shape(self):
         calls = []

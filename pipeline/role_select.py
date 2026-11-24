@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from pipeline._batch_common import APPLY_MIN_SCORE
 from pipeline.app import data as _data
 
 # Statuses that mean "evaluated, not yet acted on". Anything else (Applied,
@@ -34,7 +35,7 @@ class ApplyJob:
 def select(
     career_ops: Path,
     *,
-    min_score: float = 4.0,
+    min_score: float = APPLY_MIN_SCORE,
     limit: int = 0,
     applications_md: Path | None = None,
 ) -> list[ApplyJob]:
