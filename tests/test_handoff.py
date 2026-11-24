@@ -1152,10 +1152,10 @@ Languages: Python · Go · SQL
 Cloud & CI/CD: AWS · Docker · GitHub Actions
 
 PROFESSIONAL EXPERIENCE
-Capital One  Aug 2022 – Sep 2023
+Initech  Aug 2022 – Sep 2023
 Software Engineer  Chicago, IL
-• Built Java/Spring APIs powering two launches — BJ's opt-out (1M+ cardholders) and Kohl's (millions); shipped to AWS ECS via CI/CD.
-Bank of America  Apr 2025 – Present
+• Built Java/Spring APIs powering two launches — a loyalty-card opt-out (1M+ cardholders) and a retail card launch (millions); shipped to AWS ECS via CI/CD.
+Globex  Apr 2025 – Present
 Production Support Engineer  Plano, TX
 • Kept mission-critical financial systems at 99.999% uptime on a 24/7 on-call rotation.
 """
