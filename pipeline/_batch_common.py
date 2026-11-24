@@ -275,10 +275,17 @@ def release_process_lock(path: Path) -> None:
     replaced our pid, and we must not delete another process's lock)."""
     pid, _ = read_process_lock(path)
     if pid == os.getpid():
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        # Retried briefly: on Windows a waiter polling the lock holds it open
+        # for a moment, and a delete then fails with a sharing violation —
+        # leaving a fresh lock naming a live pid for the waiter to wait out.
+        for _ in range(10):
+            try:
+                path.unlink(missing_ok=True)
+                return
+            except PermissionError:
+                time.sleep(0.01)
+            except OSError:
+                return
 
 
 def process_lock_active(path: Path, *, max_age: float) -> bool:

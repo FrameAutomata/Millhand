@@ -337,6 +337,21 @@ def _isolate_status_overrides(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_state_sync(monkeypatch, tmp_path):
+    """Redirect Push/Refresh's two .ui-cache paths to tmp, for EVERY test.
+    UI_CACHE is rmtree'd before each artifact download, so a Push or Refresh
+    test reaching it unpatched deletes the developer's real .ui-cache/latest.
+    Three client fixtures used to assign these on pipeline.app.server; when the
+    core moved to pipeline.state_sync those assignments would have gone on
+    succeeding while applying to nothing, and one module was never isolated at
+    all. Autouse, on the module that owns the paths, cannot be forgotten."""
+    from pipeline import state_sync
+    monkeypatch.setattr(state_sync, "UI_CACHE", tmp_path / ".ui-cache" / "latest")
+    monkeypatch.setattr(state_sync, "PUSHED_OVERRIDES_FILE",
+                        tmp_path / ".ui-cache" / "pushed-overrides.json")
+
+
+@pytest.fixture(autouse=True)
 def _isolate_provider_env(monkeypatch):
     """Keep LLM-provider detection hermetic. Several modules (pipeline.filter,
     pipeline.app.server) call load_dotenv() at import time, leaking the

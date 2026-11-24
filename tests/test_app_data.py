@@ -495,8 +495,96 @@ class TestRecordStatusOverride:
         p = tmp_path / "overrides.json"
         data.record_status_override("1", "Applied", p)
         data.record_status_override("2", "Rejected", p)
-        data.clear_status_overrides(["1"], p)
+        data.clear_status_overrides({"1": "Applied"}, p)
         assert json.loads(p.read_text(encoding="utf-8")) == {"2": "Rejected"}
+
+    def test_clear_keeps_a_key_rewritten_since_the_snapshot(self, tmp_path):
+        # A card dragged again while the push was in flight: the cloud got the
+        # old value, so the new one must stay pending for the next push.
+        import json
+        p = tmp_path / "overrides.json"
+        data.record_status_override("1", "Applied", p, company="Acme", role="Engineer")
+        pushed = data.load_status_overrides(p)
+        data.record_status_override("1", "Rejected", p, company="Acme", role="Engineer")
+        data.clear_status_overrides(pushed, p)
+        assert data.override_status(json.loads(p.read_text(encoding="utf-8"))["1"]) == "Rejected"
+
+
+class TestOverrideFileLock:
+    """The override file has writers in more than one process — the UI, a local
+    run's orchestrate subprocess, a Push from outside the UI — and the thread
+    lock serializes only threads, so each read/modify/write also takes a pid
+    lock file beside it."""
+
+    # Takes the lock, signals, then does its own whole-file write after a delay
+    # and releases. A writer that did not wait would read before that write and
+    # lose it.
+    HOLDER = (
+        "import json, sys, time\n"
+        "from pathlib import Path\n"
+        "from pipeline._batch_common import (acquire_process_lock,\n"
+        "                                    atomic_write_text, release_process_lock)\n"
+        "p = Path(sys.argv[1]); lock = p.with_name(p.name + '.lock')\n"
+        "assert acquire_process_lock(lock, max_age=60)\n"
+        "print('held')\n"
+        "time.sleep(0.5)\n"
+        "atomic_write_text(p, json.dumps({'other': 'Applied'}))\n"
+        "release_process_lock(lock)\n"
+    )
+
+    def test_a_write_waits_for_another_process_and_keeps_its_edit(self, tmp_path):
+        import json
+        import subprocess
+        import sys
+        p = tmp_path / "overrides.json"
+        root = Path(__file__).resolve().parent.parent
+        holder = subprocess.Popen([sys.executable, "-u", "-c", self.HOLDER, str(p)],
+                                  cwd=root, stdout=subprocess.PIPE, text=True)
+        try:
+            assert holder.stdout.readline().strip() == "held"
+            data.record_status_override("7", "Applied", p)
+            assert holder.wait(timeout=30) == 0
+        finally:
+            holder.kill()
+            holder.stdout.close()
+        assert json.loads(p.read_text(encoding="utf-8")) == {"other": "Applied", "7": "Applied"}
+        assert not data.override_lock_path(p).exists()
+
+    def test_a_lock_it_cannot_get_is_written_through_with_a_warning(self, tmp_path,
+                                                                    monkeypatch, capsys):
+        """Every caller is best-effort, and the unlocked write is the behaviour
+        before the lock existed; refusing would drop a person's drag."""
+        import json
+        import subprocess
+        import sys
+        import time
+        p = tmp_path / "overrides.json"
+        lock = data.override_lock_path(p)
+        monkeypatch.setattr(data, "_OVERRIDE_LOCK_WAIT", 0.1)
+        live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            lock.write_text(f"{live.pid} {time.time()}", encoding="utf-8")
+            data.record_status_override("7", "Applied", p)
+        finally:
+            live.kill()
+            live.wait()
+        assert json.loads(p.read_text(encoding="utf-8")) == {"7": "Applied"}
+        assert "still held by another process" in capsys.readouterr().out
+        assert lock.read_text(encoding="utf-8").startswith(f"{live.pid} ")   # not ours to delete
+
+    def test_a_lock_that_raises_is_a_miss_not_a_lost_edit(self, tmp_path, monkeypatch, capsys):
+        # A Windows sharing violation on a lock file mid-delete raises out of
+        # os.open; record_status_override would swallow it with the edit.
+        import json
+
+        def raising(*a, **k):
+            raise PermissionError(32, "sharing violation")
+        monkeypatch.setattr(data, "acquire_process_lock", raising)
+        monkeypatch.setattr(data, "_OVERRIDE_LOCK_WAIT", 0.05)
+        p = tmp_path / "overrides.json"
+        data.record_status_override("7", "Applied", p)
+        assert json.loads(p.read_text(encoding="utf-8")) == {"7": "Applied"}
+        assert "without it" in capsys.readouterr().out
 
 
 class TestOverrideMatchesRow:

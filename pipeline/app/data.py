@@ -5,10 +5,12 @@ renders individual report markdown files to HTML. Pure functions, no FastAPI
 import — so they're unit-testable without standing up a server.
 """
 
+import contextlib
 import json
 import re
 import shutil
 import threading
+import time
 from datetime import date
 from pathlib import Path
 
@@ -18,6 +20,7 @@ from pipeline._batch_common import (
     _report_int,
     _report_link,
     ADDITION_COLUMNS,
+    acquire_process_lock,
     atomic_write_text,
     by_hand_mark,
     closed_by_recheck,
@@ -28,6 +31,7 @@ from pipeline._batch_common import (
     read_addition,
     normalize_company,
     read_url_set,
+    release_process_lock,
     score_value,
 )
 from pipeline import tracker_layout
@@ -60,6 +64,68 @@ STATUS_OVERRIDES_FILE = (
 # (a reader sees either the whole old file or the whole new one, never a
 # half-written one that would parse as {} and wipe the user's pending triage).
 _status_lock = threading.Lock()
+
+# The thread lock serializes THREADS, and the override files have writers in
+# more than one process: the UI, the orchestrate subprocess a local run starts
+# (the re-check's Discards, handoff's outcomes and the merge's reopens all go
+# through record_status_changes), and a Push from outside the UI once
+# pipeline/state_sync.py has a second caller (#211). So every read/modify/write
+# also holds a pid lock file beside the file it edits — both locks, never the
+# file alone: acquire_process_lock treats its own pid as reclaimable, so two
+# threads of one process would each "take" it. An edit lasts milliseconds, so a
+# holder older than MAX_AGE is hung and reclaimed, and WAIT outlasts MAX_AGE so
+# even that is waited out. Past WAIT the edit goes ahead unlocked with a
+# warning, which is how it ran before the lock existed: every caller is
+# best-effort, and refusing would drop a person's drag on the floor.
+_OVERRIDE_LOCK_MAX_AGE = 10.0
+_OVERRIDE_LOCK_WAIT = 15.0
+
+
+def override_lock_path(path: Path) -> Path:
+    return path.with_name(path.name + ".lock")
+
+
+def _try_override_lock(lock: Path) -> bool:
+    """One attempt at `lock`. An OSError is a miss rather than a raise — a
+    Windows sharing violation on a lock file mid-delete, or a directory that
+    cannot be written — so the caller keeps waiting and then goes ahead
+    unlocked, as documented above, instead of dropping the edit."""
+    try:
+        return acquire_process_lock(lock, max_age=_OVERRIDE_LOCK_MAX_AGE)
+    except OSError:
+        return False
+
+
+@contextlib.contextmanager
+def override_file_lock(path: Path):
+    """Hold the thread lock and `path`'s cross-process lock for one
+    read/modify/write of `path`. Not re-entrant — never nest two."""
+    lock = override_lock_path(path)
+    with _status_lock:
+        deadline = time.monotonic() + _OVERRIDE_LOCK_WAIT
+        while not (held := _try_override_lock(lock)) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not held:
+            print(f"[status] {lock.name} still held by another process after "
+                  f"{_OVERRIDE_LOCK_WAIT:.0f}s — editing {path.name} without it")
+        try:
+            yield
+        finally:
+            if held:
+                release_process_lock(lock)
+
+
+@contextlib.contextmanager
+def editing_overrides(path: Path | None = None):
+    """One read-modify-write of an override map, under override_file_lock: the
+    one shape every writer of either override file goes through, so "every
+    edit takes the lock" holds by construction rather than by each site
+    remembering. A raise inside the block skips the save."""
+    p = path or STATUS_OVERRIDES_FILE
+    with override_file_lock(p):
+        overrides = load_status_overrides(p)
+        yield overrides
+        save_status_overrides(overrides, p)
 
 
 def load_status_overrides(path: Path | None = None) -> dict:
@@ -109,18 +175,20 @@ def override_note(value) -> str:
     return ""
 
 
-def clear_status_overrides(keys, path: Path | None = None) -> None:
-    """Remove the given keys from the override map (used after a push). Re-reads
-    under the lock and removes ONLY those keys, so anything written between the
-    push's snapshot and now (e.g. an apply auto-submit) survives — unlike a
-    blanket overwrite-with-{} which would silently drop it."""
+def clear_status_overrides(snapshot: dict, path: Path | None = None) -> None:
+    """Remove the overrides a push dispatched: `snapshot` is {key: the value it
+    pushed}. Re-reads under the lock and removes a key ONLY while it still holds
+    that value, so anything written between the push's snapshot and now
+    survives — a new key (an apply auto-submit) and equally a pushed key
+    rewritten meanwhile (a card dragged again during the gh round-trip), whose
+    newer value the cloud has not seen. A blanket overwrite-with-{} or a
+    key-only pop would silently drop either."""
     p = path or STATUS_OVERRIDES_FILE
     try:
-        with _status_lock:
-            overrides = load_status_overrides(p)
-            for k in keys:
-                overrides.pop(str(k), None)
-            save_status_overrides(overrides, p)
+        with editing_overrides(p) as overrides:
+            for k, v in snapshot.items():
+                if overrides.get(str(k)) == v:
+                    del overrides[str(k)]
     except OSError:
         pass
 
@@ -171,10 +239,8 @@ def record_status_override(num: str, status: str, path: Path | None = None,
     append with the status (`by_hand_note_for`); Push carries it along."""
     p = path or STATUS_OVERRIDES_FILE
     try:
-        with _status_lock:
-            overrides = load_status_overrides(p)
+        with editing_overrides(p) as overrides:
             overrides[str(num)] = _override_value(status, company, role, note)
-            save_status_overrides(overrides, p)
     except OSError:
         pass
 
@@ -225,11 +291,9 @@ def record_status_changes(applications_md: Path, changes, *, notes: dict | None 
         if new != text:
             atomic_write_text(applications_md, new)
     try:
-        with _status_lock:
-            overrides = load_status_overrides()
+        with editing_overrides() as overrides:
             for num, status, company, role in items:
                 overrides[num] = _override_value(status, company, role, notes.get(num))
-            save_status_overrides(overrides)
     except OSError:
         pass
 
