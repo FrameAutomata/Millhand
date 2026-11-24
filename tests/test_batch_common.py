@@ -2797,6 +2797,279 @@ class TestProtectedCharacteristicRedaction:
         once = _batch_common.redact_profile_yml(self.YML)
         assert _batch_common.redact_profile_yml(once) == once
 
+    # ── #216: the label alone was the whole test ──────────────────────────────
+
+    def test_disclosure_labels_with_no_protected_stem(self):
+        """The five stems never fire on these labels, and they are the labels
+        an agent writes. The disclosure stems name nothing but a disclosure, so
+        they match a label anywhere in the file."""
+        grown = ("- **Self-ID:** Female, Hispanic or Latino\n"
+                 "- **Self identification:** declined\n"
+                 "- **EEO:** Prefer not to say\n"
+                 "- **Pronouns:** they/them\n"
+                 "- **Voluntary disclosures:** see the form\n"
+                 "- **Compensation target:** 60-70k\n")
+        assert _batch_common.redact_profile_master(grown) == "- **Compensation target:** 60-70k\n"
+
+    def test_disclosure_stems_stop_at_a_word_boundary(self):
+        """`eeo` and `pronoun` are bounded on the right too: the EEOC is an
+        employer, and "pronounced" is an ordinary word in a fact-bank label."""
+        bank = ("- **EEOC:** investigator, 2019-2022\n"
+                "- **Pronounced gains:** cut intake time 40%\n"
+                "- **Selfridges:** 2 years retail\n")
+        assert _batch_common.redact_profile_master(bank) == bank
+
+    def test_a_dropped_bullet_takes_its_continuation(self):
+        master = ("- **Disability status:**\n"
+                  "  Yes, I have a disability\n"
+                  "    (or previously had one)\n"
+                  "- **Location:** Dallas, TX\n"
+                  "  open to hybrid\n")
+        assert _batch_common.redact_profile_master(master) == (
+            "- **Location:** Dallas, TX\n"
+            "  open to hybrid\n")
+
+    def test_a_dropped_bullet_takes_its_nested_items(self):
+        master = ("- **Voluntary disclosures:**\n"
+                  "  - Gender: Female\n"
+                  "  - Hispanic or Latino\n"
+                  "\t- Not a protected veteran\n"
+                  "- **Compensation target:** 60-70k\n")
+        assert _batch_common.redact_profile_master(master) == "- **Compensation target:** 60-70k\n"
+
+    def test_a_continuation_follows_markdown_and_ends_at_a_sibling_or_heading(self):
+        """What Markdown reads as part of the dropped item goes with it: deeper
+        lines, across a blank line (a loose list nests that way), and an
+        unindented lazy line straight after it. A sibling at its own indent, a
+        new paragraph after a blank, and a heading end it."""
+        master = ("- **Gender:** Female\n"
+                  "Hispanic or Latino\n"                     # lazy continuation
+                  "\n"
+                  "  - nested after a blank line\n"           # still the item's
+                  "\n"
+                  "a new paragraph\n"
+                  "## Next\n"
+                  "  - **Veteran status:** no\n"
+                  "  - a sibling at its own indent\n"
+                  "- **Race:** x\n"
+                  "## After\n"
+                  "  indented under a heading\n")
+        assert _batch_common.redact_profile_master(master) == (
+            "\n"
+            "\n"
+            "a new paragraph\n"
+            "## Next\n"
+            "  - a sibling at its own indent\n"
+            "## After\n"
+            "  indented under a heading\n")
+
+    @pytest.mark.parametrize("heading", [
+        "## Voluntary disclosures", "## Self-ID", "## EEO self-identification",
+        "### Pronouns", "## voluntary   disclosure answers ##",
+    ])
+    def test_a_disclosure_heading_drops_its_whole_section(self, heading):
+        """Mirrors `redact_profile_yml`'s whole-section rule: an unlabelled
+        bullet under such a heading has nothing to match, so the heading is the
+        only thing that can tell. Sub-sections go with it; a heading at the same
+        level or above ends it."""
+        master = ("## Identity & contact\n"
+                  "- **Name:** Jane Roe\n"
+                  "\n"
+                  f"{heading}\n"
+                  "- Female\n"
+                  "- Hispanic or Latino\n"
+                  "\n"
+                  "#### Details\n"
+                  "Not a protected veteran.\n"
+                  "\n"
+                  "## Tailoring rules\n"
+                  "- Keep every metric.\n")
+        assert _batch_common.redact_profile_master(master) == (
+            "## Identity & contact\n"
+            "- **Name:** Jane Roe\n"
+            "\n"
+            "## Tailoring rules\n"
+            "- Keep every metric.\n")
+
+    def test_standing_answers_test_the_whole_line(self):
+        """Inside the generator's own section a stem in the value, in an
+        unlabelled bullet or in a sub-heading is a disclosure, not a fact."""
+        master = ("## Standing answers\n"
+                  "What applications keep asking:\n"
+                  "\n"
+                  "- **Work authorization:** US citizen\n"
+                  "- **Demographics:** Female; not a protected veteran\n"
+                  "- Ethnicity - Hispanic or Latino\n"
+                  "- **Location:** Dallas, TX\n"
+                  "### Gender\n"
+                  "Female\n"
+                  "### Commute\n"
+                  "- Up to 45 minutes\n"
+                  "- I have a disability parking permit\n")
+        assert _batch_common.redact_profile_master(master) == (
+            "## Standing answers\n"
+            "What applications keep asking:\n"
+            "\n"
+            "- **Work authorization:** US citizen\n"
+            "- **Location:** Dallas, TX\n"
+            "### Commute\n"
+            "- Up to 45 minutes\n")
+
+    # Values carrying every stem, in the fact-bank shapes: a bold label, a plain
+    # bullet, a nested one, an employer heading. None of them is a disclosure.
+    VALUE_DECOYS = ("- **VA North Texas:** scheduled care for 2,000 veterans\n"
+                    "- **Accessibility:** audited intake forms for users with disabilities\n"
+                    "- Led a gender pay-equity review covering race and ethnicity data\n"
+                    "  - Filed the EEO-1 report; ran a self-identification drive\n"
+                    "  - Rewrote pronouns in the style guide\n"
+                    "### Disability Rights Texas — Veterans Advocate\n"
+                    "- Represented 40 claimants at hearings\n")
+
+    def test_fact_bank_values_are_never_scanned(self):
+        """`\\bveteran` and `disab\\w*` match "veterans" and "disabilities", so a
+        global value scan would be the Grace Health deletion moved from labels
+        to values. Text before the first heading is not scanned either."""
+        doc = ("# Jane Roe — candidate profile\n"
+               "A nurse who served veterans and patients with disabilities.\n"
+               "\n"
+               "## Role fact bank\n" + self.VALUE_DECOYS)
+        assert _batch_common.redact_profile_master(doc) == doc
+
+    def test_the_scan_ends_with_the_standing_answers_section(self):
+        doc = ("## Standing answers\n"
+               "- **Gender:** Female\n"
+               "\n"
+               "## Role fact bank\n" + self.VALUE_DECOYS)
+        assert _batch_common.redact_profile_master(doc) == (
+            "## Standing answers\n"
+            "\n"
+            "## Role fact bank\n" + self.VALUE_DECOYS)
+
+    def test_master_redaction_is_idempotent(self):
+        master = ("# Jane Roe\n"
+                  "- **Self-ID:** Female\n"
+                  "  - Hispanic or Latino\n"
+                  "- **Name:** Jane Roe\n"
+                  "\n"
+                  "## Role fact bank\n" + self.VALUE_DECOYS +
+                  "\n"
+                  "## Standing answers\n"
+                  "- **Location:** Dallas, TX\n"
+                  "- not a protected veteran\n"
+                  "    deeper\n"
+                  "  shallower but still deeper than nothing\n"
+                  "### Pronouns\n"
+                  "they/them\n"
+                  "### Commute\n"
+                  "- 45 minutes\n"
+                  "## Voluntary disclosures\n"
+                  "- Female\n"
+                  "## Tailoring rules\n"
+                  "- Keep every metric.\n")
+        once = _batch_common.redact_profile_master(master)
+        assert _batch_common.redact_profile_master(once) == once
+        for leak in ("Female", "Hispanic", "protected veteran", "they/them", "shallower"):
+            assert leak not in once, leak
+        assert self.VALUE_DECOYS in once and "45 minutes" in once
+
+    def test_the_generators_own_answers_survive_and_its_section_is_scanned(self):
+        """`render_profile_md` writes the section this scan keys on, so a
+        disclosure the agent appends there is caught — and everything the
+        generator itself writes survives except its self-identification
+        instruction, which names the stems and has no use in a prompt."""
+        from pipeline import handoff
+        md = handoff.render_profile_md(
+            cv_md="## Experience\n### VA North Texas — Scheduler\n- Booked care for 2,000 veterans\n",
+            profile={"compensation": {"target_range": "60-70k", "location_flexibility": "Hybrid"},
+                     "location": {"city": "Dallas", "state": "TX", "timezone": "CST"},
+                     "work_authorization": {"citizenship": "US", "requires_sponsorship": False},
+                     "voluntary_disclosures": {"gender": "Female", "veteran_status": "No"}})
+        out = _batch_common.redact_profile_master(md)
+        assert out.splitlines() == [
+            ln for ln in md.splitlines() if not ln.startswith("- **Self-identification")]
+        location = next(ln for ln in md.splitlines() if ln.startswith("- **Location:**"))
+        grown = md.replace(location, f"{location}\n- Hispanic or Latino, not a protected veteran")
+        assert _batch_common.redact_profile_master(grown) == out
+
+    def test_evidence_sections_keep_the_pre_216_rule(self):
+        """The disclosure stems are words a job carries too. In the generator's
+        fact bank and skills inventory, an EEO role or skill survives whole,
+        while a bullet LABELLED with a protected stem still goes, as before."""
+        bank = (
+            f"## {_batch_common.EVIDENCE_HEADINGS[0]}\n"
+            "### EEO Specialist — U.S. Department of Labor\n"
+            "- Investigated 40 complaints a quarter\n"
+            "- **Pronoun-aware intake scripting:** rewrote the intake form\n"
+            f"## {_batch_common.EVIDENCE_HEADINGS[1]}\n"
+            "- **EEO-1 reporting:** strong\n"
+            "- **Gender:** Female\n")
+        out = _batch_common.redact_profile_master(bank)
+        assert out == bank.replace("- **Gender:** Female\n", "")
+
+    def test_the_evidence_rule_ends_at_the_next_generator_section(self):
+        """The fact bank holds a CV verbatim, its own `## Experience` heading
+        included; ending the section there put an "EEO Specialist" role under
+        the stricter rule, which deleted it. It ends at a section the generator
+        writes instead."""
+        bank = _batch_common.EVIDENCE_HEADINGS[0]
+        md = (f"## {bank}\n## Experience\n### EEO Specialist — U.S. Department of Labor\n"
+              "- Investigated 40 complaints a quarter\n"
+              "## How this profile grows\n### Pronouns\nthey/them\n")
+        assert _batch_common.redact_profile_master(md) == (
+            f"## {bank}\n## Experience\n### EEO Specialist — U.S. Department of Labor\n"
+            "- Investigated 40 complaints a quarter\n"
+            "## How this profile grows\n")
+
+    def test_generator_headings_are_recognised_before_any_is_tested(self):
+        """An agent widening a generator heading must not delete the section."""
+        md = ("## Standing answers (incl. EEO)\n- **Location:** Dallas, TX\n- **Gender:** x\n"
+              "## Skills inventory (incl. EEO-1 reporting)\n- **EEO-1 reporting:** strong\n")
+        assert _batch_common.redact_profile_master(md) == (
+            "## Standing answers (incl. EEO)\n- **Location:** Dallas, TX\n"
+            "## Skills inventory (incl. EEO-1 reporting)\n- **EEO-1 reporting:** strong\n")
+
+    def test_a_protected_heading_in_an_agent_section_drops_it(self):
+        md = "## How this profile grows\nnotes\n## Application answers\n### Gender\nFemale\n### Notes\nok\n"
+        assert _batch_common.redact_profile_master(md) == (
+            "## How this profile grows\nnotes\n## Application answers\n### Notes\nok\n")
+
+    def test_the_title_and_fenced_lines_are_never_headings_to_drop(self):
+        """A surname carrying a stem must not take the whole profile, and a `#`
+        inside a code fence must not end the Standing answers scan."""
+        md = ("# Eli Disabato — candidate profile\n## Standing answers\n- **Location:** Dallas\n"
+              "```\n# not a heading\n```\n- Gender: Female\n")
+        assert _batch_common.redact_profile_master(md) == (
+            "# Eli Disabato — candidate profile\n## Standing answers\n- **Location:** Dallas\n"
+            "```\n# not a heading\n```\n")
+
+    def test_numbered_and_underscore_bold_bullets_are_read(self):
+        md = "## Notes the agent added\n1. **Gender:** x\n* __Veteran status:__ no\n- **Gender identity** kept? no\n- ok\n"
+        assert _batch_common.redact_profile_master(md) == "## Notes the agent added\n- ok\n"
+
+    def test_race_needs_a_word_boundary(self):
+        """`race` unbounded on the right redacted a town ("Raceland, LA") out of
+        the candidate's location."""
+        md = "## Standing answers\n- **Location:** Raceland, LA (CST)\n- **Race:** x\n- Racial identity: y\n"
+        assert _batch_common.redact_profile_master(md) == "## Standing answers\n- **Location:** Raceland, LA (CST)\n"
+
+    def test_every_generator_section_is_listed(self):
+        """An evidence section ends only at a heading in PROFILE_SECTION_HEADINGS,
+        so a section render_profile_md adds must be listed there."""
+        from pipeline import handoff
+        cv = "## Experience\n- Did things\n"
+        md = handoff.render_profile_md(cv_md=cv, profile={})
+        written = [ln[3:].strip() for ln in md.splitlines()
+                   if ln.startswith("## ") and ln not in cv.splitlines()]   # the CV's own are pasted in
+        assert written and set(written) <= set(_batch_common.PROFILE_SECTION_HEADINGS), written
+
+    def test_the_generator_writes_the_evidence_headings(self):
+        """Renaming a heading in render_profile_md must not quietly move the fact
+        bank onto the stricter rule and delete real experience."""
+        from pipeline import handoff
+        md = handoff.render_profile_md(cv_md="## Experience\n- Did things\n", profile={})
+        for h in _batch_common.EVIDENCE_HEADINGS:
+            assert f"## {h}" in md
+
     def test_empty_and_none_degrade_quietly(self):
         for f in (_batch_common.redact_profile_yml, _batch_common.redact_profile_master):
             assert f("") == "" and f(None) == ""

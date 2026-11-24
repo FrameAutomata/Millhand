@@ -1064,6 +1064,13 @@ class TestHandoffReadme:
             assert token in md                  # the full writeback legend
         assert "cowork" not in md.lower()       # agent-agnostic
 
+    def test_forbids_writing_self_id_answers_into_the_profile(self):
+        """The README is rewritten on every bootstrap, so this reaches every
+        handoff folder; the redaction behind it is defence in depth (#216)."""
+        md = handoff.render_handoff_readme()
+        assert "**Never** write self-identification answers" in md
+        assert "voluntary disclosures" not in md
+
     def test_points_agent_at_the_living_profile(self):
         # The README must send the agent to the living master (PROFILE.md) and
         # say it's a document to grow — the whole point of Commit 2.
@@ -1254,8 +1261,8 @@ class TestRenderProfileMd:
 
     def test_standing_answers_from_profile(self):
         # The form-fill answers the agent needs on every application — work auth,
-        # comp, location, and the EEO/voluntary disclosures — sourced from
-        # profile.yml so the agent never has to re-ask the user.
+        # comp, location — sourced from profile.yml so the agent never has to
+        # re-ask the user. Never the EEO self-ID answers (#165).
         md = self._md(cv_md=_FIXTURE_CV, profile=_FIXTURE_PROFILE)
         assert "$75K-$500K" in md                                    # comp target
         assert "CST" in md                                           # location/tz

@@ -48,7 +48,8 @@ from pathlib import Path
 import yaml
 
 from pipeline._batch_common import (
-    APPLY_MIN_SCORE, atomic_write_text, env_float, env_int, normalize_company as _squeeze, read_text,
+    APPLY_MIN_SCORE, EVIDENCE_HEADINGS, STANDING_ANSWERS_HEADING, atomic_write_text, env_float,
+    env_int, normalize_company as _squeeze, read_text,
 )
 from pipeline.app import data as _data
 from pipeline.work_location import OUT_OF_AREA_TAG, commutable_area
@@ -1506,10 +1507,14 @@ def render_handoff_readme(*, policy: str | None = None) -> str:
         f"`{HANDOFF_PROFILE}` is the candidate's living master: identity, a",
         "metric-carrying fact bank, an honesty-rated skills inventory, and the",
         "standing answers to the questions applications keep asking (work",
-        "authorization, compensation, location, voluntary disclosures). Qualify and",
+        "authorization, compensation, location). Qualify and",
         f"tailor every role against it. **Grow it:** when you learn a new fact or",
         "answer a new application question, write it back into the matching section",
         f"of `{HANDOFF_PROFILE}` so the next run is smarter — that's the whole point.",
+        f"**Never** write self-identification answers (gender, race or ethnicity,",
+        "veteran or disability status, pronouns, EEO) into it: the model that scores",
+        "the candidate reads this file. Decline, or choose \"prefer not to answer\";",
+        "if a form requires a value, record `handoff` so the candidate answers it.",
         "",
         f"To rebuild or override a role's résumé, follow `{HANDOFF_RESUME_RUNBOOK}` (the",
         "content-JSON schema, the one-page fill target, and the tailoring rules).",
@@ -1815,7 +1820,7 @@ def render_profile_md(*, cv_md: str = "", profile: dict | None = None,
         *(["", "**Targeting & positioning context (from _profile.md):**", "", positioning_ctx]
           if positioning_ctx else []),
         "",
-        "## Role fact bank",
+        f"## {EVIDENCE_HEADINGS[0]}",   # redact_profile_master keeps the pre-#216 rule here
         "Your experience and projects, with the numbers that carry them. **Metrics",
         "are load-bearing — copy them into every résumé verbatim and never trim",
         "them.** Add framing variants (the same win, phrased for different job",
@@ -1827,7 +1832,7 @@ def render_profile_md(*, cv_md: str = "", profile: dict | None = None,
            "Keep any `[TODO: confirm]` figures flagged until you re-verify them.",
            "", proof_points] if proof_points else []),
         "",
-        "## Skills inventory",
+        f"## {EVIDENCE_HEADINGS[1]}",
         "Rate each skill by honesty tier — **Strong** (current, lead with it) · "
         "**Solid** · **Lighter / older** (don't over-claim) · **Coursework only** · "
         "**Gated** (surface only for the roles that ask). Only add a skill to a "
@@ -1835,7 +1840,7 @@ def render_profile_md(*, cv_md: str = "", profile: dict | None = None,
         "",
         skills or "_(seed this from your résumé's Skills section, then tier each one.)_",
         "",
-        "## Standing answers",
+        f"## {STANDING_ANSWERS_HEADING}",   # redact_profile_master value-scans this section
         "What applications keep asking — answer once here, reuse everywhere:",
         "",
         *_profile_standing_answers(profile),
