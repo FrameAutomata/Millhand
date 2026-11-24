@@ -385,10 +385,13 @@ jobs:
       # DIGEST_MIN_SCORE, with their reports attached; a one-line failure
       # notice when the step above did not succeed; a heartbeat otherwise.
       #
-      # This step only READS cached paths (career-ops/reports and
-      # data/applications.md) and writes nothing under them; the artifact
-      # guard in tests/test_workflow_artifacts.py forbids a scheduled UPLOAD of
-      # cached state, and a read is not that. `if: always()` because a failed
+      # This step only READS cached paths (career-ops/reports,
+      # career-ops/data/applications.md and, for the count of abandoned
+      # evaluations, career-ops/batch/batch-api-state.json) and writes nothing
+      # under them; the artifact guard in tests/test_workflow_artifacts.py
+      # forbids a scheduled UPLOAD of cached state, and a read is not that.
+      # The list is daily_digest.CACHED_READS, held to this comment by
+      # tests/test_workflow_env.py. `if: always()` because a failed
       # run is the one thing this must never stay quiet about, and the digest
       # exits 0 whatever happens, so it can never be why the day shows red.
       # The secrets and variables named here are pipeline/daily_digest.py's

@@ -12,6 +12,7 @@ import pytest
 
 from pipeline import batch_evaluate as eval_mod
 from pipeline._batch_common import IncompleteResponse
+from pipeline.daily_digest import abandoned_count
 from pipeline import gemini_limits as gl
 from tests.conftest import evaluate_without_a_provider, fake_clock, real_pacers_on_fake_clock
 from pipeline.batch_evaluate import (
@@ -859,6 +860,7 @@ class TestFailureAllowance:
         out = capsys.readouterr().out
         assert f"[1] ABANDONED after 3 failed runs: Acme — {exc}" in out
         assert "abandoned=1" in out
+        assert abandoned_count(h.career_ops) == 1   # the digest reads what run() wrote
 
         assert h.run().processed == 0        # out of the queue for good
         assert h.calls.count("Acme") == 3
@@ -912,6 +914,7 @@ class TestFailureAllowance:
         assert h.calls == ["Acme"]
         job = h.jobs()["1"]
         assert (job["status"], job["attempts"]) == ("failed", 1)   # not straight back to 3
+        assert abandoned_count(h.career_ops) == 0
 
         del h.failing["Acme"]
         assert h.run().processed == 1

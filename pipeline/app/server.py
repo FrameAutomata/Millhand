@@ -37,6 +37,7 @@ from pipeline import article_digest
 from pipeline import gemini_limits
 from pipeline._batch_common import (
     APPLY_MIN_SCORE,
+    BATCH_API_STATE,
     SKIP_BELOW,
     IncompleteResponse,
     build_user_message,
@@ -1781,7 +1782,7 @@ def add_job(req: AddJobRequest) -> JSONResponse:
 
     # The batch state too: an --evaluate-batch run assigns every pending job's
     # numbers before writing any report, so files and tracker alone undercount.
-    state = load_state(co / "batch" / "batch-api-state.json")
+    state = load_state(co / BATCH_API_STATE)
     tracker_num = max_tracker_num(apps_md, state) + 1
     report_num  = max_report_num(reports_dir, state, apps_md) + 1
     report_num_str = str(report_num).zfill(3)
@@ -1844,7 +1845,7 @@ def _run_add_job(job_id: str, url: str, company: str, role: str) -> None:
         reports_dir = co / "reports"
         tracker_dir = co / "batch" / "tracker-additions"
 
-        state = load_state(co / "batch" / "batch-api-state.json")   # see add_job
+        state = load_state(co / BATCH_API_STATE)   # see add_job
         tracker_num = max_tracker_num(apps_md, state) + 1
         report_num  = max_report_num(reports_dir, state, apps_md) + 1
         report_num_str = str(report_num).zfill(3)

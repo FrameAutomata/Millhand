@@ -26,12 +26,14 @@ import yaml
 
 from pipeline import daily_digest, recheck
 from tests.test_workflow_artifacts import (
+    CACHED_PATHS,
     DAILY,
     WORKFLOWS,
     _doc,
     _run_artifact_args,
     _step_index,
     _steps,
+    _triggers,
 )
 
 JOB = "scrape-and-evaluate"
@@ -79,6 +81,14 @@ def _digest_args() -> dict[str, list[str]]:
         elif flag is not None:
             args[flag].append(tok)
     return args
+
+
+def _digest_note() -> str:
+    """The comment block directly above the digest step: everything after the
+    last blank line before it."""
+    text = (WORKFLOWS / DAILY).read_text(encoding="utf-8")
+    before = text[: text.index("- name: Send the daily digest")]
+    return before[before.rfind("\n\n"):]
 
 
 def _expr(kind: str, name: str, default: str | None = None) -> re.Pattern:
@@ -152,11 +162,44 @@ class TestDigestStep:
         """The artifact guard forbids a scheduled UPLOAD of cached paths; the
         digest only reads them, and says so where a reviewer of the YAML sees
         it rather than inside the shell script."""
-        text = (WORKFLOWS / DAILY).read_text(encoding="utf-8")
-        before = text[: text.index("- name: Send the daily digest")]
-        comment = before[before.rfind("\n\n"):]
+        comment = _digest_note()
         assert "READS cached paths" in comment and "writes nothing" in comment
         assert all(l.strip().startswith("#") for l in comment.strip().splitlines())
+
+    def test_the_read_only_note_names_every_cached_read(self):
+        """`daily_digest.CACHED_READS` is every cached path the digest reads,
+        and the note above names each one under the step's own --root. Both
+        halves: a read that is not a cached path makes "only READS cached
+        paths" a claim about something else, and a read the note does not
+        name is the one a reviewer of the YAML cannot see — the batch state
+        arrived that way (#206), as a third read beside the two the note
+        already listed."""
+        (root,) = _digest_args()["root"]
+        note = " ".join(l.strip().lstrip("#").strip()
+                        for l in _digest_note().strip().splitlines())
+        for rel in daily_digest.CACHED_READS:
+            path = f"{root}/{rel}"
+            assert path in CACHED_PATHS, f"{path} is not one of the daily's cached paths"
+            assert path in note, f"the note above the digest step does not name {path}"
+
+    def test_the_abandoned_hint_names_what_the_daily_offers(self):
+        """The cloud digest tells the person how an abandoned evaluation comes
+        back (#206): run this workflow, with this checkbox ticked, whose input
+        forwards this flag. daily_digest restates them, so all are held to the
+        workflow — a renamed input or a reworded description would otherwise
+        leave every digest pointing at a checkbox that is not there. The label
+        is the input's `description`, because that is the text GitHub's
+        Run-workflow form puts beside a boolean input's checkbox; the id is
+        shown only for an input with no description."""
+        doc = _doc(DAILY)
+        assert doc["name"] == daily_digest.RETRY_WORKFLOW
+        inputs = (_triggers(doc).get("workflow_dispatch") or {}).get("inputs") or {}
+        assert daily_digest.RETRY_INPUT in inputs, sorted(inputs)
+        assert inputs[daily_digest.RETRY_INPUT].get("type") == "boolean"
+        assert inputs[daily_digest.RETRY_INPUT].get("description") == daily_digest.RETRY_LABEL
+        forwards = (r"\$\{\{\s*inputs\." + re.escape(daily_digest.RETRY_INPUT)
+                    + r"\s*&&\s*'" + re.escape(daily_digest.RETRY_FLAG) + r"'")
+        assert re.search(forwards, str(_run_step()["run"])), _run_step()["run"]
 
 
 class TestRunStepEnv:
