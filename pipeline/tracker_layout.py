@@ -300,3 +300,18 @@ def report_num(report_cell: str, notes_cell: str = "") -> str:
     m = (_REPORT_NUM_RE.search(report_cell or "")
          or _NOTES_REPORT_NUM_RE.search(notes_cell or ""))
     return str(int(m.group(1))) if m and int(m.group(1)) else ""
+
+
+def claimed_report_nums(report_cell: str, notes_cell: str = "") -> set[int]:
+    """Every report number a tracker row links, as ints.
+
+    Not `report_num`, which answers "which report IS this row" and so takes the
+    first match: this answers "which numbers are taken", which a minter asks
+    (`_batch_common.max_report_num`, #203). A re-evaluated row in a tracker with
+    no Report column carries its old and new links in Notes, oldest first
+    (merge-tracker appends), so the first match is the stale one and the
+    highest number would be missed. `[000]` claims nothing, as above."""
+    nums = {int(n) for n in _REPORT_NUM_RE.findall(report_cell or "")}
+    nums |= {int(n) for n in _NOTES_REPORT_NUM_RE.findall(notes_cell or "")}
+    nums.discard(0)
+    return nums

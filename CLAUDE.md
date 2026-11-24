@@ -322,7 +322,7 @@ Cloud automation workflows:
    4. Actions → "Edit Tracker" → Run workflow → paste the base64 → Run.
    5. The next pipeline run will see the updated statuses.
 
-**Cache eviction**: GitHub Actions Cache evicts entries after 7 days of inactivity. A daily-running workflow keeps it warm, so this only bites if you pause the workflow for >7 days. Worst case after eviction: dedup starts empty, some jobs get re-evaluated once. Recoverable.
+**Cache eviction**: GitHub Actions Cache evicts entries after 7 days of inactivity. A daily-running workflow keeps it warm, so this only bites if you pause the workflow for >7 days. Worst case after eviction: dedup starts empty, some jobs get re-evaluated once — and the tracker goes too, since `data/applications.md` is one of the cached paths. Report numbering no longer restarts with it: `max_report_num` takes the highest report the tracker links as well as the cached `reports/` and batch state (#203), so a tracker restored on its own (Edit Tracker's `applications_md_release_tag` input) keeps every new report number clear of the old rows', as career-ops' own `reserve-report-num.mjs` already did for `--batch`. The reports themselves are not restored by any workflow yet (#203's other half).
 
 ---
 
