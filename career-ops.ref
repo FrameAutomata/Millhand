@@ -34,4 +34,4 @@ CAREER_OPS_BRANCH=main
 # log, and the digest cannot show a row that never reached the tracker. So the
 # daily runs a commit someone has checked, not whatever main is at 12:00 UTC.
 # Moving it: the procedure at the top of this file, which is the whole of it.
-CAREER_OPS_COMMIT=aac998c7ed7248ea853b720ceeb1fdbeb322fc5d
+CAREER_OPS_COMMIT=1ef2ea0da345853771cf5bf277b87322d4671ecf
