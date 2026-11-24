@@ -1269,9 +1269,9 @@ def _report_location_mark(report_text: str) -> str:
 class IncompleteResponse(RuntimeError):
     """A provider answered, but not with a whole evaluation — the JOB's failure,
     not the run's — so it counts against the job's allowance of failed runs
-    (`batch_evaluate._is_countable_failure`, #206). Raised by the Claude caller
-    for a cut-off or refused answer, and by `write_job_result` for an answer
-    that is not a whole evaluation (#204)."""
+    (`batch_evaluate._is_countable_failure`, #206). Raised by the provider
+    callers for an answer their provider says it cut off or withheld, and by
+    `write_job_result` for one missing a tag (#204)."""
 
 
 def _require_whole_evaluation(response_text: str, report: str, tracker_tsv: str,

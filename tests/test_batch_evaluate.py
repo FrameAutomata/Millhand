@@ -3,6 +3,7 @@
 import csv
 import json
 import os
+import re
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -560,6 +561,86 @@ class TestClientHardening:
         # http_options.timeout is in milliseconds (180s → 180000ms).
         assert captured.get("http_options") is not None
         assert int(captured["http_options"].timeout) == 180000
+
+
+_MISSING = object()
+
+
+class TestCutOffCallers:
+    """#204's caller half: the Gemini and OpenAI-compatible callers raise
+    IncompleteResponse on a listed cut-off or withheld finish reason
+    (`_GEMINI_CUT_FINISHES`, `_OPENAI_CUT_FINISHES`) and accept any other."""
+
+    ANSWER = "<evaluation>whole</evaluation>"
+
+    @staticmethod
+    def _openai(monkeypatch, finish_reason, content=ANSWER):
+        openai = pytest.importorskip("openai")
+
+        def create(**kw):
+            choice = SimpleNamespace(message=SimpleNamespace(content=content))
+            if finish_reason is not _MISSING:
+                choice.finish_reason = finish_reason
+            return SimpleNamespace(choices=[choice])
+        monkeypatch.setattr(openai, "OpenAI", lambda **kw: SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))))
+        return eval_mod._build_openai_compat_caller("m", "k")
+
+    @staticmethod
+    def _gemini(monkeypatch, finish_reason=_MISSING, block_reason=None, text=ANSWER):
+        genai = pytest.importorskip("google.genai")
+        candidates = [] if finish_reason is _MISSING else [SimpleNamespace(finish_reason=finish_reason)]
+        resp = SimpleNamespace(text=text, candidates=candidates,
+                               prompt_feedback=SimpleNamespace(block_reason=block_reason))
+        monkeypatch.setattr(genai, "Client", lambda **kw: SimpleNamespace(
+            models=SimpleNamespace(generate_content=lambda **k: resp)))
+        monkeypatch.setenv("GEMINI_API_KEY", "k")
+        return eval_mod._build_gemini_caller("gemini-x")
+
+    @staticmethod
+    def _assert_cut(call, reason):
+        # The type is what counts it (#206); the wording is what the retry layer
+        # reads to retry it once and fail over first.
+        with pytest.raises(IncompleteResponse, match=f"empty content.*{re.escape(reason)}") as exc:
+            call("s", "u")
+        assert eval_mod._is_transient_provider_error(exc.value)
+
+    @pytest.mark.parametrize("finish", ["length", "content_filter", "LENGTH"])
+    def test_openai_compat_raises_on_a_cut(self, monkeypatch, finish):
+        self._assert_cut(self._openai(monkeypatch, finish), f"finish_reason={finish}")
+
+    @pytest.mark.parametrize("finish", ["stop", None, _MISSING, "eos"],
+                             ids=["stop", "none", "missing", "unknown"])
+    def test_openai_compat_accepts_anything_else(self, monkeypatch, finish):
+        assert self._openai(monkeypatch, finish)("s", "u") == self.ANSWER
+
+    def test_gemini_raises_on_a_cut_given_as_an_enum(self, monkeypatch):
+        types = pytest.importorskip("google.genai.types")
+        call = self._gemini(monkeypatch, types.FinishReason.MAX_TOKENS)
+        self._assert_cut(call, "finish_reason=MAX_TOKENS")
+
+    @pytest.mark.parametrize("finish", ["SAFETY", "RECITATION", "PROHIBITED_CONTENT"])
+    def test_gemini_raises_on_withheld_content(self, monkeypatch, finish):
+        self._assert_cut(self._gemini(monkeypatch, finish), f"finish_reason={finish}")
+
+    @pytest.mark.parametrize("enum", [False, True], ids=["string", "sdk-enum"])
+    def test_gemini_raises_on_a_blocked_prompt(self, monkeypatch, enum):
+        # No candidate at all: the prompt is what was refused.
+        reason = pytest.importorskip("google.genai.types").BlockedReason.SAFETY if enum else "SAFETY"
+        call = self._gemini(monkeypatch, block_reason=reason, text=None)
+        self._assert_cut(call, "block_reason=SAFETY")
+
+    @pytest.mark.parametrize("finish", ["STOP", "OTHER", None, _MISSING],
+                             ids=["stop", "unlisted", "no-reason", "no-candidates"])
+    def test_gemini_accepts_anything_else(self, monkeypatch, finish):
+        call = self._gemini(monkeypatch, finish, block_reason="BLOCKED_REASON_UNSPECIFIED")
+        assert call("s", "u") == self.ANSWER
+
+    def test_gemini_accepts_the_sdk_enum_for_no_block(self, monkeypatch):
+        types = pytest.importorskip("google.genai.types")
+        call = self._gemini(monkeypatch, types.FinishReason.STOP,
+                            block_reason=types.BlockedReason.BLOCKED_REASON_UNSPECIFIED)
+        assert call("s", "u") == self.ANSWER
 
 
 class TestAnthropicCaller:
