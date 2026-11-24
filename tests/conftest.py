@@ -413,9 +413,11 @@ def _isolate_handoff_env(monkeypatch):
     explicitly via monkeypatch.setenv. The submit policy is cleared the same way
     (its name comes from the module constant, so a rename can't leave a stale
     string here): a developer's .env set to submit-all would flip every README /
-    prompt / fallback-row assertion that pins the stop-before-submit default."""
-    from pipeline.handoff import SUBMIT_POLICY_ENV
-    for var in ("HANDOFF_JOB_LOG", "HANDOFF_OUT_DIR", SUBMIT_POLICY_ENV):
+    prompt / fallback-row assertion that pins the stop-before-submit default.
+    The claim TTL likewise: a developer's HANDOFF_CLAIM_TTL_HOURS=0 would
+    silently disable every claim-expiry assertion."""
+    from pipeline.handoff import CLAIM_TTL_ENV, SUBMIT_POLICY_ENV
+    for var in ("HANDOFF_JOB_LOG", "HANDOFF_OUT_DIR", SUBMIT_POLICY_ENV, CLAIM_TTL_ENV):
         monkeypatch.delenv(var, raising=False)
 
 
