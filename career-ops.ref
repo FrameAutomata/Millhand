@@ -1,7 +1,8 @@
 # Where career-ops comes from, for every site that fetches it.
 #
-# Shell-sourceable `KEY=value` — the daily workflow sources this file verbatim,
-# and tests/test_career_ops_source.py holds each of those sites to these values.
+# Shell-sourceable `KEY=value` — the daily workflow and the contract gate
+# (career-ops-contract.yml) source this file verbatim, and
+# tests/test_career_ops_source.py holds each of those sites to these values.
 #
 # Bumping the pin below is one line here, and it is a deliberate act. Run it
 # against this file's OWN values — a recipe that spells the URL and branch out
@@ -9,13 +10,16 @@
 #   . ./career-ops.ref
 #   git clone --branch "$CAREER_OPS_BRANCH" "$CAREER_OPS_URL" /tmp/co
 #   (cd /tmp/co && npm install --ignore-scripts)
-#   CAREER_OPS_PATH=/tmp/co .venv/bin/python -m pytest \
+#   MILLHAND_REQUIRE_CONTRACT=1 CAREER_OPS_PATH=/tmp/co .venv/bin/python -m pytest \
 #       tests/test_merge_tracker_contract.py tests/test_batch_runner_contract.py
 #   sha=$(git -C /tmp/co rev-parse HEAD)          # the new CAREER_OPS_COMMIT
 #   git -C /tmp/co fetch --depth 1 --no-tags "$CAREER_OPS_URL" "$sha"
 # That last line is the daily's own mechanism, rehearsed before the value ships:
 # a commit being on the branch today is not the same property as a bare fetch
 # being served it, and the fetch is the only way the cloud ever gets this tree.
+# The contract gate runs the clone, the install and the tests every Monday (or
+# on a dispatch with career_ops_ref=branch) and names the commit it tested; the
+# fetch line is still yours, because the gate reached that commit by a clone.
 CAREER_OPS_URL=https://github.com/career-ops-hq/career-ops
 
 # What a PERSON's checkout tracks: setup clones this branch, and the migration

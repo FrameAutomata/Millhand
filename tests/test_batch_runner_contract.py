@@ -34,9 +34,9 @@ a run launches is upstream's behaviour, and nothing here pins it.
 
 The flag set is not restated by hand. It is DERIVED from run.sh's text and must
 equal `EXPECTED`, so adding a flag to the wrapper is a deliberate edit here too,
-and `EXPECTED` is the set the probe drives. The probe tests are local-only on
-`test_merge_tracker_contract.py`'s terms (career-ops is cloned by setup, which
-CI does not run). So the skip sits on the probe class, not the module: the
+and `EXPECTED` is the set the probe drives. The probe tests need a career-ops
+checkout, on `test_merge_tracker_contract.py`'s terms (locally, and in the
+contract gate; `tests.yml` has none). So the skip sits on the probe class, not the module: the
 derivation is pure text and runs everywhere, which makes a flag added to run.sh
 fail CI straight away rather than on someone's next local run.
 """
@@ -162,7 +162,7 @@ def _probe_unavailable():
     if shutil.which("bash") is None:
         return "no bash on PATH"
     if not RUNNER.is_file():
-        return f"no career-ops checkout with {RUNNER} (local install; CI has none)"
+        return f"no career-ops checkout with {RUNNER} (CAREER_OPS_PATH names one)"
     return None
 
 
