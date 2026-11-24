@@ -117,7 +117,9 @@ DEFAULT_NEXT_STEP = ("Next: open your triage UI (./run-ui.sh or run-ui.ps1), "
 
 # GitHub Actions Free: 2,000 Linux minutes per month per ACCOUNT for private
 # repositories. The health line projects one run's duration over a month of
-# dailies against it and warns inside the last 10%.
+# dailies against it and warns inside the last 10%. That is THIS copy's
+# projection: every other private copy on the account draws on the same 2,000
+# and is invisible from here, which is why the health line names its scope.
 MONTHLY_MINUTES = 2000
 MINUTES_WARN_AT = 1800
 RUNS_PER_MONTH = 30
@@ -394,10 +396,13 @@ class Digest:
                 f"≥ {self.min_score:.1f} · {self.open} open in your queue")
         if self.duration_min is not None and self.monthly_estimate is not None:
             line += (f" · run took {self.duration_min:.0f} min ≈ "
-                     f"{self.monthly_estimate:,} min/month of {MONTHLY_MINUTES:,} at this pace")
+                     f"{self.monthly_estimate:,} min/month at this pace, this copy's "
+                     f"share of the account's {MONTHLY_MINUTES:,}")
             if self.monthly_estimate > MINUTES_WARN_AT:
-                line += (f" — WARNING: above {MINUTES_WARN_AT:,}, the free Actions "
-                         "budget is per ACCOUNT (one copy per account)")
+                line += (f" — WARNING: above {MINUTES_WARN_AT:,} on its own; a smaller "
+                         "search shortens a run, and so do higher rate limits if "
+                         "the evaluator is paced (on Gemini, your own limits in the "
+                         "Setup wizard)")
         return line
 
     @property

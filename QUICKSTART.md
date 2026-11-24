@@ -432,11 +432,17 @@ The ceilings that actually bite:
   whole job description plus your profile — which works out to roughly **2,400
   evaluations a day**, about ten times what a daily scrape produces.
 - **Actions minutes are the real limit.** The Free plan gives **2,000 Linux
-  minutes a month per account** (not per repository), and staying inside that
-  token budget means pacing: 160–190 evaluations take **95–115 minutes** of runner
-  time, so a daily at that length is ~3,000 minutes a month and does not fit. Two
-  copies of this template under one account certainly don't — put a second search
-  under a second GitHub account.
+  minutes a month per account** (not per repository), shared by every private
+  copy of this template under it, and what makes a run long is pacing — so a
+  copy's cost is its model's pace times its volume. On the recommended model that
+  token budget allows about 1.7 evaluations a minute: 160–190 evaluations take
+  **95–115 minutes** of runner time, ~3,000 minutes a month, which does not fit
+  even alone. `gemini-3.5-flash-lite` is paced by its 15 requests a minute
+  instead: two copies measured over a month at 64–110 evaluations a run took
+  about 10 minutes a run on average (7–8 at the median), about **345 billed
+  minutes a month each** once GitHub's per-job rounding and the maintenance
+  workflows are counted — both together about a third of the budget. Count
+  minutes, not copies.
 - **The fix is your own rate limits.** The built-in table is a hand-copied
   snapshot of the free tier and is only a fallback. Put your project's real
   numbers from
@@ -446,8 +452,11 @@ The ceilings that actually bite:
   fewer search passes, a smaller `results_wanted`, a higher `min_score`.
   `python -m pipeline.gemini_limits --show` prints what's in effect and which
   limit is binding.
-- **The digest does the arithmetic**, quoting each run's minutes and the monthly
-  projection at that pace, and warning inside the last 10%.
+- **The digest does the arithmetic for one copy**, quoting each run's minutes and
+  the monthly projection at that pace, and warning inside the last 10%. It can't
+  see your other copies under the account: add their projections together, and
+  leave a little room for the maintenance workflows the projection leaves out
+  (12–15 minutes a month per copy in that measurement).
 
 Paying, in the order it's worth it: a paid evaluation key removes the pacing and
 with it most of the minutes problem; paid Actions minutes remove the budget; a
