@@ -142,7 +142,7 @@ function renderTable() {
     tr.innerHTML = `
       <td class="num"><span class="score-pill ${scoreClass(j.score_value)}">${scoreText}</span></td>
       <td title="${escapeAttr(j.company)}">${escapeHtml(j.company)}</td>
-      <td title="${escapeAttr(j.role)}">${escapeHtml(j.role)}${areaTag(j)}</td>
+      <td title="${escapeAttr(j.role)}">${escapeHtml(j.role)}${areaTag(j)}${skipTag(j)}</td>
       <td><span class="status-badge">${escapeHtml(j.status)}</span></td>
       <td>${escapeHtml(j.date)}</td>`;
     tr.addEventListener("click", () => openReport(j));
@@ -202,6 +202,31 @@ function areaTag(j) {
   )}">\u26a0 ${escapeHtml(j.area)}</span>`;
 }
 
+// The evaluator's own Skip (#183), which the server reads off the row's
+// `Decision: Skip` mark. Shown, never hidden: the work-order and the cover-letter
+// and résumé runs leave the role out, and the board is where the person sees
+// that and can overrule it. Scoped to Evaluated rows for the area tag's reason:
+// past Evaluated, the role is no longer waiting on that question.
+//
+// Overruling it is a status WRITE — the server appends the by-hand mark that
+// lifts the Skip (`by_hand_note_for`) — so on a tagged row writing the status it
+// already has is not a no-op: dropping the card back on Evaluated is how a
+// person puts the role back in the queue, and both write paths let it through.
+function skipTagged(j) {
+  return Boolean(j.skip_decided) && j.status_canonical === "Evaluated";
+}
+
+function skipTag(j) {
+  if (!skipTagged(j)) return "";
+  return ` <span class="skip-tag" title="${escapeAttr(
+    "The evaluation decided Skip, so the work-order and the cover-letter and " +
+    "résumé runs leave this role out. To overrule it, drop this card on " +
+    "Evaluated again on the board (or pick another status and then Evaluated " +
+    "in the report pane), then Push; local work-orders follow after the next " +
+    "daily run and a Refresh."
+  )}">Evaluator: Skip</span>`;
+}
+
 function makeCard(j) {
   const card = document.createElement("div");
   card.className = "kanban-card" + (j.pending ? " pending" : "");
@@ -213,7 +238,7 @@ function makeCard(j) {
       <span class="card-company">${escapeHtml(j.company)}</span>
       <span class="score-pill ${scoreClass(j.score_value)}">${scoreText}</span>
     </div>
-    <div class="card-role">${escapeHtml(j.role)}</div>${areaTag(j)}`;
+    <div class="card-role">${escapeHtml(j.role)}</div>${areaTag(j)}${skipTag(j)}`;
   card.addEventListener("click", () => openReport(j));
   card.addEventListener("dragstart", (e) => {
     card.classList.add("dragging");
@@ -233,7 +258,8 @@ function wireColumnDrop(col) {
     const num = e.dataTransfer.getData("text/plain");
     const newStatus = col.dataset.status;
     const job = JOBS.find((j) => String(j.num) === String(num));
-    if (!job || job.status_canonical === newStatus) return;
+    // The same column is a no-op, except on a tagged Skip (`skipTagged`).
+    if (!job || (job.status_canonical === newStatus && !skipTagged(job))) return;
     await changeStatus(job, newStatus);
   });
 }
@@ -243,6 +269,8 @@ async function changeStatus(job, newStatus) {
   job.status = newStatus;
   job.status_canonical = newStatus;
   job.pending = true;
+  // Any status set by hand on an evaluator-Skip row records the lift (#183).
+  if (job.skip_decided) job.skip_decided = false;
   render();
   try {
     const resp = await fetch("/api/status", {
@@ -367,7 +395,10 @@ buildStatusOptions();
 els.reportStatus.addEventListener("change", () => {
   if (!selectedJob) return;
   const newStatus = els.reportStatus.value;
-  if (selectedJob.status_canonical === newStatus) return;
+  // The drop handler's rule. A <select> fires no change event for the option
+  // already chosen, so from here a tagged Skip is lifted by picking another
+  // status and then Evaluated — which the tag's tooltip says.
+  if (selectedJob.status_canonical === newStatus && !skipTagged(selectedJob)) return;
   changeStatus(selectedJob, newStatus);
 });
 

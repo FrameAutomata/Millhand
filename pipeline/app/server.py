@@ -436,26 +436,30 @@ def list_jobs() -> JSONResponse:
     # with a company-only anchor under (norm_company, "").
     overrides = data.load_status_overrides()
     if overrides:
-        by_num: dict[str, str] = {}
-        by_identity: dict[tuple[str, str], str] = {}
+        by_num: dict[str, object] = {}
+        by_identity: dict[tuple[str, str], object] = {}
         for key, value in overrides.items():
             ident = data.override_identity(value)
             if ident:
                 company, role = ident
                 by_identity[(data.normalize_company(company),
-                             data.normalize_company(role))] = data.override_status(value)
+                             data.normalize_company(role))] = value
             else:
-                by_num[key] = data.override_status(value)
+                by_num[key] = value
         for row in rows:
-            status = by_num.get(str(row.get("num")))
-            if status is None:
+            value = by_num.get(str(row.get("num")))
+            if value is None:
                 nc = data.normalize_company(row.get("company", ""))
-                status = (by_identity.get((nc, data.normalize_company(row.get("role", ""))))
-                          or by_identity.get((nc, "")))
-            if status is not None:
+                value = (by_identity.get((nc, data.normalize_company(row.get("role", ""))))
+                         or by_identity.get((nc, "")))
+            if value is not None:
+                status = data.override_status(value)
                 row["status"] = status
                 row["status_canonical"] = data.canonical_status(status)
                 row["pending"] = True
+                # A by-hand lift is a Notes mark (#183): show its effect now,
+                # not after the next daily's artifact carries the note.
+                data.apply_override_note(row, data.override_note(value))
     payload["pending"] = len(overrides)
     return JSONResponse(payload)
 

@@ -38,8 +38,9 @@ EDIT_WORKFLOW = "edit-tracker.yml"
 # newest successful run. A list because latest_successful_run takes several.
 PIPELINE_WORKFLOWS = [DAILY_WORKFLOW]
 
-# Overrides dispatched to the cloud but not yet in a pipeline artifact,
-# {num: status}. Overlaid on every job load (apply_pushed_overlay) so a pushed
+# Overrides dispatched to the cloud but not yet in a pipeline artifact:
+# {num: status}, or {num: {status, note}} for a by-hand mark
+# (data.pushed_overlay_value). Overlaid on every job load (apply_pushed_overlay) so a pushed
 # status survives Refresh and restarts, and self-cleaned entry by entry once an
 # artifact shows it.
 PUSHED_OVERRIDES_FILE = ROOT / ".ui-cache" / "pushed-overrides.json"
@@ -67,21 +68,30 @@ def apply_pushed_overlay(rows: list[dict]) -> None:
     pushed = load_pushed_overrides()
     if not pushed:
         return
-    caught_up: dict[str, str] = {}
+    caught_up: dict[str, object] = {}
     for row in rows:
         num = str(row.get("num"))
-        if num in pushed:
-            if row.get("status_canonical") == pushed[num]:
-                caught_up[num] = pushed[num]
-            else:
-                row["status"] = pushed[num]
-                row["status_canonical"] = pushed[num]
+        if num not in pushed:
+            continue
+        value = pushed[num]
+        status, note = data.override_status(value), data.override_note(value)
+        # An entry carrying a Notes mark is caught up only once the row carries
+        # the mark too: a by-hand Skip lift (#183) sets the status the row
+        # already has, so status alone would drop it at once and the tag would
+        # come back until the next artifact.
+        if row.get("status_canonical") == status and (not note
+                                                      or data.note_landed(row.get("notes"), note)):
+            caught_up[num] = value
+            continue
+        row["status"] = status
+        row["status_canonical"] = status
+        data.apply_override_note(row, note)
     if caught_up:
         # Re-read under the lock and drop only what this load saw caught up, so
         # a Push landing in between keeps the entry it just wrote.
         with data.editing_overrides(PUSHED_OVERRIDES_FILE) as pushed:
-            for num, status in caught_up.items():
-                if pushed.get(num) == status:
+            for num, value in caught_up.items():
+                if pushed.get(num) == value:
                     del pushed[num]
 
 
@@ -192,8 +202,9 @@ def push_pending(career_ops: Path) -> dict:
         # Persist dispatched overrides so they survive Refresh and restarts until
         # the pipeline produces a new artifact that already has the correct statuses.
         with data.editing_overrides(PUSHED_OVERRIDES_FILE) as pushed:
-            # The overlay is status-only: the board compares a row's status to it.
-            pushed.update({num: data.override_status(v) for num, v in cloud_payload.items()})
+            # A status, or {status, note} for a by-hand mark the overlay must
+            # keep showing until the row carries it (data.pushed_overlay_value).
+            pushed.update({num: data.pushed_overlay_value(v) for num, v in cloud_payload.items()})
     elif stale_discards:
         # Nothing resolved to dispatch, but still drop the dead Discard overrides.
         data.clear_status_overrides({k: overrides[k] for k in stale_discards})

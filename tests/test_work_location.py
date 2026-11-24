@@ -324,6 +324,43 @@ class TestNewestMarkWins:
         assert work_location_from_notes(notes) == WorkLocation()
 
 
+class TestAMarkThatOpensAReEvaluation:
+    """An addition with no req id or URL carries its Work location mark FIRST,
+    and mergeNotes writes the addition's cell after the marker's `: ` (joined
+    with `; ` after a cell ending in a location label, which is upstream's own
+    "a Location label runs to the next semicolon" rule). That `: ` is a clause
+    start — the one `work_location.NOTES_CLAUSE_START` the Decision mark is
+    anchored by too — or the newest mark is never seen and the older one wins."""
+
+    OLD = "https://x.example/1 — Work location: On-site Chicago, IL — APPLY first"
+
+    @pytest.mark.parametrize("marker", [
+        "Re-eval 2026-09-12 (4.1→4.8)",
+        "Re-eval 2026-09-12 (4.8→4.1) — Superseded report [12] (was 4.8/5)",
+    ])
+    def test_it_is_the_newest_mark(self, marker):
+        notes = f"{self.OLD}; {marker}: Work location: Remote — APPLY re-eval"
+        assert work_location_from_notes(notes).mode == MODE_REMOTE
+        assert area_verdict(work_location_from_notes(notes), DFW) == ""
+
+    def test_a_sentence_after_the_marker_is_still_not_a_mark(self):
+        notes = f"{self.OLD}; Re-eval 2026-09-12 (4.1→4.8): flexible work location: negotiable"
+        assert work_location_from_notes(notes).metro == "Chicago, IL"
+
+    @pytest.mark.parametrize("tail", [
+        "; Re-eval 2026-11-01 (3.0→4.0): req 1 — https://x.example/2 — APPLY",
+        "; Re-eval 2026-11-01 (3.0→3.0)",
+    ], ids=["with-notes", "bare"])
+    def test_a_mark_that_ends_the_cell_keeps_its_place_after_a_re_eval(self, tail):
+        """The label trips mergeNotes' location rule, so a cell that ENDS with
+        the mark is joined with "; " — the value must stop there, or it
+        swallows the re-eval clause and the role stops being demoted (#180)."""
+        notes = "req 1 — https://x.example/1 — Work location: On-site Chicago, IL" + tail
+        assert work_location_from_notes(notes) == work_location_from_notes(
+            "req 1 — https://x.example/1 — Work location: On-site Chicago, IL")
+        assert area_verdict(work_location_from_notes(notes), DFW) != ""
+
+
 class TestConfidenceLimits:
     """Everything this module declines to judge, and why. The asymmetry it is
     built on — a missed demotion is today's behaviour, a wrong one buries a role

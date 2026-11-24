@@ -104,7 +104,9 @@ def world(tmp_path):
                   "APPLY — strong Java match https://www.indeed.com/viewjob?jk=abc123")
            + _row(3, "Globex", "Platform Engineer", "4.2/5", "Evaluated", "003",
                   "CONSIDER: on-site https://www.linkedin.com/jobs/view/999")
-           + _row(4, "Initech", "Staff Engineer", "4.9/5", "Evaluated", "004", "SKIP despite score")
+           # The Skip carries the mark `write_job_result` now writes (#183).
+           + _row(4, "Initech", "Staff Engineer", "4.9/5", "Evaluated", "004",
+                  "Decision: Skip — SKIP despite score")
            + _row(5, "Umbrella", "Engineer", "3.1/5", "Evaluated", "", "no report"))
     return root, manifest
 
@@ -176,7 +178,9 @@ class TestSelection:
         assert [i.company for i in d.items] == ["Acme", "Globex"]
         assert d.evaluated == 3          # 002, 003, 004 minted this run
         assert d.qualifying == 2
-        assert d.open == 5
+        # Every Evaluated row but Initech: an evaluator Skip is not in the
+        # queue the work-order offers, so the count does not claim it (#183).
+        assert d.open == 4
 
     def test_rewritten_report_counts_as_new(self, world):
         """A retried job rewrites its file under the same name; a path-set
@@ -198,6 +202,25 @@ class TestSelection:
 
     def test_skip_decision_is_excluded_above_min_score(self, world):
         root, manifest = world
+        assert "Initech" not in [i.company for i in _build(root, manifest).items]
+
+    def test_the_rows_mark_is_read_first(self, world):
+        """#183: `skip_decided` is the field the work-order and the selector
+        exclude by, so the digest reads it too — without a report it can parse."""
+        root, manifest = world
+        (root / "reports" / "004-initech-2026-09-09.md").write_text(
+            "# Evaluacion: Initech\n\nNo summary.\n", encoding="utf-8")
+        assert "Initech" not in [i.company for i in _build(root, manifest).items]
+
+    def test_a_row_with_no_mark_falls_back_to_the_report(self, world):
+        """A row with no live mark — a Skip re-eval whose Notes repeated an older
+        clause, which merge-tracker writes as a bare marker, or a `--batch` row
+        career-ops' own runner merged before any sanitizer saw it — whose report
+        still says Skip."""
+        root, manifest = world
+        apps = root / "data" / "applications.md"
+        apps.write_text(apps.read_text(encoding="utf-8").replace(
+            "Decision: Skip — SKIP despite score", "SKIP despite score"), encoding="utf-8")
         assert "Initech" not in [i.company for i in _build(root, manifest).items]
 
     def test_unscoreable_row_does_not_qualify(self, world):
@@ -294,6 +317,18 @@ class TestVerdict:
         ("APPLY q. Closed 2026-08-02 (liveness re-check: 404)", "APPLY q."),
         ("APPLY y Reopened 2026-08-03 (re-posted and re-evaluated)", "APPLY y"),
         ("APPLY z Set Applied 2026-08-04 (by hand)", "APPLY z"),
+        ("https://x/a — Work location: On-site Dallas, TX — Decision: Skip — SKIP weak fit",
+         "SKIP weak fit"),
+        # A mark that opens a re-evaluation's cell is anchored on its "Re-eval
+        # …: ", so the marks are stripped before the marker is.
+        ("https://x/1 — Work location: On-site Dallas, TX — CONSIDER ok; Re-eval 2026-11-01"
+         " (3.0→4.2): Work location: Remote — APPLY strong", "CONSIDER ok; APPLY strong"),
+        ("https://x/1 — Decision: Skip — weak. Re-eval 2026-11-01 (3.0→4.2): Decision: Skip"
+         " — weak2. Re-eval 2026-11-02 (4.2→4.5): APPLY", "weak. weak2. (4.2→4.5): APPLY"),
+        # A lifted row re-evaluated later: the by-hand mark sat just before the
+        # "; Re-eval" join, and stripping it left a dash before the ";".
+        ("https://x/j — Decision: Skip — SKIP — weak fit — Set Evaluated 2026-11-24 (by hand);"
+         " Re-eval 2026-11-25 (2.0→2.1): APPLY", "SKIP — weak fit; (2.0→2.1): APPLY"),
         ("", ""),
     ])
     def test_marks_and_urls_are_stripped(self, notes, want):
@@ -335,7 +370,7 @@ class TestVerdict:
 
 # ── Content + health ─────────────────────────────────────────────────────────
 
-HEALTH = "3 evaluated this run · 2 at ≥ 4.0 · 5 open in your queue"
+HEALTH = "3 evaluated this run · 2 at ≥ 4.0 · 4 open in your queue"
 
 
 class TestContent:
@@ -808,7 +843,7 @@ class TestMain:
         assert doc["min_score"] == 4.5 and doc["limit"] == 5 and doc["always"] is False
         assert doc["run_url"] == "https://gh/run/7" and doc["failed"] is False
         assert [i["company"] for i in doc["items"]] == ["Acme"]
-        assert doc["evaluated"] == 3 and doc["open"] == 5 and doc["qualifying"] == 1
+        assert doc["evaluated"] == 3 and doc["open"] == 4 and doc["qualifying"] == 1
         assert doc["content"].endswith("Open the board")
         assert doc["should_send"] is True and doc["attachment_chars"] > 0
         assert "attachment_text" not in doc

@@ -50,12 +50,15 @@ from pipeline._batch_common import (
     write_job_result,
     write_process_lock,
     _report_location_mark,
-    _pending_location_mark,
+    _pending_report_marks,
     _row_report,
 )
 from pipeline._batch_common import (   # the #163 marks, a separate block on purpose
     _liveness_closed_rows, _reopen_reposted, by_hand_mark, closed_by_recheck,
     liveness_closed_mark, reopened_mark,
+)
+from pipeline._batch_common import (   # the #183 mark
+    DECISION_SKIP_MARK, _report_marks, is_skip_decision, skip_decided,
 )
 from pipeline import _batch_common
 from tests.conftest import tracker_row
@@ -2386,7 +2389,7 @@ class TestSetReportLink:
 class TestDeadLinkRepair:
     """`_dead_link_repair` takes the row's already-resolved report, because
     `_sanitize_pending_additions` resolves it once and shares it with
-    `_pending_location_mark` — a dead link sends `resolve_report` through a full
+    `_pending_report_marks` — a dead link sends `resolve_report` through a full
     `reports/` glob, and two independent callers meant two scans per addition.
     These drive the real composition rather than a two-argument shorthand."""
 
@@ -3381,7 +3384,7 @@ class TestWorkLocationMark:
         (tmp_path / "reports").mkdir()
         (tmp_path / "reports" / "047-ucan-2026-09-14.md").write_text(
             self._report(), encoding="utf-8")
-        assert _pending_location_mark(self.ROW, _row_report(tmp_path, self.ROW)) == "Work location: On-site Chicago, IL"
+        assert _pending_report_marks(self.ROW, _row_report(tmp_path, self.ROW)) == ("Work location: On-site Chicago, IL", "")
 
     def test_a_dead_report_link_still_finds_its_report(self, tmp_path):
         """The Report cell is model-authored (#162), so the slug may name no file;
@@ -3390,8 +3393,238 @@ class TestWorkLocationMark:
         (tmp_path / "reports" / "047-ucan-2026-09-14.md").write_text(
             self._report(), encoding="utf-8")
         dead = self.ROW.replace("047-ucan-2026-09-14.md", "047-ucan-&-co-2026-09-14.md")
-        assert _pending_location_mark(dead, _row_report(tmp_path, dead)) == "Work location: On-site Chicago, IL"
+        assert _pending_report_marks(dead, _row_report(tmp_path, dead)) == ("Work location: On-site Chicago, IL", "")
 
     def test_no_report_means_no_mark(self, tmp_path):
         (tmp_path / "reports").mkdir()
-        assert _pending_location_mark(self.ROW, _row_report(tmp_path, self.ROW)) == ""
+        assert _pending_report_marks(self.ROW, _row_report(tmp_path, self.ROW)) == ("", "")
+
+
+class TestDecisionSkipMark:
+    """#183: the evaluator's `final_decision: Skip` is recorded on the row, the
+    way #180 records where the job is, so the work-order and the role selector —
+    which never open reports — can leave the role out. Only a Skip is marked:
+    nothing any reader does changes for Apply, Consider or Research first."""
+
+    ROW = ("12\t2026-11-20\tInitech\tClaims Analyst\tEvaluada\t2.6/5\tnull\t"
+           "[047](reports/047-initech-2026-11-20.md)\tSKIP weak claims match")
+
+    @staticmethod
+    def _report(decision="Skip", work_location=True):
+        return ("# Evaluacion\n\n## Machine Summary\n\n```yaml\n"
+                f'final_decision: "{decision}"\n'
+                + ('work_location:\n  mode: "onsite"\n  metro: "Dallas, TX"\n  state: "TX"\n'
+                   if work_location else "")
+                + "hard_stops: []\n```\n")
+
+    def _write(self, tmp_path, decision):
+        reports, additions = tmp_path / "reports", tmp_path / "additions"
+        reports.mkdir(); additions.mkdir()
+        response = (f"<report>{self._report(decision)}</report>"
+                    f"<tracker_tsv>{self.ROW}</tracker_tsv>"
+                    '<summary>{"status": "completed", "company": "Initech"}</summary>')
+        write_job_result(response, {"id": "j1", "report_num": "047",
+                                    "url": "https://x.example/47"},
+                         reports, additions, "2026-11-20")
+        return _data_cells(additions / "j1.tsv")[8]
+
+    def test_write_job_result_marks_a_skip(self, tmp_path):
+        notes = self._write(tmp_path, "Skip")
+        assert DECISION_SKIP_MARK in notes and skip_decided(notes)
+
+    @pytest.mark.parametrize("decision", ["Apply", "Consider", "Research first"])
+    def test_and_nothing_else(self, tmp_path, decision):
+        notes = self._write(tmp_path, decision)
+        assert "Decision:" not in notes and not skip_decided(notes)
+
+    @pytest.mark.parametrize("value, want", [
+        ("Skip", True), ("skip", True), ("SKIP - weak match", True), (["Skip"], True),
+        ("Consider", False), ("", False), (None, False), ([], False),
+    ])
+    def test_the_one_reading_of_final_decision(self, value, want):
+        assert is_skip_decision(value) is want
+
+    def test_a_report_with_no_summary_earns_no_mark(self):
+        assert _report_marks("# Evaluacion\n\nNo summary here.") == ("", "")
+
+    def test_one_parse_yields_both_marks(self, mocker):
+        """The writer and the merge-time pass each want both marks of one report,
+        and the YAML parse is the cost the merge-time pass's guard exists to
+        avoid, so one call parses the Machine Summary once."""
+        spy = mocker.spy(_batch_common, "parse_machine_summary")
+        assert _report_marks(self._report()) == (
+            "Work location: On-site Dallas, TX", DECISION_SKIP_MARK)
+        assert spy.call_count == 1
+
+    def test_the_mark_lands_after_the_url_the_req_id_and_the_location(self):
+        out = sanitize_addition(self.ROW, "https://x.example/47", "Job ID: 88214",
+                                work_location="Work location: On-site Dallas, TX",
+                                decision=DECISION_SKIP_MARK)
+        notes = out.split("\t")[-1]
+        assert (notes.index("req ") < notes.index("https://") < notes.index("Work location:")
+                < notes.index(DECISION_SKIP_MARK) < notes.index("SKIP weak"))
+
+    def test_it_is_idempotent(self):
+        """sanitize_addition runs at two points; a second pass must not grow a
+        second mark — TestSanitizeAddition's rule, with the new step in it."""
+        kw = dict(work_location="Work location: On-site Dallas, TX", decision=DECISION_SKIP_MARK)
+        once = sanitize_addition(self.ROW, "https://x.example/47", "Job ID: 88214", **kw)
+        twice = sanitize_addition(once, "https://x.example/47", "Job ID: 88214", **kw)
+        assert once == twice and twice.count(DECISION_SKIP_MARK) == 1
+
+    def test_a_cell_the_mark_opens_is_idempotent_too(self):
+        """No URL, req id or location to land after: the mark opens the cell, and
+        the guard must still find it there."""
+        once = sanitize_addition(self.ROW, decision=DECISION_SKIP_MARK)
+        assert once.split("\t")[-1].startswith(DECISION_SKIP_MARK)
+        assert sanitize_addition(once, decision=DECISION_SKIP_MARK) == once
+
+    def test_a_batch_row_gets_both_marks_from_the_report_it_links(self, tmp_path):
+        """The `--batch` path, as for the Work location mark: one report read
+        yields both, since they come from the same Machine Summary."""
+        (tmp_path / "reports").mkdir()
+        (tmp_path / "reports" / "047-initech-2026-11-20.md").write_text(
+            self._report(), encoding="utf-8")
+        assert _pending_report_marks(self.ROW, _row_report(tmp_path, self.ROW)) == (
+            "Work location: On-site Dallas, TX", DECISION_SKIP_MARK)
+
+    def test_a_marked_skip_is_not_read_again(self, tmp_path):
+        """A Decision mark is the evidence the row's writer read its report: that
+        writer wrote the Work location mark from the same Machine Summary."""
+        (tmp_path / "reports").mkdir()
+        (tmp_path / "reports" / "047-initech-2026-11-20.md").write_text(
+            self._report(), encoding="utf-8")
+        row = self.ROW.replace(
+            "\tSKIP", f"\tWork location: On-site Dallas, TX — {DECISION_SKIP_MARK} — SKIP")
+        assert _pending_report_marks(row, _row_report(tmp_path, row)) == ("", "")
+
+    def test_a_pre_183_addition_gets_its_decision_at_merge_time(self, tmp_path):
+        """A Work location mark is NOT that evidence: `write_job_result` before
+        #183 wrote it and no Decision mark, and its additions can still be
+        pending after the upgrade (a merge that failed leaves them for the next).
+        The report is read, the Skip is marked, and the Work location mark the
+        row already carries is not written a second time."""
+        co = tmp_path / "co"
+        (co / "reports").mkdir(parents=True)
+        (co / "reports" / "047-initech-2026-11-20.md").write_text(self._report(), encoding="utf-8")
+        additions = co / "batch" / "tracker-additions"
+        additions.mkdir(parents=True)
+        row = self.ROW.replace("\tSKIP", "\thttps://x.example/47 — Work location: On-site Dallas, TX — SKIP")
+        (additions / "5.tsv").write_text(row + "\n", encoding="utf-8")
+        _sanitize_pending_additions(co, additions)
+        notes = _data_cells(additions / "5.tsv")[8]
+        assert skip_decided(notes)
+        assert notes.count("Work location:") == 1 and notes.count(DECISION_SKIP_MARK) == 1
+
+    def test_the_merge_time_pass_writes_it_onto_a_batch_row(self, tmp_path):
+        co = tmp_path / "co"
+        (co / "reports").mkdir(parents=True)
+        (co / "reports" / "047-initech-2026-11-20.md").write_text(self._report(), encoding="utf-8")
+        additions = co / "batch" / "tracker-additions"
+        additions.mkdir(parents=True)
+        (additions / "5.tsv").write_text(self.ROW + "\n", encoding="utf-8")
+        _sanitize_pending_additions(co, additions)
+        assert skip_decided(_data_cells(additions / "5.tsv")[8])
+
+
+class TestSkipDecidedReading:
+    """`skip_decided` is the verdict every reader acts on, derived per read from
+    the marks in Notes — the newest one that bears on it wins, for the reason
+    `work_location_from_notes` gives: merge-tracker keeps old Notes first."""
+
+    BASE = "req 88214 — https://x.example/47 — Work location: On-site Dallas, TX"
+
+    def test_the_mark_alone(self):
+        assert skip_decided(f"{self.BASE} — {DECISION_SKIP_MARK} — SKIP weak match")
+        assert skip_decided(DECISION_SKIP_MARK)                     # a cell with nothing else
+        assert not skip_decided(f"{self.BASE} — APPLY strong match")
+        assert not skip_decided("")
+
+    @pytest.mark.parametrize("notes", [
+        # Mid-clause: an ordinary sentence the model writes in that cell.
+        "https://x.example/47 — SKIP: the final decision: Skip unless remote is offered",
+        "https://x.example/47 — CONSIDER, decision: Skip if the pay is low",
+        # Clause-leading, but not our spelling.
+        "https://x.example/47 — decision: skip — weak match",
+        "https://x.example/47 — Decision: Skipped for now",
+    ])
+    def test_a_model_sentence_is_not_the_mark(self, notes):
+        assert not skip_decided(notes)
+
+    def test_a_re_evaluation_retires_it(self):
+        """The update tier appends the new evaluation after a `Re-eval` marker;
+        an Apply writes no mark of its own, so the old Skip must not outlive it."""
+        notes = (f"{self.BASE} — {DECISION_SKIP_MARK} — SKIP weak. "
+                 f"Re-eval 2026-11-22 (2.6→4.3): {self.BASE} — APPLY better fit")
+        assert not skip_decided(notes)
+
+    def test_a_re_evaluation_that_skips_again_is_a_skip(self):
+        notes = (f"{self.BASE} — APPLY. Re-eval 2026-11-22 (4.3→2.4): "
+                 f"{self.BASE} — {DECISION_SKIP_MARK} — SKIP now")
+        assert skip_decided(notes)
+
+    @pytest.mark.parametrize("tail", [
+        ". Re-eval 2026-11-22 (2.6→2.6)",
+        # A downgrade's marker carries the superseded report, still bare.
+        ". Re-eval 2026-11-22 (2.6→2.4) — Superseded report [31] (was 2.6/5)",
+        # …and a sighting note after it has a colon of its own to reach for.
+        ". Re-eval 2026-11-22 (2.6→2.4) — Superseded report [31] (was 2.6/5). "
+        "Also listed at https://agg.example/9",
+        "; Re-eval 2026-11-22 (2.6→2.6)",
+        # One of OUR later " — " clauses after a bare marker: its colon is not
+        # the marker's ": " (only mergeNotes' Superseded-report text sits there).
+        "; Re-eval 2026-11-01 (3.0→3.0) — Closed 2026-11-05 (liveness re-check: posting 404)",
+        ". Re-eval 2026-11-01 (3.0→3.0) — Work location: On-site Chicago, IL",
+    ])
+    def test_a_bare_re_eval_marker_does_not_retire_it(self, tail):
+        """mergeNotes writes the marker BARE when the new notes repeat a clause
+        already in the cell — a Skip re-evaluated to the same cell. That is no
+        newer verdict, and reading it as one queued the Skip again."""
+        assert skip_decided(f"{self.BASE} — {DECISION_SKIP_MARK} — SKIP weak{tail}")
+
+    def test_a_re_eval_that_carries_notes_past_a_superseded_report_retires_it(self):
+        notes = (f"{self.BASE} — {DECISION_SKIP_MARK} — SKIP weak. Re-eval 2026-11-22 "
+                 f"(2.6→2.4) — Superseded report [31] (was 2.6/5): {self.BASE} — CONSIDER")
+        assert not skip_decided(notes)
+
+    @pytest.mark.parametrize("marker", [
+        "Re-eval 2026-11-22 (4.3→2.4)",
+        "Re-eval 2026-11-22 (4.3→2.4) — Superseded report [31] (was 4.3/5)",
+    ])
+    def test_a_mark_that_opens_the_re_evaluations_cell_is_read(self, marker):
+        """A row with no req id, URL or Work location mark puts the Decision mark
+        FIRST in its cell, and mergeNotes writes that cell after the marker's
+        `: ` — a clause start, or the mark is not seen at all."""
+        notes = f"https://x.example/47 — APPLY. {marker}: {DECISION_SKIP_MARK} — SKIP now"
+        assert skip_decided(notes)
+
+    @pytest.mark.parametrize("cell", [
+        "the final decision: Skip unless remote",
+        "Decision: Skipped for now",
+    ])
+    def test_after_a_marker_a_model_sentence_is_still_not_the_mark(self, cell):
+        notes = f"https://x.example/47 — APPLY. Re-eval 2026-11-22 (4.3→2.4): {cell}"
+        assert not skip_decided(notes)
+
+    def test_the_converse_repeat_is_the_documented_misread(self):
+        """What reading a bare marker as "no change" costs: Apply → Skip → an
+        Apply that repeats the FIRST evaluation word for word stays a Skip. Rarer
+        than the identical Skip re-evaluation it fixes, and the by-hand lift
+        recovers it — pinned so a change to the trade is a decision."""
+        notes = (f"{self.BASE} — APPLY. Re-eval 2026-11-21 (4.3→2.4): {self.BASE} — "
+                 f"{DECISION_SKIP_MARK} — SKIP now. Re-eval 2026-11-22 (2.4→4.3)")
+        assert skip_decided(notes)
+
+    def test_a_status_set_by_hand_lifts_it(self):
+        notes = f"{self.BASE} — {DECISION_SKIP_MARK} — SKIP weak"
+        lifted = f"{notes} — {by_hand_mark('2026-11-23', 'Interview')}"
+        assert skip_decided(notes) and not skip_decided(lifted)
+
+    def test_the_rechecks_marks_do_not_bear_on_it(self):
+        """Closed and Reopened are about the POSTING, not the evaluator's verdict
+        on the role: a reopened re-post is re-evaluated, and that re-evaluation's
+        own marks after its `Re-eval` marker decide."""
+        notes = (f"{self.BASE} — {DECISION_SKIP_MARK} — SKIP weak — "
+                 f"{liveness_closed_mark('2026-11-21', 'HTTP 404')}")
+        assert skip_decided(notes)
+        assert skip_decided(f"{notes} — {reopened_mark('2026-11-22')}")

@@ -20,6 +20,7 @@ from pipeline._batch_common import (
     _report_int,
     _report_link,
     ADDITION_COLUMNS,
+    BY_HAND_RE,
     acquire_process_lock,
     atomic_write_text,
     by_hand_mark,
@@ -33,9 +34,12 @@ from pipeline._batch_common import (
     read_url_set,
     release_process_lock,
     score_value,
+    skip_decided,
 )
 from pipeline import tracker_layout
-from pipeline.work_location import area_verdict, commutable_area, work_location_from_notes
+from pipeline.work_location import (
+    REEVAL_MARK_RE, area_verdict, commutable_area, work_location_from_notes,
+)
 from pipeline.tracker_layout import (
     CANONICAL_COLUMNS,
     SEPARATOR_RE as _SEPARATOR_RE,
@@ -193,6 +197,41 @@ def clear_status_overrides(snapshot: dict, path: Path | None = None) -> None:
         pass
 
 
+def apply_override_note(row: dict, note: str) -> None:
+    """Show a pending or pushed override's Notes mark on a row before the
+    tracker carries it: the fields a mark decides are re-derived on the row's
+    Notes plus that mark, the way the parser would derive them once it lands.
+    Today that is the evaluator-Skip lift (#183): a by-hand status write on a
+    `Decision: Skip` row records "Set <Status> … (by hand)", and until the
+    artifact carries it the tag would stay on the card the person just moved."""
+    if note and row.get("skip_decided"):
+        row["skip_decided"] = skip_decided(f"{row.get('notes') or ''} — {note}")
+
+
+def pushed_overlay_value(value):
+    """What the pushed overlay keeps for a dispatched override: its status,
+    plus its note only when that note is a by-hand mark. A by-hand lift of an
+    evaluator Skip (#183) sets the status the row already has, so status alone
+    would count it caught up at once; every other entry keeps the status-only
+    shape and catch-up it always had, so a note that never lands in the cloud
+    (#254) cannot pin a status on the row."""
+    note = override_note(value)
+    if note and BY_HAND_RE.search(note):
+        return {"status": override_status(value), "note": note}
+    return override_status(value)
+
+
+def note_landed(row_notes: str, note: str) -> bool:
+    """Whether the tracker now carries `note`. Contained, not an exact " — "
+    clause: the cloud appends the mark at the END of the cell, and
+    merge-tracker joins a later re-evaluation straight onto it with ". " or
+    "; " (its location rule fires on nearly every row), so the clause becomes
+    "Set Evaluated … (by hand); Re-eval …" and an exact match would hold the
+    entry in the pushed overlay for good. The mark carries its date, so
+    containment does not match an older lift."""
+    return bool(note) and note in (row_notes or "")
+
+
 def override_matches_row(value, row: dict) -> bool:
     """Whether an identity-anchored override targets this tracker row (matched
     by normalized company, and role when the anchor carries one). Plain-string
@@ -253,8 +292,14 @@ def by_hand_note_for(row_notes: str, status: str, today: str | None = None) -> s
     bounced the person's Discard back to Evaluated, and nothing could confirm a
     re-check Discard as final. Only such a row gets the mark — re-selecting
     Discarded on it IS the confirmation — and an ordinary drag stays unmarked,
-    so Notes do not grow a clause per drag."""
-    if not closed_by_recheck(row_notes or ""):
+    so Notes do not grow a clause per drag.
+
+    A row the evaluator decided to Skip (#183) is the same case from the other
+    side: `skip_decided` keeps it out of the work-order and the selector until
+    something newer than the model's verdict says otherwise, and a person
+    setting its status by hand is that — the mark is what lets the next read
+    see the person rather than the model."""
+    if not (closed_by_recheck(row_notes) or skip_decided(row_notes)):
         return ""
     return by_hand_mark(today or date.today().isoformat(), status)
 
@@ -589,14 +634,6 @@ def _realign_cells(cells: list[str], columns: list[str]) -> list[str]:
 _NOTES_URL_RE = re.compile(r"https?://\S+")
 
 
-# merge-tracker's re-evaluation marker. merge-tracker keeps a row's existing
-# Notes verbatim and FIRST and appends `Re-eval DATE (a→b)[ — …]: {new notes}`
-# after them; the older script replaced the cell with the marker leading. Under
-# both, the posting the row's NEWEST evaluation looked at is the first URL
-# after the last marker.
-_REEVAL_MARK_RE = re.compile(r"\bRe-eval \d{4}-\d{2}-\d{2}")
-
-
 def extract_url(notes: str) -> str:
     """The posting URL of a Notes cell — the first URL of its newest evaluation
     — or "" if none. Shared by the apply queue (pick a posting to apply to),
@@ -609,9 +646,11 @@ def extract_url(notes: str) -> str:
     (re-Discarding a role the merge had just reopened) and the browser agent
     to a 404. A re-eval clause with no URL of its own — upstream elides notes
     that repeat an existing clause — falls back to the first URL, which is
-    then the same one."""
+    then the same one. The marker is `work_location.REEVAL_MARK_RE`, the one
+    spelling of it every Notes reader builds on — `skip_decided` reads the
+    newest evaluation through it too."""
     notes = notes or ""
-    start = max((m.end() for m in _REEVAL_MARK_RE.finditer(notes)), default=0)
+    start = max((m.end() for m in REEVAL_MARK_RE.finditer(notes)), default=0)
     m = _NOTES_URL_RE.search(notes, start) or _NOTES_URL_RE.search(notes)
     return m.group(0).rstrip(".,);]") if m else ""
 
@@ -632,9 +671,11 @@ def parse_applications(applications_md: Path, *, commutable=None) -> list[dict]:
     Each dict has the _COLUMNS keys plus a derived `report_num` and
     `report_path` extracted from the Report cell's markdown link, a
     `score_value` float (parsed from the "X.X/5" Score cell, or None), an
-    `easy_apply` bool (its Notes URL is in the sibling easy-apply-urls.txt), and
-    an `area` string — the out-of-area label (#180) when the row's recorded work
-    location is outside the candidate's commutable metros, "" otherwise.
+    `easy_apply` bool (its Notes URL is in the sibling easy-apply-urls.txt), an
+    `area` string — the out-of-area label (#180) when the row's recorded work
+    location is outside the candidate's commutable metros, "" otherwise — and a
+    `skip_decided` bool, the evaluator's own Skip (#183) read off the row's
+    `Decision: Skip` mark (`_batch_common.skip_decided`).
     Returns [] if the file is missing or has no data rows."""
     if not applications_md.exists():
         return []
@@ -645,15 +686,26 @@ def parse_applications(applications_md: Path, *, commutable=None) -> list[dict]:
     )
 
 
-def _area_for(notes: str, commutable) -> str:
-    """The #180 out-of-area label for one row, from the `Work location:` mark the
-    evaluation wrote into its Notes. One helper because both parsers below
-    produce the same row shape and the UI ranks whichever it gets.
+def _derive_fields(row: dict, *, easy_apply_urls: set[str], commutable,
+                   vocabulary: tuple | None = None) -> dict:
+    """Set the fields every reader ranks or filters on, derived from one row's
+    cells. One helper because both parsers below produce the same row shape and
+    the UI ranks whichever it gets, so a field added for one reaches the other.
 
-    No empty-`commutable` guard: `out_of_area` already answers False when there
-    are no commutable states, and restating that rule here would be a second
-    place for "the gate is off" to be decided."""
-    return area_verdict(work_location_from_notes(notes), commutable)
+    `area` is the #180 out-of-area label, from the `Work location:` mark the
+    evaluation wrote into Notes. No empty-`commutable` guard: `out_of_area`
+    already answers False when there are no commutable states, and restating
+    that rule here would be a second place for "the gate is off" to be decided."""
+    notes = row.get("notes", "")
+    # The Report link cell → report number + path.
+    row["report_num"], row["report_path"] = _report_link(row.get("report", ""))
+    # The leading float of "4.2/5" → 4.2, for sorting.
+    row["score_value"] = score_value(row.get("score", ""))
+    row["status_canonical"] = canonical_status(row.get("status", ""), vocabulary)
+    row["easy_apply"] = extract_url(notes) in easy_apply_urls
+    row["area"] = area_verdict(work_location_from_notes(notes), commutable)
+    row["skip_decided"] = skip_decided(notes)
+    return row
 
 
 def parse_applications_text(text: str, *, easy_apply_urls: set[str] | None = None,
@@ -676,7 +728,11 @@ def parse_applications_text(text: str, *, easy_apply_urls: set[str] | None = Non
     trackers: that path compares cells, a derived field is not one, and
     resolving a search config off env and disk would make a documented pure
     merge depend on both. `parse_applications`, the file entry point every
-    ranking caller uses, is where the default flips to "resolve it"."""
+    ranking caller uses, is where the default flips to "resolve it".
+
+    `skip_decided` (#183) is derived here on the same terms and needs no config:
+    the Notes mark is the fact, the newest-mark rule the verdict, so the
+    work-order, the selector, the digest and the UI cannot disagree about it."""
     easy_apply_urls = easy_apply_urls or set()
     vocabulary = _load_states()
     rows: list[dict] = []
@@ -686,18 +742,8 @@ def parse_applications_text(text: str, *, easy_apply_urls: set[str] | None = Non
         if len(cells) > len(columns):
             cells = _realign_cells(cells, columns)
 
-        row = dict(zip(columns, cells))
-
-        # Derive report number + path from the Report link cell.
-        row["report_num"], row["report_path"] = _report_link(row.get("report", ""))
-
-        # Parse the leading float out of "4.2/5" → 4.2 for sorting.
-        row["score_value"] = score_value(row.get("score", ""))
-        row["status_canonical"] = canonical_status(row.get("status", ""), vocabulary)
-        row["easy_apply"] = extract_url(row.get("notes", "")) in easy_apply_urls
-        row["area"] = _area_for(row.get("notes", ""), commutable)
-
-        rows.append(row)
+        rows.append(_derive_fields(dict(zip(columns, cells)), easy_apply_urls=easy_apply_urls,
+                                   commutable=commutable, vocabulary=vocabulary))
 
     return rows
 
@@ -961,15 +1007,12 @@ def parse_tracker_additions(tracker_dir: Path) -> list[dict]:
     # works in this fallback path too (career-ops/data is a sibling of batch/).
     easy_apply_urls = load_easy_apply_urls(tracker_dir.parent.parent / "data")
     commutable = commutable_area()
+    vocabulary = _load_states()
     rows: list[dict] = []
     for f in tracker_dir.glob("*.tsv"):
         for row in _addition_records(read_addition(f)):
-            row["report_num"], row["report_path"] = _report_link(row.get("report", ""))
-            row["score_value"] = score_value(row.get("score", ""))
-            row["status_canonical"] = canonical_status(row.get("status", ""))
-            row["easy_apply"] = extract_url(row.get("notes", "")) in easy_apply_urls
-            row["area"] = _area_for(row.get("notes", ""), commutable)
-            rows.append(row)
+            rows.append(_derive_fields(row, easy_apply_urls=easy_apply_urls,
+                                       commutable=commutable, vocabulary=vocabulary))
     rows.sort(key=lambda r: _safe_int(r.get("num")))
     return rows
 

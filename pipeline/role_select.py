@@ -50,6 +50,11 @@ def select(
     queued roles were. The verdict rides in on the row (`data.parse_applications`
     derives it), so this is an ordering change, not a second rule.
 
+    A role the evaluator decided to Skip (#183) is not returned at all, on the
+    same terms: `skip_decided` is on the row, so the money is not spent on a
+    role the evaluation itself said not to apply to, and nothing here opens the
+    report to find that out.
+
     min_score: skip rows scoring below this (rows with no score are skipped).
     limit: cap the number returned (0 = no cap).
     applications_md: tracker to read; defaults to career_ops/data/applications.md
@@ -59,7 +64,7 @@ def select(
 
     jobs: list[ApplyJob] = []
     for row in rows:
-        if row.get("status_canonical") not in _PENDING_STATUSES:
+        if row.get("status_canonical") not in _PENDING_STATUSES or row.get("skip_decided"):
             continue
         score = row.get("score_value")
         if score is None or score < min_score:

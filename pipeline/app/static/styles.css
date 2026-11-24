@@ -516,8 +516,10 @@ tbody tr.selected { background: #233047; }
 /* #180: a role whose recorded work location is outside the candidate's search
    area. Muted rather than alarming — the role is demoted and labelled, never
    removed, because someone may genuinely relocate. Matches .status-badge's
-   shape so it reads as one of the row's tags, not as an error. */
-.area-tag {
+   shape so it reads as one of the row's tags, not as an error. The evaluator's
+   Skip tag (#183) shares the look for the same reason: the role is shown and
+   labelled, not removed. */
+.area-tag, .skip-tag {
   display: inline-block;
   margin-left: 6px;
   font-size: 11px;

@@ -78,17 +78,19 @@ from pipeline._batch_common import (
     ABANDONED,
     APPLY_MIN_SCORE,
     BATCH_API_STATE,
+    DECISION_SKIP_RE,
     SCORE_BANDS,
     LIVENESS_CLOSED_RE,
     RESERVED_REPORT_SUFFIX,
     _report_int,
     env_float,
     env_int,
+    is_skip_decision,
     load_state,
     parse_machine_summary,
 )
 from pipeline.app import data
-from pipeline.work_location import OUT_OF_AREA_TAG, WORK_LOCATION_RE
+from pipeline.work_location import OUT_OF_AREA_TAG, REEVAL_MARK_RE, WORK_LOCATION_RE
 from pipeline.stdio import line_buffer_stdout
 
 # ── Env contract ─────────────────────────────────────────────────────────────
@@ -165,12 +167,12 @@ DISCORD_MAX_CONTENT = 2000
 HTTP_TIMEOUT = 20
 
 VERDICT_MAX = 300
-DECISION_SKIP = "skip"
 
 # The marks the pipeline appends to a Notes cell (#163) and the URL the bridge
 # stores there. The digest wants the evaluator's one-line verdict, so all of
-# them come out. The URL and Re-eval patterns are `data`'s own, the Closed one
-# is `_batch_common`'s; the two below are spelled here because their sources
+# them come out. The URL pattern is `data`'s own, the Closed and Decision ones
+# are `_batch_common`'s and the Re-eval and Work location ones are
+# `work_location`'s; the two below are spelled here because their sources
 # (`reopened_mark`, `by_hand_mark`) are writers with no matching reader regex
 # that keeps the date.
 _REOPENED_RE = re.compile(r"\bReopened \d{4}-\d{2}-\d{2}(?: \([^)]*\))?", re.I)
@@ -331,12 +333,17 @@ def clean_verdict(notes: str) -> str:
     # after a link belongs to the sentence — `extract_url` trims the same set.
     text = data._NOTES_URL_RE.sub(
         lambda m: m.group(0)[len(m.group(0).rstrip(".,);]")):], text)
-    for pattern in (data._REEVAL_MARK_RE, _CLOSED_FULL_RE, _REOPENED_RE, _BY_HAND_RE,
-                    WORK_LOCATION_RE):
+    # The clause-anchored marks first: a mark that opens a re-evaluation's cell
+    # is anchored on that "Re-eval …: " (NOTES_CLAUSE_START), so stripping the
+    # marker first would leave the mark unanchored and in the verdict.
+    for pattern in (WORK_LOCATION_RE, DECISION_SKIP_RE, REEVAL_MARK_RE, _CLOSED_FULL_RE,
+                    _REOPENED_RE, _BY_HAND_RE):
         text = pattern.sub(" ", text)
     text = " ".join(text.split())
     text = re.sub(r"\s+([,;:.)\]])", r"\1", text)      # no space before punctuation
     text = re.sub(r"\(\s*\)", "", text)                # parens the strip emptied
+    text = re.sub(r"([;.])\s*—\s*", r"\1 ", text)       # a join left where a mark opened a clause
+    text = re.sub(r"\s*—\s*([;.])", r"\1", text)        # …or where one ended it
     # A leading or trailing separator is scaffolding left where a URL or a mark
     # was (`https://… — CONSIDER: …`, `APPLY —`).
     text = re.sub(r"^[\s—:;|,.-]+|[\s—:;|,-]+$", "", text)
@@ -349,6 +356,19 @@ def select_items(rows: list[dict], new_files: dict[int, str], root: Path, *,
     `min_score` or above, still Evaluated, and not a Machine-Summary `Skip` —
     reachable roles first, then by score desc then company, cut at `limit`.
     `dropped` is the tail the limit removed, for the log.
+
+    A Skip is read off the row first — `skip_decided`, from the `Decision:
+    Skip` mark the work-order and the selector exclude by (#183) — and off the
+    report second, for a row whose report decided Skip but which carries no
+    live mark: a Skip re-evaluation whose Notes repeated an OLDER clause, which
+    merge-tracker writes as a bare `Re-eval` marker the row cannot read past
+    (`skip_decided` reads a bare marker as "no change"), a row the sanitizer
+    could not classify, and, when the digest is run locally, a `--batch` row
+    career-ops' own runner merged before any sanitizer saw it. Either one
+    excludes. The report fallback cannot override a person's lift, because it
+    only ever reads a report minted this run: that is the newest word on its
+    role, and a lift reaches the cloud tracker only through `edit-tracker.yml`,
+    which shares the daily's concurrency group and so cannot land inside the run.
 
 The rows arrive with `area` already derived (`build_digest` parses the
     tracker with the run's commutable metros). A role whose recorded work
@@ -366,7 +386,7 @@ The rows arrive with `area` already derived (`build_digest` parses the
         score = row.get("score_value")
         if score is None or score < min_score:
             continue
-        if row.get("status_canonical") != "Evaluated":
+        if row.get("status_canonical") != "Evaluated" or row.get("skip_decided"):
             continue
         rel = new_files[n]
         try:
@@ -374,7 +394,7 @@ The rows arrive with `area` already derived (`build_digest` parses the
         except OSError:
             summary = {}
         decision = _first(summary.get("final_decision"))
-        if decision.lower().startswith(DECISION_SKIP):
+        if is_skip_decision(decision):
             continue
 
         items.append(DigestItem(
@@ -584,7 +604,9 @@ def build_digest(root: Path, manifest: Path, *, min_score: float, limit: int,
         _log(f"tracker unreadable ({tracker}: {exc!r}); treating as no rows")
         rows = []
     shown, dropped = select_items(rows, new_files, root, min_score=min_score, limit=limit)
-    open_count = sum(1 for r in rows if r.get("status_canonical") == "Evaluated")
+    # The queue the work-order offers: an evaluator Skip is not in it (#183).
+    open_count = sum(1 for r in rows
+                     if r.get("status_canonical") == "Evaluated" and not r.get("skip_decided"))
 
     duration = _duration(run_started_at, now)
     monthly = round(duration * RUNS_PER_MONTH) if duration is not None else None

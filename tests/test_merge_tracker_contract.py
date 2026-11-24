@@ -55,10 +55,12 @@ from pipeline._batch_common import (
     ADDITION_COLUMNS, ADDITION_LABEL_LINE, ADDITION_LABELS, _REFUSES_HEADERLESS_MARKER,
     _REQUIRED_IDXS, _liveness_closed_rows, _pending_additions,
     _reopen_reposted, _sanitize_pending_additions, _warn_on_lost_additions,
-    closed_by_recheck, jd_cache_path, labelled_addition,
+    DECISION_SKIP_MARK, closed_by_recheck, jd_cache_path, labelled_addition,
     liveness_closed_mark, queued_additions, reads_labelled_additions, run_merge_tracker,
+    sanitize_addition,
 )
 from pipeline.tracker_layout import career_ops_dir
+from pipeline.work_location import work_location_from_notes
 from tests.conftest import tracker_row
 
 HEADER = ("# Applications Tracker\n\n"
@@ -788,3 +790,141 @@ class TestRecheckDiscardIsReopenedOnRepost:
         assert row["status_canonical"] == "Evaluated"
         assert data.extract_url(row["notes"]) == "https://indeed.com/viewjob?jk=new"
         assert not closed_by_recheck(row["notes"])          # a later Discard is a person's
+
+
+
+# ── #183: the Skip decision mark through the update tier ─────────────────────
+
+def _reeval(score, status, notes, decision="", url="https://indeed.com/viewjob?jk=new", **kw):
+    """A re-evaluation of `_tracker`'s row (the same company and title, so the
+    exact tier pairs them) as `write_job_result` writes it: through the
+    sanitizer, which puts the posting URL, any `Decision: Skip` mark and any
+    other mark `kw` names in Notes, and under the label line."""
+    row = ("11\t2026-09-01\tUT Southwestern Medical Center\t" + BASE +
+           f"\t{status}\t{score}\tnull\t[229](reports/229-ut.md)\t{notes}")
+    return _labelled(sanitize_addition(row, url, decision=decision, **kw))
+
+
+@pytest.fixture(scope="module")
+def dropped_to_skip(tmp_path_factory):
+    """A queued Apply re-evaluated as a Skip. The score goes DOWN, which the
+    pinned checkout writes through (career-ops#2411 — the older script skipped a
+    lower re-eval, and this case would then be the evaluation lost outright)."""
+    return _merge(tmp_path_factory.mktemp("skip"), _tracker(BASE, 200),
+                  {"123.tsv": _reeval("2.4/5", "SKIP", "SKIP weak claims match",
+                                      decision=DECISION_SKIP_MARK)})
+
+
+@pytest.fixture(scope="module")
+def skip_then_apply(tmp_path_factory):
+    """A row that already carries the mark, re-evaluated as an Apply (higher, so
+    it holds on either side of #2411). An Apply writes no mark of its own."""
+    text = (_tracker(BASE, 200).replace("| 4.0/5 |", "| 2.4/5 |")
+            .replace("— APPLY |", f"— {DECISION_SKIP_MARK} — SKIP weak |"))
+    return _merge(tmp_path_factory.mktemp("apply"), text,
+                  {"123.tsv": _reeval("4.3/5", "Evaluated", "APPLY strong match")})
+
+
+# The cell `_reeval` writes for a Skip, which `skip_reevaluated_identically`
+# also puts on the tracker row, so the re-evaluation repeats it exactly.
+SKIP_CELL = f"https://indeed.com/viewjob?jk=new — {DECISION_SKIP_MARK} — SKIP weak claims match"
+
+
+@pytest.fixture(scope="module")
+def skip_reevaluated_identically(tmp_path_factory):
+    """A Skip re-evaluated to the cell it already has. mergeNotes finds the
+    incoming notes among the row's clauses and writes the `Re-eval` marker
+    BARE — no `: <notes>` — which is the shape `skip_decided` must not read as
+    a newer verdict."""
+    text = (_tracker(BASE, 200).replace("| 4.0/5 |", "| 2.4/5 |")
+            .replace(f"| {_notes(None, 'old')} |", f"| {SKIP_CELL} |"))
+    addition = _reeval("2.4/5", "SKIP", "SKIP weak claims match", decision=DECISION_SKIP_MARK)
+    assert f"\t{SKIP_CELL}\t" in addition           # the premise: an exact repeat
+    return _merge(tmp_path_factory.mktemp("same"), text, {"123.tsv": addition})
+
+
+@pytest.fixture(scope="module")
+def skip_opens_the_re_eval(tmp_path_factory):
+    """A Skip whose addition has no req id, URL or Work location mark, so the
+    Decision mark opens its cell — which mergeNotes writes after the marker's
+    `: `, where a ` — `-only clause anchor cannot see it. A downgrade, so the
+    marker also carries the superseded report between the two (#2411)."""
+    return _merge(tmp_path_factory.mktemp("opens"), _tracker(BASE, 200),
+                  {"123.tsv": _reeval("2.4/5", "SKIP", "SKIP now", url="",
+                                      decision=DECISION_SKIP_MARK)})
+
+
+@pytest.fixture(scope="module")
+def location_opens_the_re_eval(tmp_path_factory):
+    """The Work location mark in the same position, against a row whose cell
+    already carries one — so mergeNotes joins with `; `, its rule for a cell
+    that ends in a location label."""
+    text = _tracker(BASE, 200).replace(
+        "— APPLY |", "— Work location: On-site Chicago, IL — APPLY |")
+    return _merge(tmp_path_factory.mktemp("where"), text,
+                  {"123.tsv": _reeval("4.3/5", "Evaluated", "APPLY now", url="",
+                                      work_location="Work location: Remote")})
+
+
+@pytest.fixture(scope="module")
+def location_ends_the_cell(tmp_path_factory):
+    """A cell that ENDS with its Work location mark, re-evaluated with no mark
+    of its own: the label trips mergeNotes' location rule, so the re-eval is
+    joined with `; `, and the old mark is still the newest one (#180)."""
+    text = _tracker(BASE, 200).replace("— APPLY |", "— Work location: On-site Chicago, IL |")
+    return _merge(tmp_path_factory.mktemp("ends"), text,
+                  {"123.tsv": _reeval("4.3/5", "Evaluated", "APPLY now", url="")})
+
+
+class TestDecisionSkipThroughTheUpdateTier:
+    """Why the Skip has to be on the row, and that it survives being put there.
+
+    merge-tracker's update tier keeps the EXISTING row's status, so a re-eval
+    that drops a queued role to Skip leaves it Evaluated whatever Status the
+    addition carried — the Status cell cannot say Skip on that path, only the
+    Notes can. And its `mergeNotes` keeps the old cell first and appends the new
+    one after a `Re-eval` marker, which is the shape `skip_decided`'s
+    newest-mark rule is written against."""
+
+    def test_the_update_keeps_the_rows_status(self, dropped_to_skip):
+        row = tracker_row(dropped_to_skip.tracker, "10")
+        assert row["report_num"] == "229" and row["status_canonical"] == "Evaluated"
+
+    def test_the_mark_lands_after_the_re_eval_marker_and_reads_as_a_skip(self, dropped_to_skip):
+        row = tracker_row(dropped_to_skip.tracker, "10")
+        assert row["notes"].index("Re-eval") < row["notes"].index(DECISION_SKIP_MARK)
+        assert row["skip_decided"] is True
+
+    def test_an_existing_mark_is_kept_and_a_newer_apply_retires_it(self, skip_then_apply):
+        row = tracker_row(skip_then_apply.tracker, "10")
+        assert row["report_num"] == "229"
+        assert row["notes"].index(DECISION_SKIP_MARK) < row["notes"].index("Re-eval")
+        assert row["skip_decided"] is False
+
+    def test_an_identical_skip_re_evaluation_stays_a_skip(self, skip_reevaluated_identically):
+        """The bare marker is real: the pinned script writes it for an exact
+        repeat, and the row must still read as the Skip it is."""
+        notes = tracker_row(skip_reevaluated_identically.tracker, "10")["notes"]
+        assert notes.startswith(SKIP_CELL)
+        assert re.fullmatch(r"Re-eval 2026-09-01 \([^)]*\)", notes[notes.index("Re-eval"):])
+        assert tracker_row(skip_reevaluated_identically.tracker, "10")["skip_decided"] is True
+
+    def test_a_mark_that_opens_the_re_evaluations_cell_is_read(self, skip_opens_the_re_eval):
+        row = tracker_row(skip_opens_the_re_eval.tracker, "10")
+        assert re.search(r"Re-eval 2026-09-01 \([^)]*\) — Superseded report \[200\] "
+                         r"\(was [^)]*\): " + DECISION_SKIP_MARK, row["notes"])
+        assert row["skip_decided"] is True
+
+    def test_a_location_mark_that_ends_the_cell_survives_a_re_eval(self, location_ends_the_cell):
+        """Read past the `; ` join, the mark's value swallowed the re-eval clause
+        and lost its state, so a re-evaluated out-of-area role stopped being
+        demoted."""
+        notes = tracker_row(location_ends_the_cell.tracker, "10")["notes"]
+        assert re.search(r"Work location: On-site Chicago, IL; Re-eval 2026-09-01 ", notes)
+        where = work_location_from_notes(notes)
+        assert (where.mode, where.metro, where.state) == ("onsite", "Chicago, IL", "IL")
+
+    def test_so_is_a_work_location_mark_there(self, location_opens_the_re_eval):
+        notes = tracker_row(location_opens_the_re_eval.tracker, "10")["notes"]
+        assert re.search(r"; Re-eval 2026-09-01 \([^)]*\): Work location: Remote", notes)
+        assert work_location_from_notes(notes).mode == "remote"

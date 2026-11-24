@@ -841,6 +841,77 @@ class TestQueueFromTracker:
                          career_ops=tmp_path / "no-career-ops")
         assert rc == 1
 
+    SKIP_ROW = ("| 4 | 2026-06-01 | Hooli | Analyst | 4.9/5 | Evaluated | X | [004](reports/004.md) "
+                "| https://www.linkedin.com/jobs/view/4 — Decision: Skip — SKIP weak |\n")
+
+    def test_an_evaluator_skip_is_left_out_and_said(self, tmp_path, capsys):
+        """#183: still Evaluated and the top score, but the evaluation decided
+        Skip — the row's own mark, read by the tracker parser, flags it in the
+        queue, and the work-order offers it as no fresh role."""
+        co = self._career_ops(tmp_path)
+        apps = co / "data" / "applications.md"
+        apps.write_text(apps.read_text(encoding="utf-8") + self.SKIP_ROW, encoding="utf-8")
+        queue = handoff.load_queue_from_tracker(co)
+        assert [(r.company, r.skip_decided) for r in queue] == [("Acme", False), ("Hooli", True)]
+        out = tmp_path / "handoff"
+        assert handoff.run(queue_path=tmp_path / "missing.jsonl", out_dir=out, career_ops=co) == 0
+        assert "[handoff] evaluator Skip: 1 of 2 queued roles not offered" in capsys.readouterr().out
+        assert "Hooli" not in handoff.work_order_paths(out, "linkedin")[0].read_text(encoding="utf-8")
+        # The header's counts add up: the Skip is in the 2 scored and said.
+        md = handoff.work_order_paths(out, "linkedin")[1].read_text(encoding="utf-8")
+        assert ("1 fresh LinkedIn roles (of 2 scored; 0 to finish, 0 excluded, "
+                "1 the evaluation decided to Skip).") in md
+
+    def test_the_skip_count_is_what_the_build_left_out(self, tmp_path, capsys):
+        """A Skip already in role-status.jsonl is counted as excluded, and one
+        whose form is filled comes back to finish — neither is one the Skip
+        rule dropped, so neither is in the count the stage log and the header
+        state."""
+        co = self._career_ops(tmp_path)
+        apps = co / "data" / "applications.md"
+        extra = "".join(self.SKIP_ROW.replace("| 4 |", f"| {n} |").replace("Hooli", co_name)
+                        .replace("view/4", f"view/{n}")
+                        for n, co_name in ((5, "Umbrella"), (6, "Vandelay")))
+        apps.write_text(apps.read_text(encoding="utf-8") + self.SKIP_ROW + extra, encoding="utf-8")
+        queue = handoff.load_queue_from_tracker(co)
+        tracked = [handoff.TrackedRole(key=handoff.role_key("Umbrella", "Analyst"), company="Umbrella",
+                                       role="Analyst", status="applied"),
+                   handoff.TrackedRole(key=handoff.role_key("Vandelay", "Analyst"), company="Vandelay",
+                                       role="Analyst", status=handoff.READY_STATUS)]
+        skipped = []
+        items = handoff.build_work_order(queue, tracked, skipped=skipped)
+        assert [q.company for q in skipped] == ["Hooli"]
+        assert [(i.company, i.resume_from) for i in items] == [
+            ("Vandelay", handoff.READY_STATUS), ("Acme", "")]
+        out = tmp_path / "handoff"
+        out.mkdir()
+        handoff.write_tracker(out / handoff.DEFAULT_TRACKER_NAME, tracked)
+        assert handoff.run(queue_path=tmp_path / "missing.jsonl", out_dir=out, career_ops=co) == 0
+        assert "[handoff] evaluator Skip: 1 of 4 queued roles" in capsys.readouterr().out
+
+    def test_a_lifted_skip_is_back_in_the_work_order(self, tmp_path):
+        co = self._career_ops(tmp_path)
+        apps = co / "data" / "applications.md"
+        lifted = self.SKIP_ROW.replace("SKIP weak |", "SKIP weak — Set Evaluated 2026-06-02 (by hand) |")
+        apps.write_text(apps.read_text(encoding="utf-8") + lifted, encoding="utf-8")
+        queue = handoff.load_queue_from_tracker(co)
+        assert [(r.company, r.skip_decided) for r in queue] == [("Acme", False), ("Hooli", False)]
+        assert [i.company for i in handoff.build_work_order(queue, [])] == ["Hooli", "Acme"]
+
+    def test_a_filled_form_on_a_skip_still_comes_back(self, tmp_path):
+        """The Skip keeps a role out of the FRESH roles only. A form the agent
+        filled — before a re-evaluation turned the role Skip, or because the
+        person handed off a tagged card by hand — is waiting on the person's
+        click, and the queue is what decides whether it is re-emitted."""
+        co = self._career_ops(tmp_path)
+        apps = co / "data" / "applications.md"
+        apps.write_text(apps.read_text(encoding="utf-8") + self.SKIP_ROW, encoding="utf-8")
+        ready = handoff.TrackedRole(key=handoff.role_key("Hooli", "Analyst"), company="Hooli",
+                                    role="Analyst", status=handoff.READY_STATUS)
+        items = handoff.build_work_order(handoff.load_queue_from_tracker(co), [ready])
+        assert [(i.company, i.resume_from) for i in items] == [
+            ("Hooli", handoff.READY_STATUS), ("Acme", "")]
+
 
 class TestSharedTailorCaller:
     """Review bug: each pooled row resolved its own LLM caller, giving every
@@ -2058,6 +2129,20 @@ class TestReadyReemittedFirst:
         assert [i.company for i in sessions["linkedin"]] == ["Globex", "Acme", "Fresh"]
         assert sessions["indeed"][0].company == "Indy" and sessions["indeed"][0].rank == 1
 
+    def test_the_export_carries_skip_decided_tolerantly(self, tmp_path):
+        """#183: the scored export has no Notes cell to derive the Skip from, so
+        it is read off the row — through `_truthy`, so a quoted "false" is not
+        one — and a row without the key is no Skip."""
+        q = tmp_path / "q.jsonl"
+        q.write_text("".join(
+            json.dumps({"num": str(n), "score": 4.0, "company": c, "role": "R",
+                        "url": f"https://www.indeed.com/viewjob?jk={n}", **extra}) + "\n"
+            for n, c, extra in ((1, "A", {"skip_decided": True}), (2, "B", {"skip_decided": "false"}),
+                                (3, "C", {"skip_decided": "true"}), (4, "D", {}))), encoding="utf-8")
+        queue = handoff.load_queue(q)
+        assert [r.skip_decided for r in queue] == [True, False, True, False]
+        assert [i.company for i in handoff.build_work_order(queue, [])] == ["B", "D"]
+
     def test_queue_readers_thread_easy_apply(self, tmp_path):
         q = tmp_path / "q.jsonl"
         q.write_text(json.dumps({"num": "1", "score": 4.0, "company": "A", "role": "R",
@@ -2627,6 +2712,18 @@ class TestReadyMd:
         assert handoff.EASY_APPLY_TAG not in fresh
         assert md.index("| Acme |") < md.index("| Fresh |")
 
+    def test_the_skip_count_is_stated_only_when_there_is_one(self):
+        """#183: an Evaluated Skip is in the scored count and in none of the
+        others, so the header says how many; a work-order with none reads as it
+        did before."""
+        items = [_item("Fresh", "Dev", "https://www.linkedin.com/jobs/view/2")]
+        md = handoff.render_work_order_md(items, board="linkedin", total_queue=9, touched=3,
+                                          skipped=2)
+        assert ("1 fresh LinkedIn roles (of 9 scored; 0 to finish, 3 excluded, "
+                "2 the evaluation decided to Skip).") in md
+        md = handoff.render_work_order_md(items, board="linkedin", total_queue=9, touched=3)
+        assert "1 fresh LinkedIn roles (of 9 scored; 0 to finish, 3 excluded)." in md
+
     def test_no_ready_rows_no_heading(self):
         md = handoff.render_work_order_md(
             [_item("Fresh", "Dev", "https://www.linkedin.com/jobs/view/2")],
@@ -2896,7 +2993,7 @@ class TestGateOffIsVisible:
     reach everything. This is a feature whose only failure mode is invisibility,
     so the two cases must not print the same line."""
 
-    def _run(self, tmp_path, monkeypatch, capsys, config_text):
+    def _run(self, tmp_path, monkeypatch, capsys, config_text, extra_rows=""):
         co = tmp_path / "career-ops"
         (co / "data").mkdir(parents=True)
         header = ("| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
@@ -2904,7 +3001,8 @@ class TestGateOffIsVisible:
         (co / "data" / "applications.md").write_text(
             header + ("| 1 | 2026-09-14 | UCAN | Coordinator | 4.8/5 | Evaluated |  |  | "
                       "https://www.linkedin.com/jobs/view/1 — "
-                      "Work location: On-site Chicago, IL — APPLY |\n"), encoding="utf-8")
+                      "Work location: On-site Chicago, IL — APPLY |\n") + extra_rows,
+            encoding="utf-8")
         cfg = tmp_path / "search.yml"
         cfg.write_text(config_text, encoding="utf-8")
         monkeypatch.setenv("SEARCH_CONFIG", str(cfg))
@@ -2916,6 +3014,16 @@ class TestGateOffIsVisible:
         out = self._run(tmp_path, monkeypatch, capsys, "searches:\n  - location: Dallas, TX\n")
         assert "out of area: 1 of 1" in out and "Dallas, TX" in out
         assert "gate OFF" not in out
+
+    def test_an_excluded_skip_is_not_counted_as_sorted_last(self, tmp_path, monkeypatch, capsys):
+        # An out-of-area evaluator Skip is in no work-order at all (#183), so the
+        # "sorted last" count leaves it out.
+        skip = ("| 2 | 2026-09-14 | Globex | Coordinator | 4.6/5 | Evaluated |  |  | "
+                "https://www.linkedin.com/jobs/view/2 — Work location: On-site Chicago, IL"
+                " — Decision: Skip — SKIP |\n")
+        out = self._run(tmp_path, monkeypatch, capsys, "searches:\n  - location: Dallas, TX\n",
+                        extra_rows=skip)
+        assert "out of area: 1 of 2" in out
 
     @pytest.mark.parametrize("config_text", [
         "searches: [oh: no: wait\n",                            # malformed

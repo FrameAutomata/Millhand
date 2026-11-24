@@ -1129,6 +1129,46 @@ class TestAreaDerivation:
             text, commutable=["Dallas, TX", "Chicago, IL"])[0]["area"]
 
 
+class TestSkipDecidedDerivation:
+    """#183: `skip_decided` is derived in the tracker parsers beside `area` and
+    `easy_apply`, from the row's own `Decision: Skip` mark, so the work-order,
+    the selector, the digest and the UI read one field instead of each opening
+    the report."""
+
+    HEADER = TestAreaDerivation.HEADER
+    SKIP = "https://x.example/1 — Work location: On-site Dallas, TX — Decision: Skip — SKIP weak"
+    _text = TestAreaDerivation._text
+
+    def test_the_text_parser_sets_it(self):
+        rows = data.parse_applications_text(self._text(self.SKIP, "https://x.example/2 — APPLY"))
+        assert [r["skip_decided"] for r in rows] == [True, False]
+
+    def test_the_file_parser_sets_it(self, tmp_path):
+        apps = tmp_path / "data" / "applications.md"
+        apps.parent.mkdir()
+        apps.write_text(self._text(self.SKIP), encoding="utf-8")
+        assert data.parse_applications(apps, commutable=())[0]["skip_decided"] is True
+
+    def test_the_tracker_additions_fallback_sets_it(self, tmp_path):
+        d = tmp_path / "batch" / "tracker-additions"
+        d.mkdir(parents=True)
+        (d / "1.tsv").write_text(
+            f"1\t2026-11-20\tInitech\tEng\tEvaluada\t2.6/5\tnull\t[1](reports/1.md)\t{self.SKIP}\n"
+            f"2\t2026-11-20\tGlobex\tEng\tEvaluada\t4.4/5\tnull\t[2](reports/2.md)\tAPPLY\n",
+            encoding="utf-8")
+        by_co = {r["company"]: r["skip_decided"] for r in data.parse_tracker_additions(d)}
+        assert by_co == {"Initech": True, "Globex": False}
+
+    def test_a_status_set_by_hand_on_a_skip_row_carries_the_lift(self):
+        """The person overruling the model, through the channel the Closed-mark
+        case already uses — and only on a row whose newest mark is the Skip."""
+        assert data.by_hand_note_for(self.SKIP, "Evaluated", "2026-11-23") == \
+            "Set Evaluated 2026-11-23 (by hand)"
+        assert data.by_hand_note_for(f"{self.SKIP} — Set Interview 2026-11-23 (by hand)",
+                                     "Evaluated", "2026-11-24") == ""
+        assert data.by_hand_note_for("https://x.example/2 — APPLY", "Applied", "2026-11-23") == ""
+
+
 class TestUiRanksOutOfAreaLast:
     """The UI is the surface a person has open while triaging, and it ranked the
     same queue independently — so #180 survived there after both other surfaces
@@ -1214,3 +1254,79 @@ class TestSelectorRanksOutOfAreaLast:
         jobs = role_select.select(co, min_score=4.0)
         assert [j.company for j in jobs] == ["Metrocare", "UCAN"]
         assert jobs[1].area == "On-site Chicago, IL" and jobs[1].score == 4.8
+
+
+class TestSelectorExcludesASkip:
+    """#183: the selector spends — an LLM call per cover letter, a rendered PDF
+    per tailored résumé — so a role the evaluator decided to Skip is not
+    returned at all, however it scored, until a person overrules it."""
+
+    HEADER = TestSelectorRanksOutOfAreaLast.HEADER
+
+    def _tracker(self, tmp_path, skip_notes):
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        (co / "data" / "applications.md").write_text(
+            self.HEADER
+            + f"| 1 | 2026-11-20 | Initech | Analyst | 4.6/5 | Evaluated |  |  | {skip_notes} |\n"
+            + ("| 2 | 2026-11-20 | Globex | Analyst | 4.1/5 | Evaluated |  |  | "
+               "https://x.example/2 — APPLY |\n"),
+            encoding="utf-8")
+        return co
+
+    def test_a_skip_is_not_selected(self, tmp_path):
+        from pipeline import role_select
+        co = self._tracker(tmp_path, "https://x.example/1 — Decision: Skip — SKIP")
+        assert [j.company for j in role_select.select(co, min_score=4.0)] == ["Globex"]
+
+    def test_a_lifted_skip_is(self, tmp_path):
+        from pipeline import role_select
+        co = self._tracker(tmp_path, "https://x.example/1 — Decision: Skip — SKIP — "
+                                     "Set Evaluated 2026-11-23 (by hand)")
+        assert [j.company for j in role_select.select(co, min_score=4.0)] == ["Initech", "Globex"]
+
+
+class TestUiTagsAnEvaluatorSkip:
+    """#183: the UI SHOWS a Skip-decided role — the board is where the person
+    sees why the work-order left it out and can overrule it — tagged, and only
+    while it is still Evaluated, for the area tag's reason."""
+
+    _js = staticmethod(TestUiRanksOutOfAreaLast._js)
+
+    def test_both_views_render_the_tag(self):
+        js = self._js()
+        calls = [l for l in js.splitlines()
+                 if "skipTag(j)" in l and not l.strip().startswith("function")]
+        assert len(calls) == 2, calls
+        assert any("<td" in l for l in calls) and any("card-role" in l for l in calls)
+
+    def test_it_is_scoped_to_evaluated_rows(self):
+        js = self._js()
+        tag = js[js.index("function skipTag(j)"):]
+        assert tag[:tag.index("return")].count("skipTagged(j)") == 1
+        helper = js[js.index("function skipTagged(j)"):]
+        body = helper[:helper.index("}")]
+        assert "j.skip_decided" in body and 'status_canonical === "Evaluated"' in body
+
+    def test_both_write_paths_let_the_lift_through(self):
+        """The lift is a status WRITE (the server appends the by-hand mark), and
+        a tagged row is always Evaluated, so a write path that drops a write of
+        the status the row already has can never lift it — which is what both
+        did while the tag's tooltip said setting the status would."""
+        js = self._js()
+        drop = js[js.index("function wireColumnDrop(col)"):js.index("async function changeStatus(")]
+        assert "job.status_canonical === newStatus && !skipTagged(job)" in drop
+        picker = js[js.index('els.reportStatus.addEventListener("change"'):]
+        picker = picker[:picker.index("});")]
+        assert "selectedJob.status_canonical === newStatus && !skipTagged(selectedJob)" in picker
+        tag = js[js.index("function skipTag(j)"):js.index("function makeCard(j)")]
+        assert "drop this card on" in tag and "Evaluated again" in tag
+        # The write is the lift, so the card loses its tag at once.
+        change = js[js.index("async function changeStatus("):js.index("function updatePushButton(")]
+        assert "if (job.skip_decided) job.skip_decided = false;" in change
+
+    def test_it_does_not_reorder_or_hide_the_row(self):
+        """Shown, not hidden or sunk: neither the filter nor the comparator reads it."""
+        js = self._js()
+        body = js[js.index("let rows = JOBS.filter("):js.index("return rows;")]
+        assert "skip_decided" not in body
