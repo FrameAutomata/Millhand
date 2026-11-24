@@ -215,7 +215,7 @@ State persists in `career-ops/batch/batch-state.tsv` — safe to interrupt and r
 .\run.ps1 --evaluate-batch --retry-abandoned            # re-queue abandoned jobs
 ```
 
-A job that fails is re-queued on the next run. One whose answer the model cut off or refused fails the same way every time, so after three such runs it is marked `abandoned` and the run prints an `ABANDONED` line naming it (today this applies to Claude; Gemini and the OpenAI-compatible providers follow). Rate limits and outages do not count toward the three, and neither does a run where most jobs failed the same way, some for the first time (that is the run's problem, not the jobs'). `--retry-abandoned` gives abandoned jobs a fresh three; in the cloud, run **Daily Job Pipeline** by hand with **retry_abandoned** ticked.
+A job that fails is re-queued on the next run. One whose answer the model cut off or refused fails the same way every time, so after three such runs it is marked `abandoned` and the run prints an `ABANDONED` line naming it. Rate limits and outages do not count toward the three, and neither does a run where most jobs failed the same way, some for the first time (that is the run's problem, not the jobs'). `--retry-abandoned` gives abandoned jobs a fresh three; in the cloud, run **Daily Job Pipeline** by hand with **retry_abandoned** ticked.
 
 Provider auto-detection order: Gemini → Groq → DeepInfra → OpenRouter → DeepSeek → OpenAI → Anthropic. The first one with a configured API key wins. Override with `BATCH_PROVIDER`.
 

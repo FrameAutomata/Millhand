@@ -181,8 +181,10 @@ _TRANSIENT_SERVER_MARKERS = (
     "temporarily unavailable",
     # Our own callers raise "<provider> returned empty content" when a model
     # answers 200 with an empty body — a degraded endpoint, or a reasoning
-    # model that burned its whole token budget thinking. Either way the model
-    # is unusable for this call: retry, and above all FAIL OVER to a sibling.
+    # model that burned its whole token budget thinking — and for an answer
+    # its provider says it cut off or withheld (IncompleteResponse keeps this
+    # wording; see _is_countable_failure). Either way the model is unusable for
+    # this call: retry, and above all FAIL OVER to a sibling.
     "empty content",
 )
 
@@ -402,6 +404,22 @@ _COMPLETE_STOPS = ("end_turn", "stop_sequence")
 # same way tomorrow (#206). A reason the API adds later is not assumed to be one.
 _JOB_SHAPED_STOPS = ("max_tokens", "refusal", "model_context_window_exceeded")
 
+# The Gemini and OpenAI-compatible callers' _JOB_SHAPED_STOPS (#204): only these
+# reasons raise IncompleteResponse, in the empty-content wording (see
+# _COMPLETE_STOPS above). Unlike _COMPLETE_STOPS, an unlisted or missing reason
+# is accepted: these backends are many and their vocabularies grow, so an
+# unlisted reason is far likelier a dialect of "stop" than a cut, and the
+# writer still rejects an answer that lost a tag.
+_GEMINI_CUT_FINISHES = frozenset({"MAX_TOKENS", "SAFETY", "RECITATION", "BLOCKLIST",
+                                  "PROHIBITED_CONTENT", "SPII", "LANGUAGE"})
+_OPENAI_CUT_FINISHES = frozenset({"length", "content_filter"})
+
+
+def _reason_name(value) -> str:
+    """A finish or block reason as its bare name, whether the SDK hands back an
+    enum (google-genai's `FinishReason.MAX_TOKENS`) or a string ("length")."""
+    return str(getattr(value, "name", value) or "")
+
 
 def _anthropic_effort() -> str | None:
     """ANTHROPIC_EFFORT, or None for the model's default. An unknown value warns
@@ -483,6 +501,15 @@ def _build_gemini_caller(model: str) -> Caller:
             contents=user,
             config=types.GenerateContentConfig(system_instruction=system),
         )
+        # A blocked prompt has no candidate at all: the prompt is what failed.
+        blocked = _reason_name(getattr(getattr(resp, "prompt_feedback", None),
+                                       "block_reason", None))
+        if blocked and blocked.upper() != "BLOCKED_REASON_UNSPECIFIED":
+            raise IncompleteResponse(f"gemini returned empty content (block_reason={blocked})")
+        candidates = getattr(resp, "candidates", None) or []
+        finish = _reason_name(getattr(candidates[0], "finish_reason", None)) if candidates else ""
+        if finish.upper() in _GEMINI_CUT_FINISHES:
+            raise IncompleteResponse(f"gemini returned empty content (finish_reason={finish})")
         text = getattr(resp, "text", None)
         if not text:
             raise RuntimeError("gemini returned empty content")
@@ -523,7 +550,11 @@ def _build_openai_compat_caller(model: str, api_key: str, base_url: str | None =
             ],
             extra_body=extra_body,
         )
-        content = resp.choices[0].message.content
+        choice = resp.choices[0]
+        finish = _reason_name(getattr(choice, "finish_reason", None))
+        if finish.lower() in _OPENAI_CUT_FINISHES:
+            raise IncompleteResponse(f"provider returned empty content (finish_reason={finish})")
+        content = choice.message.content
         if not content:
             # None happens on refusals / tool-only responses. Treat as failure.
             raise RuntimeError("provider returned empty content")
