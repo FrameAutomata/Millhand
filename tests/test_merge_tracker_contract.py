@@ -59,7 +59,7 @@ from pipeline._batch_common import (
     liveness_closed_mark, queued_additions, reads_labelled_additions, run_merge_tracker,
     sanitize_addition,
 )
-from pipeline.tracker_layout import career_ops_dir
+from pipeline.tracker_layout import career_ops_dir, data_rows
 from pipeline.work_location import work_location_from_notes
 from tests.conftest import tracker_row
 
@@ -482,25 +482,27 @@ class TestUnsanitizedRowsAreRefused:
         assert "https://x/j/7" in sanitized.tracker and "req 88214" in sanitized.tracker
 
 
-def _refused_then_merged(tmp_path, addition, *, queued_url=False):
+def _refused_then_merged(tmp_path, addition, *, queued_url=False, tracker=HEADER):
     """The `--batch` case end to end, against the real script: the runner's own
     merge refuses `addition` as 7.tsv — archiving it before #5862, keeping it
     since — and `run_merge_tracker`, which the wrappers run after the runner,
     gets it back into shape (recovery from merged/, or the sanitizer in the
     queue) and lands it. `queued_url` adds the batch-input.tsv a queued job has,
-    after the runner's merge. Each stage's evidence is kept rather than
-    asserted here, so a failure names the stage."""
-    career_ops, additions, state = _stage(tmp_path, HEADER, {"7.tsv": addition})
+    after the runner's merge; `tracker` is the applications.md it merges into.
+    Each stage's evidence is kept rather than asserted here, so a failure names
+    the stage."""
+    career_ops, additions, state = _stage(tmp_path, tracker, {"7.tsv": addition})
     first = _node_merge(career_ops, state)                # what batch-runner.sh's last step does
     after_first = _tracker_after(career_ops)
     refused_where = _refused_where(additions, "7.tsv")
     if queued_url:
         _queue_url(career_ops)
     ok, printed = _run_merge_tracker_for_real(career_ops, state)
-    applied = additions / "merged" / "7.tsv"
+    applied, kept = additions / "merged" / "7.tsv", additions / "7.tsv"
     return SimpleNamespace(first=first, after_first=after_first, refused_where=refused_where,
                            ok=ok, printed=printed,
                            applied=applied.read_text(encoding="utf-8") if applied.exists() else None,
+                           kept=kept.read_text(encoding="utf-8") if kept.exists() else None,
                            tracker=_tracker_after(career_ops))
 
 
@@ -705,6 +707,152 @@ class TestHeadedRecoveryAfterTheRunnersOwnMerge:
         # Recovery's part where the refusal was archived; the sanitizer's alone
         # where it was kept.
         assert ("recovered 1 evaluation" in h.printed) == (not KEEPS_REFUSALS)
+
+
+# #191: a headed addition labelled in another order — the `via` column an
+# agent CLI adds after `company`, where the tracker's own Via layout has it —
+# with a bare score. merge-tracker reads it by name and refuses the score, and
+# the chain addresses cells by index, so until #191 it was left as written and
+# nothing here could bring it back. Merged into both tracker layouts: the Via
+# one an agent adds the column for, and the canonical one, where merge-tracker
+# drops a `via` value (with a `--migrate-via` hint) whatever order it came in.
+VIA_TRACKER = ("# Applications Tracker\n\n"
+               "| # | Date | Company | Via | Role | Score | Status | PDF | Report | Notes |\n"
+               "|---|------|---------|-----|------|-------|--------|-----|--------|-------|\n")
+VIA_LABELS = ("num", "date", "company", "via", "role", "status", "score", "pdf", "report",
+              "notes", "url")
+
+
+def _via_addition(score):
+    """`_headed_cells` with an agency, labelled in `VIA_LABELS` order."""
+    cells = {**_headed_cells(score), "via": "Hays"}
+    return "\t".join(VIA_LABELS) + "\n" + "\t".join(cells[label] for label in VIA_LABELS) + "\n"
+
+
+@pytest.fixture(scope="module", params=[VIA_TRACKER, HEADER], ids=["via-layout", "canonical"])
+def via_reordered(request, tmp_path_factory):
+    h = _refused_then_merged(tmp_path_factory.mktemp("via-reordered"),
+                             _via_addition("4.2"), tracker=request.param)
+    h.via_column = request.param is VIA_TRACKER
+    return h
+
+
+class TestAHeadedRowInAnotherOrderIsRepaired:
+    def test_as_written_its_bare_score_is_refused_by_label(self, via_reordered):
+        """The premise, off the real script: the order is legal — the refusal
+        names the column LABELLED score, wherever it sits — and the score is
+        not. If upstream starts accepting a bare score, this failing is the
+        notification."""
+        h = via_reordered
+        assert "Platform Engineer" not in h.after_first
+        assert 'Skipping 7.tsv: the column labelled "score" reads "4.2"' in h.first.stderr
+        assert h.refused_where == REFUSED_WHERE
+
+    def test_put_in_order_by_its_labels_it_merges(self, via_reordered):
+        """Read off the file merge-tracker applied: still labelled — the nine
+        in the batch prompt's order, then `url`, then `via` — with the score
+        repaired. The agency lands in the Via column where the
+        tracker has one, merge-tracker reading the `via` label by name, and is
+        dropped where it has none, exactly as it would be in order."""
+        h = via_reordered
+        assert h.applied is not None, h.printed
+        label, data = h.applied.rstrip("\n").split("\n")     # one data row
+        assert label.split("\t") == [*ADDITION_COLUMNS, "url", "via"]
+        assert dict(zip(label.split("\t"), data.split("\t")))["score"] == "4.2/5"
+        rows = {cells[0]: dict(zip(columns, cells)) for columns, cells in data_rows(h.tracker)}
+        row = rows["11"]
+        assert (row["company"], row["role"], row["score"]) == (
+            "Acme Corp", "Platform Engineer", "4.2/5")
+        assert "https://x/j/7" in row["notes"]
+        if h.via_column:
+            assert row["via"] == "Hays"
+        else:
+            assert "via" not in row and "Hays" not in h.tracker
+        assert h.ok is True, h.printed
+
+
+# What putting a file in order must NOT repair: headed rows the real script
+# refuses as written, each with a bare score, where the chain's score repair is
+# the one thing that would let it through — with cells under labels they were
+# not written under. merge-tracker lets a row stop before its optional cells
+# and reads every present cell by its label, so a row that left out an
+# INTERIOR cell is read one label off from there on, and it says so only when
+# the shift reaches the score; and it refuses a bare URL under a label that is
+# not `url` while the `url` cell is absent, which padding would make present.
+# A refusal the loss guard names is recoverable; a merged garbage row is not.
+# {id: (the file, the reason merge-tracker gives for refusing it as written)}
+_LEFT_OUT = "[229](reports/229-acme.md)\tAPPLY\n"
+NOT_REPAIRED = {
+    # The PDF value left out, labels in another order: read by name, the
+    # report link is the PDF and the note is the Report.
+    "interior-cell-another-order": (
+        "company\trole\tnum\tdate\tscore\tstatus\tpdf\treport\tnotes\n"
+        "Acme Corp\tPlatform Engineer\t11\t2026-09-01\t4.2\tEvaluated\t" + _LEFT_OUT,
+        'the column labelled "score" reads "4.2"'),
+    # The same in the batch prompt's order, where the chain used to pad the
+    # 8-cell row to nine and take it as it stood.
+    "interior-cell-prompt-order": (
+        f"{ADDITION_LABEL_LINE}\n"
+        "11\t2026-09-01\tAcme Corp\tPlatform Engineer\tEvaluated\t4.2\t" + _LEFT_OUT,
+        'the column labelled "score" reads "4.2"'),
+    # A `via` label after Report, its empty cell left out: nine cells, the
+    # Report link in place, no required label after it and no URL misplaced
+    # — read by name, the note is the agency, and the shift never reaches the
+    # score. A short row may have left out only the prompt's own tail there.
+    "optional-cell-after-report": (
+        "num\tdate\tcompany\trole\tstatus\tscore\tpdf\treport\tvia\tnotes\turl\n"
+        "11\t2026-09-01\tAcme Corp\tPlatform Engineer\tEvaluated\t4.2\tnull\t" + _LEFT_OUT,
+        'the column labelled "score" reads "4.2"'),
+    # A tab inside Notes: one cell more than the labels. By name the second
+    # half of the note is the URL and the URL is past every label; the score
+    # repair would merge that shift.
+    "a-cell-past-the-labels": (
+        f"{ADDITION_LABEL_LINE}\n"
+        "11\t2026-09-01\tAcme Corp\tPlatform Engineer\tEvaluated\t4.2\tnull\t"
+        "[229](reports/229-acme.md)\tnote a\tnote b\thttps://www.linkedin.com/jobs/view/1\n",
+        'the column labelled "score" reads "4.2"'),
+    # The posting URL under `notes` and no `url` cell, after a `location`.
+    "bare-url-no-url-cell": (
+        "num\tdate\tcompany\trole\tstatus\tscore\tpdf\treport\tlocation\tnotes\turl\n"
+        "11\t2026-09-01\tAcme Corp\tPlatform Engineer\tEvaluated\t4.2\tnull\t"
+        "[229](reports/229-acme.md)\tDallas\thttps://x/j/7\n",
+        'a URL sits under "notes" while the "url" cell is absent'),
+}
+
+
+@pytest.fixture(scope="module", params=list(NOT_REPAIRED))
+def not_repaired(request, tmp_path_factory):
+    text, reason = NOT_REPAIRED[request.param]
+    h = _refused_then_merged(tmp_path_factory.mktemp(request.param), text)
+    h.text, h.reason = text, reason
+    return h
+
+
+class TestWhatItsLabelsCannotPlaceIsNotRepaired:
+    def test_as_written_it_is_refused(self, not_repaired):
+        """The premise, off the real script — and the reason is the one that
+        makes the shape what it is. If upstream starts merging one of these
+        as written, this failing is the notification."""
+        h = not_repaired
+        assert "Platform Engineer" not in h.after_first
+        assert f"Skipping 7.tsv: {h.reason}" in h.first.stderr
+        assert h.refused_where == REFUSED_WHERE
+
+    def test_it_is_still_refused_left_exactly_as_written(self, not_repaired):
+        """Never merged on the sanitizer's guess. Where the release keeps a
+        refusal, the next merge leaves the file as the writer wrote it, is not
+        a success, and names it with merge-tracker's own reason; where it
+        archives one, recovery leaves it in the archive untouched."""
+        h = not_repaired
+        assert "Platform Engineer" not in h.tracker, h.printed
+        assert "sanitized" not in h.printed and "recovered" not in h.printed
+        if KEEPS_REFUSALS:
+            assert h.kept == h.text
+            assert h.ok is False
+            assert "refused by merge-tracker and KEPT" in h.printed
+            assert h.reason in h.printed
+        else:
+            assert h.kept is None and h.applied == h.text
 
 
 @pytest.fixture(scope="module")
