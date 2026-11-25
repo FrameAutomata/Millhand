@@ -13,7 +13,8 @@ from datetime import datetime
 from pathlib import Path
 
 from pipeline.work_location import (
-    WORK_LOCATION_RE, location_mark, parse_work_location,
+    NOTES_CLAUSE_START, REEVAL_WITH_NOTES_RE, WORK_LOCATION_RE,
+    location_mark, parse_work_location,
 )
 from pipeline.tracker_layout import (
     SCORE_SENTINELS, claimed_report_nums, data_rows, header_aliases, header_columns,
@@ -515,13 +516,12 @@ def read_report(base: Path, report_path: str, *, label: str = "report",
 
 
 # The `## Machine Summary` block a report carries, read here beside the other
-# report readers because two stages act on it: the digest excludes a
-# `final_decision: Skip`, and both it and the handoff build demote a role whose
-# `work_location` names a metro outside the candidate's commutable ones (#180).
+# report readers because the tracker row's two evaluation marks are written from
+# it (`Decision: Skip`, #183; `Work location:`, #180 — see `_report_marks`).
 # The fence may sit a few prose lines below the heading (a model that adds a
 # sentence there is drift, not a different shape): any non-fence lines are
-# skipped, or `final_decision: Skip` would parse as no summary and a Skip
-# above min_score would be digested.
+# skipped, or `final_decision: Skip` would parse as no summary and the role
+# would be queued like any other.
 _MACHINE_SUMMARY_RE = re.compile(
     r"##\s*Machine Summary[^\n]*\n(?:(?!\s*```)[^\n]*\n)*?\s*```[a-zA-Z]*\s*\n(.*?)\n\s*```",
     re.S)
@@ -532,7 +532,7 @@ def parse_machine_summary(report_text: str) -> dict:
     """The `## Machine Summary` YAML block of a report as a dict, `{}` when
     there is none. PyYAML when it is importable and the block parses; else a
     regex that recovers `final_decision` alone, which is the field that
-    changes what the digest does (a `Skip` is excluded)."""
+    decides whether a role is queued at all (a `Skip` is excluded)."""
     m = _MACHINE_SUMMARY_RE.search(report_text or "")
     if not m:
         return {}
@@ -1112,6 +1112,51 @@ def _inject_work_location_into_notes(tracker_tsv: str, mark: str) -> str:
                              lambda notes: WORK_LOCATION_RE.search(notes) is not None)
 
 
+# ── The Skip decision mark (#183) ───────────────────────────────────────────
+# `final_decision: Skip` is the evaluator saying the role is not worth applying
+# to, and it lives in the report. Only the digest opened reports to read it, so
+# the work-order and `role_select` (which spends: an LLM call per cover letter, a
+# rendered PDF per tailored résumé) selected on the Status cell and the score
+# alone, and a Skip still sitting in Evaluated ranked like any other role. That
+# is reachable without the model misbehaving: merge-tracker's update tier keeps
+# the EXISTING row's status, so a re-evaluation that drops a queued role to Skip
+# writes its score, report and Notes through and leaves the row Evaluated.
+#
+# So the decision is recorded on the row the way #180 records where the job is —
+# once, in Notes, at evaluation time — and the tracker parser derives
+# `skip_decided` from it for every reader (`skip_decided` below). Only a Skip is
+# marked: Apply, Consider and Research first change nothing any reader does, and
+# a mark on every row would be wallpaper. Anchored to the start of a clause by
+# the SAME pattern WORK_LOCATION_RE is (`work_location.NOTES_CLAUSE_START`: the
+# cell's start, a ` — `, or a re-evaluation marker's `: `, where a row with no
+# req id, URL or Work location mark puts this mark first), because the model
+# writes that cell and "…the final decision: Skip unless remote" is a sentence
+# it could write; case-sensitive besides, so a clause the model opens with
+# "decision: skip" is its prose, not our mark. The lookahead ends the mark at
+# the Notes grammar's own boundaries — ` — `, the `. `/`; ` merge-tracker joins
+# a re-evaluation with, or the end of the cell — so "Decision: Skipped for now"
+# is not one either.
+DECISION_SKIP_MARK = "Decision: Skip"
+DECISION_SKIP_RE = re.compile(
+    rf"{NOTES_CLAUSE_START}{DECISION_SKIP_MARK}(?=\s*(?:—|[.;]|$))")
+
+
+def is_skip_decision(final_decision) -> bool:
+    """Whether a Machine Summary's `final_decision` is a Skip — the one reading,
+    for the mark's writer and the digest's report fallback. Tolerant of the
+    shapes a model reaches for: a list (its first entry) and any case."""
+    if isinstance(final_decision, (list, tuple)):
+        final_decision = final_decision[0] if final_decision else ""
+    return str(final_decision or "").strip().lower().startswith("skip")
+
+
+def _inject_decision_into_notes(tracker_tsv: str, mark: str) -> str:
+    """Record the evaluator's Skip in the notes cell (#183). Idempotent on the
+    mark, like the Work location one: a second pass finds it and adds nothing."""
+    return _prepend_to_notes(tracker_tsv, mark,
+                             lambda notes: DECISION_SKIP_RE.search(notes) is not None)
+
+
 def _inject_url_into_notes(tracker_tsv: str, url: str) -> str:
     """Splice the job URL into the notes cell so the UI's "Open posting" link
     works.
@@ -1267,11 +1312,19 @@ def _set_report_link(tracker_tsv: str, report_file: str) -> str:
     return "\t".join(parts)
 
 
+def _report_marks(report_text: str) -> tuple[str, str]:
+    """(the `Work location:` mark, the `Decision: Skip` mark) a report earns —
+    `""` for each it does not. The one place a report is turned into the row's
+    marks, so the writer and the merge-time repair cannot produce two shapes,
+    and one parse of the Machine Summary yields both."""
+    summary = parse_machine_summary(report_text)
+    return (location_mark(parse_work_location(summary)),
+            DECISION_SKIP_MARK if is_skip_decision(summary.get("final_decision")) else "")
+
+
 def _report_location_mark(report_text: str) -> str:
-    """The `Work location:` mark for a report's own `work_location` block, or ""
-    when it has none — the one place a report is turned into that mark, so the
-    writer and the merge-time repair cannot produce two shapes."""
-    return location_mark(parse_work_location(parse_machine_summary(report_text)))
+    """The `Work location:` mark alone, for `backfill_work_location`."""
+    return _report_marks(report_text)[0]
 
 
 class IncompleteResponse(RuntimeError):
@@ -1335,10 +1388,11 @@ def write_job_result(
     # cell names the file THIS function writes, not the one the model guessed
     # at (#162): the prompt gives it only the link's shape. Every caller writes
     # into <career-ops>/batch/tracker-additions, so the checkout is two up.
+    work_location, decision = _report_marks(report_content)
     tracker_tsv = sanitize_addition(tracker_tsv, job_meta.get("url", ""),
                                     job_meta.get("jd_text", ""),
                                     report_file=report_file,
-                                    work_location=_report_location_mark(report_content))
+                                    work_location=work_location, decision=decision)
     addition = _addition_text("", tracker_tsv, tracker_dir.parent.parent)
 
     (reports_dir / report_file).write_text(report_content, encoding="utf-8")
@@ -1648,7 +1702,8 @@ def ensure_applications_md(career_ops: Path) -> Path:
 
 
 def sanitize_addition(tracker_tsv: str, url: str = "", jd_text: str = "",
-                      report_file: str = "", work_location: str = "") -> str:
+                      report_file: str = "", work_location: str = "",
+                      decision: str = "") -> str:
     """Turn a model's tracker row into one merge-tracker can read, and read
     correctly. The whole chain, in the one order that works.
 
@@ -1661,20 +1716,22 @@ def sanitize_addition(tracker_tsv: str, url: str = "", jd_text: str = "",
     Report link is set from `report_file` — the report that exists on disk,
     which the writer knows and the merge-time pass looks up by number — because
     the model authors that cell from a shape alone and invents the slug (#162).
-    The `work_location` mark goes in BEFORE the URL and the req id so it lands
-    after them in the cell: those two are read by machines that take the first
-    match (merge-tracker's `extractReqNumber`, the UI's "Open posting"), and the
-    mark is read by a regex that does not care where it sits.
+    The `work_location` and `decision` marks go in BEFORE the URL and the req id
+    so they land after them in the cell: those two are read by machines that take
+    the first match (merge-tracker's `extractReqNumber`, the UI's "Open posting"),
+    and the marks are read by regexes that do not care where they sit. The
+    decision goes in first, so the cell reads `req — url — Work location — Decision`.
 
     **Idempotent**, which is what lets it run at two points without a second
     mechanism: padding a nine-column row does nothing, the pipe strip has nothing
     left to strip, a normalized score re-normalizes to itself, a link already
-    pointing at the file is rewritten to itself, and all three injectors bail
+    pointing at the file is rewritten to itself, and all four injectors bail
     when their content is already present."""
     row = _restore_trailing_cells(tracker_tsv)
     row = _strip_role_pipe(row)
     row = _normalize_score_cell(row)
     row = _set_report_link(row, report_file)
+    row = _inject_decision_into_notes(row, decision)
     row = _inject_work_location_into_notes(row, work_location)
     # The URL the pipeline QUEUED first, the row's own trailing field second.
     # Everything downstream routes by the notes URL — handoff picks the site
@@ -1746,7 +1803,7 @@ def _row_report(career_ops: Path, tracker_tsv: str) -> Path | None:
     and company (`resolve_report`, for #162's model-invented slugs).
 
     Called ONCE per addition by `_sanitize_pending_additions` and handed to both
-    merge-time passes that need it (`_dead_link_repair`, `_pending_location_mark`).
+    merge-time passes that need it (`_dead_link_repair`, `_pending_report_marks`).
     That is the point of extracting it rather than of each pass resolving its own:
     a dead link — the case both passes exist for — sends `resolve_report` through
     a full `reports/` glob, so two independent callers meant two scans of a
@@ -1777,28 +1834,43 @@ def _dead_link_repair(career_ops: Path, tracker_tsv: str, found: Path | None) ->
     return found.name
 
 
-def _pending_location_mark(tracker_tsv: str, found: Path | None) -> str:
-    """The `Work location:` mark for an addition written outside Python, read
-    off the report its own row links to.
+def _pending_report_marks(tracker_tsv: str, found: Path | None) -> tuple[str, str]:
+    """(the `Work location:` mark, the `Decision: Skip` mark) for a pending
+    addition, read off the report its own row links to — `""` for each the
+    report does not earn.
 
-    This is what gets a `--batch` row marked at all: career-ops' `batch-runner.sh`
-    lets the agent CLI write the TSV directly, so the row reaches the merge with
-    none of the chain applied — and the report it names is on disk, written by
-    the same run. `found` is that report, resolved ONCE by the caller (`_row_report`)
-    and shared with `_dead_link_repair`, so a model-invented slug (#162) still
-    finds its report by number without a second directory scan."""
+    This is how a `--batch` row gets marked when a merge we run sees it:
+    career-ops' `batch-runner.sh` lets the agent CLI write the TSV directly, so
+    the row reaches the merge with none of the chain applied — and the report it
+    names is on disk, written by the same run. Not every `--batch` row comes
+    here: the runner merges its own additions as its last act, so only the ones
+    it refused (re-queued by `_recover_refused_additions`) or never merged do.
+    It is also how an addition `write_job_result` wrote before #183 gets its
+    Decision mark (below). `found` is that report, resolved ONCE by the caller
+    (`_row_report`) and shared with `_dead_link_repair`, so a model-invented slug
+    (#162) still finds its report by number without a second directory scan.
+    Both marks come from one read and one parse (`_report_marks`)."""
     parts = _row_parts(_restore_trailing_cells(tracker_tsv))
-    if parts is None:
-        return ""
-    # Cheapest guard first: a row `write_job_result` wrote already carries its
-    # mark, and that is most pending additions on every run that is not
-    # `--batch`. `_inject_work_location_into_notes` would discard whatever we
-    # computed anyway, so reading and YAML-parsing an 8KB report to reach that
-    # conclusion is ~1ms per addition spent to learn nothing — 160-190 of them
-    # on a cloud daily.
-    if WORK_LOCATION_RE.search(parts[_NOTES_IDX]):
-        return ""
-    return _report_location_mark(read_text(found)) if found else ""
+    if parts is None or found is None:
+        return "", ""
+    # Only a Decision mark settles it without the report: the writer that wrote
+    # one wrote the Work location mark from the same report. A Work location
+    # mark alone used to be taken as that evidence, but `write_job_result`
+    # before #183 wrote it and no Decision mark, and its additions can still be
+    # pending after the upgrade — a merge that failed (merge-tracker without its
+    # npm deps leaves them piling up in `tracker-additions/`) hands them to the
+    # next one — so a Skip among them merged unmarked. An Apply never carries a
+    # Decision mark, so this reads the report of every pending addition that is
+    # not a marked Skip: on a cloud daily that is most of the 160-190 it writes,
+    # ~1ms each for an 8KB read and one YAML parse, a fraction of a second beside
+    # the evaluations that produced them. The injectors are idempotent, so a Work
+    # location mark already on the row is not written twice; a Decision mark
+    # added to such a row lands at the FRONT of the cell, which no reader minds —
+    # the ones that take a first match are after a req id and a URL, and the
+    # mark is neither.
+    if DECISION_SKIP_RE.search(parts[_NOTES_IDX]):
+        return "", ""
+    return _report_marks(read_text(found))
 
 
 def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
@@ -1859,10 +1931,11 @@ def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
         header, row = split
         # One resolution per addition, shared by the two passes that need it.
         report = _row_report(career_ops, row)
+        work_location, decision = _pending_report_marks(row, report)
         fixed = sanitize_addition(row, urls.get(f.stem, ""),
                                   read_text(jd_cache_path(career_ops, f.stem)),
                                   report_file=_dead_link_repair(career_ops, row, report),
-                                  work_location=_pending_location_mark(row, report))
+                                  work_location=work_location, decision=decision)
         text = _addition_text(header, fixed, career_ops)
         # Nothing repaired and no label line gained. The ROW, not the file read:
         # rejoining drops a blank line between a header and its row, which
@@ -2081,9 +2154,20 @@ def reopened_mark(date: str) -> str:
 
 def by_hand_mark(date: str, status: str) -> str:
     """The Notes mark a person's status write leaves on a row whose newest mark
-    is the re-check's Closed one — what makes the decision a person's (#163).
-    `app.data.by_hand_note_for` decides when one is needed."""
+    is the re-check's Closed one (#163) or the evaluator's Decision: Skip (#183)
+    — what makes the decision a person's. `app.data.by_hand_note_for` decides
+    when one is needed."""
     return f"Set {_note_safe(status) or 'status'} {date} (by hand)"
+
+
+def _newest_wins(notes: str, mark_re: re.Pattern, overruling: tuple) -> bool:
+    """True when the newest `mark_re` match in `notes` is newer than every match
+    of the `overruling` patterns. The one rule behind `closed_by_recheck` and
+    `skip_decided`: Notes only ever grow at the end (merge-tracker keeps the old
+    cell first and appends), so a mark's position is its age."""
+    last = max((m.end() for m in mark_re.finditer(notes)), default=-1)
+    since = max((m.end() for r in overruling for m in r.finditer(notes)), default=-1)
+    return last > since
 
 
 def closed_by_recheck(notes: str) -> bool:
@@ -2092,11 +2176,47 @@ def closed_by_recheck(notes: str) -> bool:
     left — so the row's Discard is the re-check's, not a person's. Only
     meaningful on a row whose status IS Discarded; `recheck_discarded` asks
     both halves."""
+    return _newest_wins(notes or "", LIVENESS_CLOSED_RE, (REOPENED_RE, BY_HAND_RE))
+
+
+def skip_decided(notes: str) -> bool:
+    """True when the evaluator decided Skip and nothing since has overruled it:
+    the newest `Decision: Skip` mark in `notes` is newer than any by-hand mark a
+    person's status write left and than any `Re-eval` marker that carries its
+    own notes (#183).
+
+    The newest mark wins, as in `closed_by_recheck` and for merge-tracker's
+    reason: its update tier keeps the old Notes first and appends the new
+    evaluation after a `Re-eval` marker, so a role that was a Skip and is now an
+    Apply still carries the old mark. The marker is what retires it — a newer
+    evaluation that decided Skip again writes its own mark after it — and a
+    by-hand mark is a person overruling the model, which is the one way to put a
+    Skip back in the queue.
+
+    Only a marker followed by its evaluation's own `: <notes>` retires it
+    (`REEVAL_WITH_NOTES_RE`). mergeNotes writes the marker BARE when the new
+    notes repeat a clause already in the cell — a Skip re-evaluated to the same
+    cell, mark and all — so reading a bare marker as "the verdict changed" put
+    that Skip back in the work-order and the selector, neither of which opens
+    the report to find out otherwise. A bare marker therefore reads as "no
+    change", which is wrong only when the repeated clause is an OLDER one: a
+    Skip → Apply → Skip row whose third evaluation repeats the first reads as
+    not-Skip (the safe direction, and the digest's report fallback still
+    catches it), and the converse, rarer still, an Apply → Skip → Apply row
+    whose third repeats the first, stays a Skip until the person's by-hand
+    lift.
+
+    Otherwise errs towards False, the pre-#183 behaviour: a missed Skip is
+    ranked like any other role, while a wrong one keeps out of the work-order a
+    role that nothing ruled out."""
     notes = notes or ""
-    last_closed = max((m.end() for m in LIVENESS_CLOSED_RE.finditer(notes)), default=-1)
-    last_person = max((m.end() for r in (REOPENED_RE, BY_HAND_RE) for m in r.finditer(notes)),
-                      default=-1)
-    return last_closed > last_person
+    # The tracker parser asks this of every row on every board load and Kanban
+    # write, and almost no row carries the mark. Every match of the
+    # case-sensitive pattern contains the literal, so its absence is the answer
+    # without three regex scans.
+    if DECISION_SKIP_MARK not in notes:
+        return False
+    return _newest_wins(notes, DECISION_SKIP_RE, (BY_HAND_RE, REEVAL_WITH_NOTES_RE))
 
 
 def recheck_discarded(status: str, notes: str, vocabulary: tuple | None = None) -> bool:

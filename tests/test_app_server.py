@@ -263,6 +263,87 @@ def test_status_write_on_a_recheck_closed_row_carries_a_by_hand_mark(client):
     assert client.get("/api/jobs").json()["rows"][0]["status_canonical"] == "Discarded"
 
 
+def test_an_evaluator_skip_reaches_the_board_and_a_status_write_lifts_it(client):
+    """#183: the row field the UI tags by is on /api/jobs, and a person setting
+    the status of a Skip-decided row by hand leaves the mark that overrules the
+    model, through the same override + Push channel the Closed-mark case uses."""
+    from pipeline.app import data, server
+    apps = server._career_ops() / "data" / "applications.md"
+    apps.write_text(apps.read_text(encoding="utf-8").replace(
+        "| APPLY |", "| https://x.example/1 — Decision: Skip — SKIP weak |"), encoding="utf-8")
+    assert client.get("/api/jobs").json()["rows"][0]["skip_decided"] is True
+    assert client.post("/api/status", json={"num": "1", "status": "Interview"}).status_code == 200
+    note = data.override_note(data.load_status_overrides()["1"])
+    assert note.startswith("Set Interview ") and note.endswith("(by hand)")
+
+
+def test_rewriting_a_skip_rows_own_status_is_the_lift(client):
+    """#183: a tagged row is Evaluated, so the lift the UI offers is a write of
+    the status the row already has. The endpoint takes it and records the mark,
+    which Push then carries — a same-status write is not a no-op here."""
+    from pipeline.app import data, server
+    apps = server._career_ops() / "data" / "applications.md"
+    text = apps.read_text(encoding="utf-8").replace(
+        "| APPLY |", "| https://x.example/1 — Decision: Skip — SKIP weak |")
+    apps.write_text(text, encoding="utf-8")
+    row = client.get("/api/jobs").json()["rows"][0]
+    assert row["skip_decided"] is True and row["status_canonical"] == "Evaluated"
+    assert client.post("/api/status", json={"num": "1", "status": "Evaluated"}).status_code == 200
+    value = data.load_status_overrides()["1"]
+    assert data.override_status(value) == "Evaluated"
+    note = data.override_note(value)
+    assert note.startswith("Set Evaluated ") and note.endswith("(by hand)")
+    # What edit-tracker applies in the cloud: the status unchanged, the mark on.
+    pushed, changed = data.apply_cloud_overrides(text, {"1": value})
+    assert changed == 1 and not data.parse_applications_text(pushed)[0]["skip_decided"]
+    # …and the board shows it at once: the pending overlay applies the mark's
+    # effect, not just the status, so the tag goes when the card is moved.
+    assert client.get("/api/jobs").json()["rows"][0]["skip_decided"] is False
+
+
+def test_a_landed_lift_is_caught_up_after_a_later_re_eval_joins_onto_it():
+    """The cloud appends the mark at the END of the cell and merge-tracker joins
+    the next re-evaluation straight onto it with "; " — the mark is then no
+    longer a clause of its own, and an exact-clause test held the entry (and
+    pinned the card's status) for good."""
+    from pipeline.app import data
+    mark = "Set Evaluated 2026-11-24 (by hand)"
+    notes = (f"https://x.example/1 — Work location: On-site Dallas, TX — Decision: Skip"
+             f" — SKIP weak — {mark}; Re-eval 2026-11-25 (2.0→2.1): req 1 — APPLY")
+    assert data.note_landed(notes, mark)
+    assert not data.note_landed(notes, "Set Evaluated 2026-11-30 (by hand)")   # a later lift
+    assert not data.note_landed(notes, "")
+
+
+def test_a_pushed_lift_holds_until_the_tracker_carries_its_mark(client, monkeypatch):
+    """After Push the pending override is gone and the status already matches,
+    so a status-only overlay dropped the lift at once and the tag came back
+    until the next artifact. The pushed entry keeps its note and is caught up
+    only when the row carries it."""
+    from pipeline import state_sync
+    from pipeline.app import data, server
+    apps = server._career_ops() / "data" / "applications.md"
+    skip_text = apps.read_text(encoding="utf-8").replace(
+        "| APPLY |", "| https://x.example/1 — Decision: Skip — SKIP weak |")
+    apps.write_text(skip_text, encoding="utf-8")
+    client.post("/api/status", json={"num": "1", "status": "Evaluated"})
+    value = data.load_status_overrides()["1"]
+    monkeypatch.setattr(state_sync.gh, "latest_successful_run", lambda *a, **k: None)
+    monkeypatch.setattr(state_sync.gh, "trigger_workflow", lambda *a: None)
+    assert client.post("/api/push-status").status_code == 200
+    assert data.load_status_overrides() == {}
+    kept = state_sync.load_pushed_overrides()["1"]
+    assert (data.override_status(kept), data.override_note(kept)) == (
+        "Evaluated", data.override_note(value))                     # note kept
+    assert client.get("/api/jobs").json()["rows"][0]["skip_decided"] is False
+    assert state_sync.load_pushed_overrides()["1"] == kept           # not caught up yet
+    # The next artifact carries the mark: caught up, and the parser agrees.
+    landed, _ = data.apply_cloud_overrides(skip_text, {"1": value})
+    apps.write_text(landed, encoding="utf-8")
+    assert client.get("/api/jobs").json()["rows"][0]["skip_decided"] is False
+    assert "1" not in state_sync.load_pushed_overrides()
+
+
 def test_an_ordinary_drag_stays_unmarked(client):
     from pipeline.app import data
     client.post("/api/status", json={"num": "1", "status": "Applied"})

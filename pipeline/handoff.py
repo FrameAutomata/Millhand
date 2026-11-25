@@ -277,6 +277,9 @@ class QueueRole:
     # pass metro (#180), "" when it does not — one field, since the label is only
     # ever set for a role the predicate demoted.
     area: str = ""
+    # The evaluator decided Skip (#183): never offered as a fresh role, though a
+    # form already filled for it still comes back (`build_work_order`).
+    skip_decided: bool = False
 
     @property
     def board(self) -> str:
@@ -684,11 +687,13 @@ def _iter_jsonl(path: Path):
 def load_queue(path: Path) -> list[QueueRole]:
     """Read evaluated-roles-by-score.jsonl (tolerant of blank/garbled lines).
 
-    `area` (#180) is taken from the row when the export carries it. Nothing in
-    this repo produces this file, and an export written without that key gets no
-    out-of-area demotion — the tracker path derives it from each row's Notes,
-    this one cannot, and inventing a lookup back into the tracker would make the
-    optional artifact depend on the thing it exists to replace."""
+    `area` (#180) and `skip_decided` (#183) are taken from the row when the
+    export carries them — the second through `_truthy`, so a quoted "false" is
+    not a Skip. Nothing in this repo produces this file, and an export written
+    without those keys gets no out-of-area demotion and no Skip exclusion — the
+    tracker path derives both from each row's Notes, this one cannot, and
+    inventing a lookup back into the tracker would make the optional artifact
+    depend on the thing it exists to replace."""
     out: list[QueueRole] = []
     for o in _iter_jsonl(path):
         try:
@@ -711,6 +716,7 @@ def load_queue(path: Path) -> list[QueueRole]:
             report=str(o.get("report") or "").strip(),
             report_num=str(o.get("report_num") or "").strip(),
             easy_apply=_truthy(o.get("easy_apply")),
+            skip_decided=_truthy(o.get("skip_decided")),
         ))
     return out
 
@@ -729,7 +735,14 @@ def load_queue_from_tracker(career_ops: Path) -> list[QueueRole]:
     every --evaluate-batch run writes. This is the default queue source when no
     scored-export jsonl exists (nothing in the repo produces one; it's an
     optional out-of-band artifact), so --handoff works on a fresh install.
-    Rows without a score or URL are skipped — they aren't actionable rows."""
+    Rows without a score or URL are skipped — they aren't actionable rows.
+
+    An Evaluated row the evaluator decided to Skip (#183) stays in the queue,
+    flagged: `skip_decided` is derived by the tracker parser from the row's own
+    `Decision: Skip` mark, the same route `area` takes, so this never opens a
+    report. `build_work_order` is what leaves it out, and only of the fresh
+    roles, because the queue is also what decides whether a filled form comes
+    back and which companies the JOB_LOG reconcile knows."""
     tracker = Path(career_ops) / "data" / "applications.md"
     if not tracker.exists():
         return []
@@ -760,6 +773,7 @@ def load_queue_from_tracker(career_ops: Path) -> list[QueueRole]:
             # easy_apply takes, so the UI, the digest and this ranker cannot
             # come to three different answers about one role.
             area=str(row.get("area") or "").strip(),
+            skip_decided=bool(row.get("skip_decided")),
         ))
     return out
 
@@ -1099,6 +1113,8 @@ def build_work_order(
     tracker: list[TrackedRole],
     board: str = "both",
     limit: int | None = None,
+    *,
+    skipped: list[QueueRole] | None = None,
 ) -> list[WorkOrderItem]:
     """The scored queue minus every key already in the tracker, board-filtered,
     ranked by score descending, numbered from 1, each with a resume-base hint.
@@ -1112,7 +1128,17 @@ def build_work_order(
     before anything new. Only a role still in the QUEUE is re-emitted: the
     queue is what is still actionable, so a ready role whose tracker row has
     since moved on (Applied by hand, Discarded by the re-check) stays in
-    role-status.jsonl and is not sent back to the agent."""
+    role-status.jsonl and is not sent back to the agent.
+
+    A role the evaluator decided to Skip (#183) is never a fresh role: the
+    evaluation's own verdict is that the candidate should not apply, which is
+    why it is left out rather than demoted like `area`. Its filled form still
+    comes back, though: it is waiting on the person, and whether to click
+    Submit is theirs to decide, so dropping it would lose the form without a
+    word. When `skipped` is given, the queue rows left out for a Skip are
+    appended to it — only those that would otherwise have been fresh, so a Skip
+    already tracked or re-emitted is not counted twice — for the count `run`
+    prints and the work-order header states."""
     ready_keys = {t.key for t in tracker if t.status == READY_STATUS}
     touched = {t.key for t in tracker} - ready_keys
     # Secondary index: paren-stripped key → the qualifier sets seen for it.
@@ -1166,6 +1192,10 @@ def build_work_order(
             continue
         if key in touched or _fuzzy_touched(q):
             continue
+        if q.skip_decided:
+            if skipped is not None:
+                skipped.append(q)
+            continue
         seen.add(key)
         fresh.append(q)
 
@@ -1197,6 +1227,8 @@ def build_sessions(
     queue: list[QueueRole],
     tracker: list[TrackedRole],
     limit: int | None = None,
+    *,
+    skipped: list[QueueRole] | None = None,
 ) -> dict[str, list[WorkOrderItem]]:
     """Partition the fresh work-order into one session per site the scraper
     searches from — so a browser agent can log into each site once and work its
@@ -1204,8 +1236,9 @@ def build_sessions(
     tests) to get the globally-deduped, score-descending list, then groups by
     board and applies `limit` PER SESSION (each site capped independently),
     renumbering ranks 1..N within each session. A company::role key appears in
-    exactly one session because build_work_order dedups globally first."""
-    ranked = build_work_order(queue, tracker, board="both", limit=None)
+    exactly one session because build_work_order dedups globally first.
+    `skipped` is build_work_order's, passed through."""
+    ranked = build_work_order(queue, tracker, board="both", limit=None, skipped=skipped)
     sessions: dict[str, list[WorkOrderItem]] = {}
     for item in ranked:                       # already score-descending
         sessions.setdefault(item.board, []).append(item)
@@ -1410,13 +1443,16 @@ def _out_of_area_note(fresh: list[WorkOrderItem]) -> list[str]:
 
 
 def render_work_order_md(items: list[WorkOrderItem], *, board: str = "both",
-                         total_queue: int, touched: int, policy: str | None = None) -> str:
+                         total_queue: int, touched: int, skipped: int = 0,
+                         policy: str | None = None) -> str:
     """Human/agent-readable work-order for one site's session, with a short
     how-to header (stating the submit policy), the status legend, then the
     ready-to-submit rows under READY_HEADING FIRST and the fresh rows after.
     `touched` is the count of tracked roles EXCLUDED (ready ones are not — they
-    are in `items`). Names THIS site's jsonl as the writeback target.
-    Agent-agnostic — never names a specific browser agent."""
+    are in `items`); `skipped` the queued roles left out because the evaluation
+    decided Skip (#183), stated only when there are any, since they are in
+    `total_queue` and nowhere else. Names THIS site's jsonl as the writeback
+    target. Agent-agnostic — never names a specific browser agent."""
     jsonl_name = f"{_work_order_stem(board)}.jsonl"
     site = _site_prefix(board)
     ready = [i for i in items if i.resume_from == READY_STATUS]
@@ -1425,7 +1461,8 @@ def render_work_order_md(items: list[WorkOrderItem], *, board: str = "both",
         f"# Work order — fresh {site}roles for a browser agent",
         "",
         f"{len(fresh)} fresh {site}roles (of {total_queue} scored; {len(ready)} to finish, "
-        f"{touched} excluded).",
+        f"{touched} excluded"
+        + (f", {skipped} the evaluation decided to Skip" if skipped else "") + ").",
         "Work top-down: the score sets your reading order, nothing more — judge each role from the live posting.",
         *_out_of_area_note(fresh),
         policy_line(policy),
@@ -2222,7 +2259,8 @@ def run(
     # candidate who really can reach everything. This is a feature whose only
     # failure mode is invisibility, so the two cases say different things.
     commutable = commutable_area()
-    away = sum(1 for q in queue if q.area)
+    # Excluded Skips are not "sorted last": they are not in any work-order.
+    away = sum(1 for q in queue if q.area and not q.skip_decided)
     if not commutable:
         print("[handoff] out of area: gate OFF -- no commutable metros in the search "
               "config (no non-remote pass with a location, or the config is unreadable)")
@@ -2259,7 +2297,16 @@ def run(
 
     # One session per site the scraper searches from (ranked + limited within
     # each site). A specific --board narrows the build to that one site.
-    sessions = build_sessions(queue, tracked, limit=limit)
+    skipped: list[QueueRole] = []
+    sessions = build_sessions(queue, tracked, limit=limit, skipped=skipped)
+    # #183: said, because a role that silently stops appearing is the failure
+    # this build is careful to name. Counted by the build itself, so a Skip that
+    # was tracked already or comes back as a filled form is not in it.
+    if skipped:
+        print(f"[handoff] evaluator Skip: {len(skipped)} of {len(queue)} queued roles not "
+              "offered as fresh roles (tagged in the UI, where dropping the card on "
+              "Evaluated overrules it; an overrule shows here after Push, the next "
+              "daily run and a Refresh)")
     if not _is_combined(board):
         sessions = {board: sessions.get(board, [])}
 
@@ -2320,7 +2367,8 @@ def run(
         jsonl_path, md_path = work_order_paths(out_dir, b)
         atomic_write_text(jsonl_path, render_work_order_jsonl(items))
         atomic_write_text(md_path, render_work_order_md(
-            items, board=b, total_queue=len(queue), touched=excluded))
+            items, board=b, total_queue=len(queue), touched=excluded,
+            skipped=len(skipped)))
         written.update((jsonl_path, md_path))
 
     # Empty any leftover work-order file whose site produced nothing this run so
@@ -2337,7 +2385,7 @@ def run(
         atomic_write_text(stale, render_work_order_jsonl([]))
         atomic_write_text(stale.with_suffix(".md"), render_work_order_md(
             [], board=_board_from_filename(stale.name),
-            total_queue=len(queue), touched=excluded))
+            total_queue=len(queue), touched=excluded, skipped=len(skipped)))
 
     # ASCII-only: Windows consoles often run cp1252, where fancy arrows crash print.
     all_items = [i for v in sessions.values() for i in v]

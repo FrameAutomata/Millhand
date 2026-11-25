@@ -64,7 +64,8 @@ from pipeline.search_config import load_search_config
 
 __all__ = [
     "MODE_ONSITE", "MODE_HYBRID", "MODE_REMOTE", "PRESENCE_MODES", "OUT_OF_AREA_TAG",
-    "WORK_LOCATION_RE", "WorkLocation", "parse_work_location", "commutable_area",
+    "WORK_LOCATION_RE", "REEVAL_MARK_RE", "REEVAL_WITH_NOTES_RE", "NOTES_CLAUSE_START",
+    "WorkLocation", "parse_work_location", "commutable_area",
     "commutable_states", "out_of_area", "area_label", "area_verdict",
     "location_mark", "work_location_from_notes",
 ]
@@ -106,14 +107,54 @@ OUT_OF_AREA_TAG = "⚠ Out of area"
 # because `_state_of` recovers it. `_prepend_to_notes` owns the cell grammar
 # (`req <id> — <url> — <mark> — <the model's sentence>`).
 WORK_LOCATION_LABEL = "Work location"
-# Anchored to the START of a clause — the beginning of the cell, or just after
-# the ` — ` the Notes grammar joins with. The label is ordinary English, and the
-# model writes that cell: a verdict sentence containing "...flexible work
-# location: negotiable" would otherwise satisfy the idempotence guard (so OUR
-# mark is never written, and the role becomes permanently undemotable) and then
-# win the newest-mark read, since it sits after the mark we did write.
+
+# ── Where a Notes clause starts ─────────────────────────────────────────────
+# merge-tracker's re-evaluation marker. Its `mergeNotes` keeps a row's existing
+# Notes verbatim and FIRST and appends `Re-eval DATE (a→b)` after them — with
+# ` — Superseded report [N] (was X/5)` on a downgrade, and then `: <the
+# addition's whole cell>` unless that cell repeats an existing clause, when
+# the marker is written BARE. (The older script replaced the cell with
+# `Re-eval DATE (a→b). <new notes>`.) Under every shape, what the row's NEWEST
+# evaluation said is whatever follows the last marker. One spelling for every
+# reader — `app.data.extract_url`, `_batch_common.skip_decided`, the digest —
+# and spelled HERE because the clause rule below is built from it and this is
+# the lowest module that reads a Notes clause (`_batch_common` imports it).
+REEVAL_MARK_RE = re.compile(r"\bRe-eval \d{4}-\d{2}-\d{2}")
+# A marker that carries its evaluation's own notes: through the `: ` mergeNotes
+# writes before them, past the one text it ever puts between ")" and ":" — its
+# downgrade marker, " — Superseded report [N] (was X/5)" — matched EXACTLY, so a
+# bare marker followed by one of OUR later " — " clauses (the re-check's
+# "Closed … (liveness re-check: …)", an appended "Work location: …") is never
+# read as one that carries notes. A BARE marker says only that the
+# re-evaluation happened and that its notes repeated a clause already in the
+# cell, which is why `skip_decided` lets just the with-notes form retire an
+# older mark.
+_REEVAL_WITH_NOTES = (REEVAL_MARK_RE.pattern
+                      + r" \([^)]*\)(?: — Superseded report \[[^\]]*\] \(was [^)]*\))?:")
+REEVAL_WITH_NOTES_RE = re.compile(_REEVAL_WITH_NOTES)
+# Where a clause of a Notes cell starts — the beginning of the cell, just after
+# the ` — ` the Notes grammar joins with, or just after a re-evaluation marker's
+# `: `, which is where mergeNotes puts the addition's cell and so its FIRST
+# clause (a row with no req id, URL or Work location mark writes its Decision
+# mark there). ONE pattern for every clause-anchored mark — `WORK_LOCATION_RE`
+# here, `_batch_common.DECISION_SKIP_RE` — so the two readers cannot drift on
+# which positions count. Strict otherwise: a mark's words inside a sentence the
+# model wrote are not at any of these.
+NOTES_CLAUSE_START = rf"(?:^|—|{_REEVAL_WITH_NOTES})\s*"
+
+# Anchored to the START of a clause (`NOTES_CLAUSE_START`). The label is
+# ordinary English, and the model writes that cell: a verdict sentence
+# containing "...flexible work location: negotiable" would otherwise satisfy the
+# idempotence guard (so OUR mark is never written, and the role becomes
+# permanently undemotable) and then win the newest-mark read, since it sits
+# after the mark we did write.
 WORK_LOCATION_RE = re.compile(
-    rf"(?:^|—)\s*{WORK_LOCATION_LABEL}:\s*(?P<value>[^—|]*?)\s*(?=—|\||$)", re.I)
+    rf"{NOTES_CLAUSE_START}{WORK_LOCATION_LABEL}:\s*(?P<value>[^—|]*?)\s*"
+    # "; Re-eval" too: the label trips mergeNotes' location rule
+    # (/\blocation:[^;]*$/i), so a re-evaluation of a row whose cell ENDS with
+    # this mark is joined with "; " rather than ". " — read past it and the
+    # value swallows the whole re-eval clause, losing the state (#180).
+    rf"(?=—|\||;\s*Re-eval\b|$)", re.I)
 
 _MODE_WORDS = {MODE_ONSITE: "On-site", MODE_HYBRID: "Hybrid", MODE_REMOTE: "Remote"}
 
