@@ -99,3 +99,28 @@ class TestThinkingToggle:
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         be._build_caller("openai", "m", disable_thinking=True)("sys", "user")
         assert captured.get("extra_body") is None
+
+
+class TestGroqReasoningBudget:
+    """#223: gpt-oss on Groq reasons inside max_tokens and cannot stop, so it
+    gets more than the shared cap; every other model keeps the shared cap."""
+
+    def _sent(self, monkeypatch, provider, model):
+        captured: dict = {}
+        monkeypatch.setattr("openai.OpenAI", lambda **kw: _fake_openai_client(captured))
+        monkeypatch.setenv(be._PROVIDER_KEYS[provider], "k")
+        be._build_caller(provider, model)("sys", "user")
+        return captured["max_tokens"]
+
+    def test_gpt_oss_on_groq_gets_the_larger_budget(self, monkeypatch):
+        sent = self._sent(monkeypatch, "groq", "openai/gpt-oss-120b")
+        assert sent > be.MAX_TOKENS
+        assert sent == be.GROQ_REASONING_MAX_TOKENS
+
+    @pytest.mark.parametrize("provider,model", [
+        ("groq", "qwen/qwen3.8-27b"),               # another Groq model: its own cap
+        ("deepinfra", "openai/gpt-oss-120b"),       # the same model elsewhere: not this rule
+    ])
+    def test_everything_else_keeps_the_shared_cap(self, monkeypatch, provider, model):
+        assert self._sent(monkeypatch, provider, model) == be.MAX_TOKENS
+

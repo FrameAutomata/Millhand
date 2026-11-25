@@ -5,14 +5,11 @@ workers. Results are written as they complete.
 
 Supported providers
 -------------------
-  anthropic    claude-haiku-5-5  (default)             ANTHROPIC_API_KEY (+ ANTHROPIC_EFFORT)
-  gemini       gemini-2.5-flash  (default)             GEMINI_API_KEY
-  openai       gpt-4o-mini       (default)             OPENAI_API_KEY
-  groq         llama-3.3-70b-versatile (default)       GROQ_API_KEY
-  deepinfra    deepseek-ai/DeepSeek-V4-Flash (def)     DEEPINFRA_API_KEY
-  openrouter   meta-llama/llama-3.3-70b-instruct (def) OPENROUTER_API_KEY
-  deepseek     deepseek-chat     (default)             DEEPSEEK_API_KEY
-  ollama       qwen2.5:32b       (default)             OLLAMA_BASE_URL (default: http://localhost:11434)
+The providers and their default models are PROVIDER_DEFAULTS. The API-key env
+var each one reads is _PROVIDER_KEYS, whose order is also auto-detection's:
+BATCH_PROVIDER, else the first of those keys that is set. ollama needs no key
+(it reads OLLAMA_BASE_URL, default http://localhost:11434), and ANTHROPIC_EFFORT
+sets how much Claude thinks before answering.
 
 Hosted open-model providers (deepinfra, openrouter) serve open-weight models
 like Llama 3.3 70B and DeepSeek V3 over OpenAI-compatible APIs. See
@@ -26,9 +23,6 @@ OPENAI_API_KEY=<their-key> + OPENAI_BASE_URL=<their-url>.
 
 DeepSeek's own API (DEEPSEEK_API_KEY, https://api.deepseek.com) is a first-class
 provider — cheaper than DeepInfra hosting the same weights, for high-volume runs.
-
-Provider auto-detection: BATCH_PROVIDER env var, then first key found in the
-order: gemini → groq → deepinfra → openrouter → deepseek → openai → anthropic.
 
 Requirements (install only the provider you need):
   pip install anthropic                  # anthropic
@@ -98,7 +92,16 @@ PROVIDER_DEFAULTS: dict[str, str] = {
     # per-model free-tier caps + the run-time warning, and .env.example.
     "gemini": "gemini-2.5-flash",
     "openai": "gpt-4o-mini",
-    "groq": "llama-3.3-70b-versatile",
+    # openai/gpt-oss-120b, NOT llama-3.3-70b-versatile (#223): Groq shut the
+    # llama down for free and Developer keys on 2026-08-16, and it has been
+    # enterprise-only since — which is why the models page still lists it,
+    # under an Enterprise badge. gpt-oss-120b is the replacement Groq's
+    # deprecations page and changelog both name, and a Production model;
+    # qwen/qwen3.8-27b is Preview, and qwen/qwen3.6-27b, the deprecations
+    # page's other suggestion, was itself shut down on 2026-09-14. gpt-oss-120b
+    # is unverified live: nobody here has seen it finish an evaluation. No model
+    # makes Groq's free tier usable here (see _TOO_LARGE_MARKERS).
+    "groq": "openai/gpt-oss-120b",
     # Hosted open-weight providers. The model ID conventions differ across
     # providers (capital vs lowercase namespaces), so these aren't typos.
     # Override via BATCH_MODEL.
@@ -205,6 +208,15 @@ _CONFIG_ERROR_MARKERS = (
     "no address associated with hostname",
 )
 
+# A request larger than the provider will admit at all (#223): Groq's 413
+# "Request too large for model … on tokens per minute (TPM)", which a free key
+# gets on every evaluation, and Anthropic's 413 `request_too_large`. No wait and
+# no sibling model makes such a request fit, so it is never transient.
+_TOO_LARGE_MARKERS = (
+    "request too large",
+    "request_too_large",
+)
+
 # An empty-content failure is deterministic on a single model (a reasoning model
 # exhausting MAX_TOKENS, a safety block) — failover to a SIBLING is the right
 # move, but re-running the identical prompt against the SAME model many times is
@@ -253,15 +265,14 @@ def _is_transient_provider_error(exc: BaseException) -> bool:
     error'): everything where a retry or a failover to a sibling model makes
     sense. Definitive caller/config errors (401 auth, 404 bad model id, a dead
     host/port) stay non-transient so a misconfiguration fails loudly on job 1
-    instead of burning the whole chain x backlog."""
+    instead of burning the whole chain x backlog — and so does a 413, a request
+    too large for the provider to admit at all."""
     # Combine the message with its __cause__ — openai's APIConnectionError
     # stringifies to a bare "Connection error." and puts the real reason
     # ("All connection attempts failed") on the cause.
     text = (str(exc) + " " + str(getattr(exc, "__cause__", "") or "")).lower()
     if any(marker in text for marker in _CONFIG_ERROR_MARKERS):
         return False
-    if _is_rate_limit_error(exc):
-        return True
     status = getattr(exc, "status_code", None)
     if status is None:
         status = getattr(exc, "code", None)
@@ -269,6 +280,12 @@ def _is_transient_provider_error(exc: BaseException) -> bool:
         code = int(status) if status is not None else None
     except (TypeError, ValueError):
         code = None
+    # Before the rate-limit test: Groq's 413 carries `rate_limit_exceeded` in
+    # its body, which _RATE_LIMIT_MARKERS matches.
+    if code == 413 or any(marker in text for marker in _TOO_LARGE_MARKERS):
+        return False
+    if _is_rate_limit_error(exc):
+        return True
     if code is not None:
         if code in (408, 429):     # request timeout / too many requests — transient
             return True
@@ -385,6 +402,21 @@ def _call_with_retry(
 # budget runs out). A slower model (Opus, Fable) needs LLM_TIMEOUT raised to
 # match, since a non-streamed answer arrives all at once or not at all.
 ANTHROPIC_MAX_TOKENS = 20_000
+
+# Groq's gpt-oss models reason before they answer too, the reasoning counts
+# toward max_tokens, and Groq cannot turn it off ("low" is the floor) — so the
+# shared MAX_TOKENS would cut a long evaluation off, which counts against the
+# job (#206) and abandons it (#223). 16,384 of the model's 65,536 completion
+# tokens leaves room for the reasoning and a ~5K-token report; unverified live,
+# like the model itself. Other Groq models keep MAX_TOKENS: their completion
+# caps differ, and a request over a model's cap is refused outright.
+GROQ_REASONING_MAX_TOKENS = 16_384
+
+
+def _max_tokens_for(provider: str, model: str) -> int:
+    if provider == "groq" and model.startswith("openai/gpt-oss-"):
+        return GROQ_REASONING_MAX_TOKENS
+    return MAX_TOKENS
 
 # `output_config.effort`: how much the model thinks. Thinking is billed as
 # output, so this is the main cost control on Claude; unset is the model's own
@@ -527,7 +559,8 @@ _THINKING_TOGGLE_PROVIDERS = frozenset({"deepinfra", "openrouter", "ollama"})
 
 
 def _build_openai_compat_caller(model: str, api_key: str, base_url: str | None = None,
-                                disable_thinking: bool = False) -> Caller:
+                                disable_thinking: bool = False,
+                                max_tokens: int = MAX_TOKENS) -> Caller:
     from openai import OpenAI  # type: ignore[import]
     # Explicit timeout: the SDK default is 600s, so a hung endpoint silently
     # stalls a worker for 10 minutes per attempt (a live MiMo outage froze a
@@ -545,7 +578,7 @@ def _build_openai_compat_caller(model: str, api_key: str, base_url: str | None =
     def call(system: str, user: str) -> str:
         resp = client.chat.completions.create(
             model=model,
-            max_tokens=MAX_TOKENS,
+            max_tokens=max_tokens,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -680,6 +713,7 @@ def _build_single_caller(provider: str, model: str, *, disable_thinking: bool = 
         return _build_openai_compat_caller(
             model, api_key=os.environ[_PROVIDER_KEYS[provider]],
             base_url=PROVIDER_BASE_URLS[provider], disable_thinking=toggle,
+            max_tokens=_max_tokens_for(provider, model),
         )
     if provider == "ollama":
         # `or DEFAULT` not `get(VAR, DEFAULT)` — see BATCH_MODEL fix below for
@@ -693,8 +727,9 @@ def _build_single_caller(provider: str, model: str, *, disable_thinking: bool = 
 # ── Provider validation ──────────────────────────────────────────────────────
 
 # Detection order matters when a user has multiple keys configured. We check
-# free-tier providers first (Gemini, Groq), then hosted open-model providers
-# (DeepInfra, OpenRouter), then closed-weights paid APIs (OpenAI, Anthropic).
+# Gemini's free tier first, then Groq (paid here — #223), then hosted
+# open-model providers (DeepInfra, OpenRouter), then closed-weights paid APIs
+# (OpenAI, Anthropic).
 # Users can always override with BATCH_PROVIDER if they want a specific one.
 # ollama has no required key, so it is excluded from auto-detection.
 _PROVIDER_KEYS: dict[str, str] = {
