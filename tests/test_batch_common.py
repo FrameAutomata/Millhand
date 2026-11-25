@@ -15,6 +15,7 @@ from pipeline._batch_common import (
     IncompleteResponse,
     ADDITION_LABEL_LINE,
     ADDITION_LABELS,
+    atomic_write_text,
     _HEADED_PARSER_MARKER,
     _dead_link_repair,
     labelled_addition,
@@ -96,14 +97,14 @@ _APPS_HEADER = ("# Applications Tracker\n\n"
                 "|---|------|---------|------|-------|--------|-----|--------|-------|\n")
 
 
-def _career_ops(tmp_path, rows=(), additions=()):
+def _career_ops(tmp_path, rows=(), additions=(), header=_APPS_HEADER):
     """A career-ops with a stand-in merge-tracker.mjs, a tracker holding `rows`
-    and one labelled addition per name in `additions` — the form
+    under `header` and one labelled addition per name in `additions` — the form
     `write_job_result` writes. Returns (career_ops, its queue)."""
     co = tmp_path / "career-ops"
     (co / "data").mkdir(parents=True)
     (co / "merge-tracker.mjs").write_text(_CURRENT_MERGE_TRACKER, encoding="utf-8")
-    (co / "data" / "applications.md").write_text(_APPS_HEADER + "".join(rows), encoding="utf-8")
+    (co / "data" / "applications.md").write_text(header + "".join(rows), encoding="utf-8")
     queue = co / "batch" / "tracker-additions"
     queue.mkdir(parents=True)
     for i, name in enumerate(additions):
@@ -162,6 +163,76 @@ class TestTailText:
         assert "OLD-LINE" not in out
         assert "NEW-LINE" in out
 
+
+class TestAtomicWriteText:
+    def test_two_writers_do_not_share_a_sibling(self, tmp_path, mocker):
+        """One sibling name for every writer of a file tore their writes: the
+        second truncated and refilled the sibling the first had written, and
+        replaced it — after which the first writer's replace failed, so its
+        write was lost with an exception (or, mid-write, installed the second's
+        partial text). Held here at the point between write and replace."""
+        target = tmp_path / "applications.md"
+        target.write_text("before\n", encoding="utf-8")
+        real = Path.write_text
+        a_written, b_done = threading.Event(), threading.Event()
+
+        def write_text(self, *args, **kwargs):
+            out = real(self, *args, **kwargs)
+            if threading.current_thread().name == "writer-a":
+                a_written.set()
+                b_done.wait(5)
+            return out
+
+        mocker.patch.object(Path, "write_text", write_text)
+        errors = []
+
+        def writer_a():
+            try:
+                atomic_write_text(target, "from A\n")
+            except Exception as exc:     # noqa: BLE001 — the assertion reports it
+                errors.append(exc)
+
+        a = threading.Thread(target=writer_a, name="writer-a")
+        a.start()
+        assert a_written.wait(5)
+        atomic_write_text(target, "from B\n")
+        b_done.set()
+        a.join(5)
+        assert errors == []
+        assert target.read_text(encoding="utf-8") == "from A\n"     # the last word, whole
+        assert [f.name for f in tmp_path.iterdir()] == ["applications.md"]
+
+    def test_a_failed_replace_leaves_the_file_and_no_sibling(self, tmp_path, mocker):
+        """A per-writer sibling is no longer overwritten by the next write, so
+        one a failed write leaves behind would stay — on Windows that failure
+        is routine, a tracker held open by another program."""
+        target = tmp_path / "applications.md"
+        target.write_text("before\n", encoding="utf-8")
+        mocker.patch.object(_batch_common.os, "replace", side_effect=PermissionError("held open"))
+        with pytest.raises(PermissionError):
+            atomic_write_text(target, "after\n")
+        assert target.read_text(encoding="utf-8") == "before\n"
+        assert [f.name for f in tmp_path.iterdir()] == ["applications.md"]
+
+    def test_a_sibling_caught_mid_write_is_in_no_readers_glob(self, tmp_path, mocker):
+        """A forward guard on the name, not a pin of the per-writer fix (the two
+        tests above are that): the readers of the directories written here
+        match on a suffix, and a sibling must keep failing every one of them."""
+        additions, handoff = tmp_path / "tracker-additions", tmp_path / "handoff"
+        seen, siblings = [], []
+        real = os.replace
+
+        def replace(src, dst):
+            siblings.append(Path(src).name)
+            seen.extend(p.name for d, pat in ((additions, "*.tsv"), (handoff, "next-roles*.jsonl"))
+                        for p in d.glob(pat))
+            return real(src, dst)
+
+        mocker.patch.object(_batch_common.os, "replace", side_effect=replace)
+        atomic_write_text(additions / "7.tsv", "x")
+        atomic_write_text(handoff / "next-roles-linkedin.jsonl", "x")
+        assert len(siblings) == 2       # each caught while it sat beside its file
+        assert seen == ["7.tsv"]        # the first file, in place when the second was written
 
 class TestReadText:
     def test_reads_file_content(self, tmp_path):
@@ -3082,6 +3153,465 @@ class TestRecoverRefusedAdditions:
         mocker.patch("pipeline._batch_common.subprocess.run", side_effect=snapshot)
         run_merge_tracker(co)
         assert seen["pending"] == ["7.tsv"]         # back in the queue when node ran
+
+
+# A report header in each of the two shapes that write one: this repo's
+# evaluation prompt (`build_system_prompt`) and career-ops' batch-prompt.md,
+# whose report also ends with the JD archived verbatim.
+def _our_report(url="https://x/j/7"):
+    return ("# Evaluacion: Acme Corp - Platform Engineer\n\n**Fecha:** 2026-09-01\n"
+            "**Arquetipo:** Platform\n**Score:** 4.7/5\n**Legitimacy:** High Confidence\n"
+            f"**URL:** {url}\n**PDF:** null (batch mode)\n**Batch ID:** 7\n\n---\n\n"
+            "## Machine Summary\n\n```yaml\nfinal_decision: Apply\n```\n")
+
+
+def _career_ops_report(url="https://x/j/7"):
+    return ("# Evaluation: Acme Corp — Platform Engineer\n\n**Date:** 2026-09-01\n"
+            "**Archetype:** Platform\n**Score:** 4.7/5\n**Decision:** Apply\n"
+            f"**Legitimacy:** High Confidence\n**Work Auth:** ➖ Not needed\n**URL:** {url}\n"
+            "**PDF:** not generated\n**Batch ID:** 7\n\nStrong match.\n\n---\n\n"
+            "## A) Role Summary\n\nx\n\n---\n\n## Job Description (archived verbatim)\n\n"
+            "Apply here.\nURL: https://acme.example/careers\n")
+
+
+class TestReportHeaderUrl:
+    @pytest.mark.parametrize("report", [_our_report(), _career_ops_report()],
+                             ids=["ours", "career-ops"])
+    def test_both_prompts_header_shapes(self, report):
+        assert _batch_common.report_header_url(report) == "https://x/j/7"
+
+    @pytest.mark.parametrize("line", [
+        "**URL**: https://x/j/7",                      # the colon outside the bold
+        "URL: https://x/j/7",                          # the bold dropped
+        "- **URL:** https://x/j/7",                    # a list bullet
+        "**URL:**https://x/j/7",                       # no space
+        "**URL:**   https://x/j/7  (LinkedIn)",        # whitespace, a trailing aside
+        "**url:** https://x/j/7",
+        "**URL:** <https://x/j/7>",                    # an autolink
+        "**Score:** 4.1/5 | **URL:** https://x/j/7 | **Legitimacy:** High",   # the inline form
+        "**URL:** https://x/j/7|**Legitimacy:** High",  # a `|` would split the Notes cell
+        "**URL:** https://x/j/7.",                     # a full stop, trimmed as extract_url trims one
+    ])
+    def test_what_a_model_does_to_the_label(self, line):
+        assert _batch_common.report_header_url(f"# Evaluation: Acme\n\n{line}\n\n---\n") == \
+            "https://x/j/7"
+
+    @pytest.mark.parametrize("value", ["N/A", "{{URL}}", "URL", "www.x.com/j/7", "",
+                                       "[posting](https://x/j/7)"])
+    def test_a_value_that_is_not_an_http_url_is_none(self, value):
+        assert _batch_common.report_header_url(_our_report(value)) == ""
+
+    def test_the_report_our_prompt_prescribes(self):
+        """Held to `build_system_prompt`'s own report template, not to the copy
+        in `_our_report`. (career-ops' batch prompt is held to it by the
+        contract test, where the checkout is.)"""
+        report = re.search(r"<report>\n(.*?)</report>", build_system_prompt("", ""), re.S)
+        assert report, "the evaluation prompt no longer shows a <report> template"
+        filled = re.sub(r"(\*\*URL:\*\*) URL$", r"\1 https://x/j/7", report.group(1), flags=re.M)
+        assert filled != report.group(1), "the template's `**URL:** URL` line has moved"
+        assert _batch_common.report_header_url(filled) == "https://x/j/7"
+
+    def test_the_header_only(self):
+        """A JD archived below the header can carry an employer's own "URL:"
+        line; a header that lost its URL line must not borrow it."""
+        report = _career_ops_report().replace("**URL:** https://x/j/7\n", "")
+        assert "URL: https://acme.example/careers" in report
+        assert _batch_common.report_header_url(report) == ""
+
+    def test_a_label_inside_another_word_is_not_the_line(self):
+        assert _batch_common.report_header_url("**Apply URL:** https://x/j/7\n---\n") == ""
+
+    @pytest.mark.parametrize("line", [
+        "**URL: https://x/j/7**",                      # the bold closed after the value
+        "*URL:* https://x/j/7*",                       # an italic one
+        "**URL:** **https://x/j/7**",                  # the value bold on its own
+        "**URL:** `https://x/j/7`",                    # a code span
+        "**URL:** https://x/j/7.**",                   # punctuation inside the wrapper
+        "**URL:** https://x/j/7**.",                   # ...and outside it
+        "**URL:** <https://x/j/7>,",
+    ])
+    def test_markdown_around_the_value_is_not_part_of_the_url(self, line):
+        """Left in, the wrapper is a URL that 404s — and written after the last
+        Re-eval marker it is what `extract_url` reads from then on, so the
+        re-check fetches it and Discards a live role."""
+        assert _batch_common.report_header_url(f"# Evaluation: Acme\n\n{line}\n\n---\n") == \
+            "https://x/j/7"
+
+    def test_a_backslash_escape_is_unescaped(self):
+        """A model writing markdown escapes an underscore; the posting's own URL
+        has none."""
+        assert _batch_common.report_header_url(_our_report(r"https://x/j/a\_b\-c")) == \
+            "https://x/j/a_b-c"
+
+    def test_an_asterisk_inside_the_url_stays(self):
+        """Only the ends are stripped: `*` is a legal URL character."""
+        assert _batch_common.report_header_url(_our_report("https://x/j/a*b")) == "https://x/j/a*b"
+
+    @pytest.mark.parametrize("report", [_our_report(), _career_ops_report()],
+                             ids=["ours", "career-ops"])
+    @pytest.mark.parametrize("title", ["## ", "### ", "\n\n## ", "  ## "])
+    def test_a_title_at_any_level_is_not_the_end_of_the_header(self, report, title):
+        """The header ends at the first `## ` heading — the title's own line,
+        when a model writes the title one level down, and every URL above it
+        was then nowhere."""
+        titled = report.replace("# Eval", title + "Eval", 1)
+        assert titled != report
+        assert _batch_common.report_header_url(titled) == "https://x/j/7"
+
+    def test_skipping_the_title_does_not_reach_the_archived_jd(self):
+        """A report with no header — its first line a section heading — still
+        ends at the next rule, so a JD archived after one is not read. (With no
+        rule at all, a heading-first report cannot be told from an H2-titled
+        one and is read as one; no writer produces either without a title.)"""
+        report = _career_ops_report().split("---\n\n", 1)[1]
+        assert report.startswith("## A) Role Summary")
+        assert "URL: https://acme.example/careers" in report
+        assert _batch_common.report_header_url(report) == ""
+
+    def test_a_url_on_the_title_line_counts(self):
+        """The title is skipped to find the header's end, not to bound the
+        search, so this reads as it did before the title was skipped at all."""
+        report = "# Evaluation: Acme | **URL:** https://x/j/7 | **Score:** 4/5\n\n---\n"
+        assert _batch_common.report_header_url(report) == "https://x/j/7"
+
+    @pytest.mark.parametrize("line", [
+        "**URL:** https://x/j/7\\|**Legitimacy:** High",
+        "**Score:** 4.1/5 \\| **URL:** https://x/j/7\\| **Legitimacy:** High",
+        "**URL:** https://x/j/7.\\|",
+    ])
+    def test_an_escaped_pipe_leaves_no_backslash(self, line):
+        """A model escaping the inline form's `|` for markdown: the value stops
+        at the pipe, and the backslash before it is not part of the URL."""
+        assert _batch_common.report_header_url(f"# Evaluation: Acme\n\n{line}\n\n---\n") == \
+            "https://x/j/7"
+
+
+class TestBackfillReportUrls:
+    """#190: a `--batch` row's posting URL, read back out of its own report."""
+
+    ROW = ("| 11 | 2026-09-01 | Acme Corp | Platform Engineer | 4.7/5 | Evaluated | null "
+           "| [229](../reports/229-acme-corp-2026-09-01.md) | APPLY strong match |\n")
+    REPORT = "229-acme-corp-2026-09-01.md"
+
+    @staticmethod
+    def _tree(tmp_path, rows=(ROW,), reports=None, header=_APPS_HEADER):
+        """`_career_ops` with reports/ holding `reports` ({filename: text}; by
+        default the ROW's report, naming https://x/j/7)."""
+        co, _ = _career_ops(tmp_path, rows, header=header)
+        (co / "reports").mkdir()
+        for name, text in ({TestBackfillReportUrls.REPORT: _our_report()}
+                           if reports is None else reports).items():
+            (co / "reports" / name).write_text(text, encoding="utf-8")
+        return co
+
+    @staticmethod
+    def _tracker(co):
+        return (co / "data" / "applications.md").read_text(encoding="utf-8")
+
+    @staticmethod
+    def _notes(co):
+        return tracker_row(co / "data" / "applications.md", "11")["notes"]
+
+    def _assert_untouched(self, co, capsys):
+        before = self._tracker(co)
+        _batch_common._backfill_report_urls(co)
+        assert self._tracker(co) == before
+        assert capsys.readouterr().out == ""
+
+    def test_a_row_with_no_url_gets_its_reports(self, tmp_path, capsys):
+        from pipeline.app import data
+        co = self._tree(tmp_path)
+        _batch_common._backfill_report_urls(co)
+        assert self._notes(co) == "APPLY strong match — https://x/j/7"
+        assert data.extract_url(self._notes(co)) == "https://x/j/7"
+        assert "into the Notes of 1 tracker row" in capsys.readouterr().out
+
+    def test_a_row_with_a_url_after_its_last_re_eval_is_skipped(self, tmp_path, capsys):
+        """A URL the newest evaluation's own notes carry stands, even where the
+        report names another — which is also why such a row is never read."""
+        rows = (self.ROW.replace("| APPLY strong match |", "| https://x/j/model — APPLY |"),
+                self.ROW.replace("| 11 |", "| 12 |").replace("[229]", "[230]").replace(
+                    "| APPLY strong match |",
+                    "| https://x/j/old — APPLY. Re-eval 2026-09-01 (4→4.7): https://x/j/mine |"))
+        co = self._tree(tmp_path, rows=rows, reports={
+            self.REPORT: _our_report(), "230-acme-corp.md": _our_report("https://x/j/8")})
+        self._assert_untouched(co, capsys)
+
+    def test_a_re_eval_with_no_url_gets_the_new_reports_after_the_marker(self, tmp_path):
+        """merge-tracker keeps the old Notes first and appends the re-eval's —
+        a `--batch` one carries no URL — so `extract_url` fell back to the OLD
+        posting while the Report cell links the new report. Appended after the
+        last clause, the new URL is the first one after the last marker."""
+        from pipeline.app import data
+        notes = "https://x/j/old — APPLY. Re-eval 2026-09-01 (4→4.7): APPLY strong match"
+        co = self._tree(tmp_path, rows=(self.ROW.replace("| APPLY strong match |", f"| {notes} |"),))
+        assert data.extract_url(self._notes(co)) == "https://x/j/old"        # the premise
+        _batch_common._backfill_report_urls(co)
+        assert self._notes(co) == f"{notes} — https://x/j/7"
+        assert data.extract_url(self._notes(co)) == "https://x/j/7"
+
+    def test_a_re_eval_of_the_same_posting_writes_nothing(self, tmp_path, capsys):
+        """merge-tracker elides re-eval notes that repeat a clause, so no URL
+        follows the marker — but the fallback is already the report's posting."""
+        notes = "https://x/j/7 — APPLY strong match. Re-eval 2026-09-01 (4→4.7)"
+        co = self._tree(tmp_path, rows=(self.ROW.replace("| APPLY strong match |", f"| {notes} |"),))
+        self._assert_untouched(co, capsys)
+
+    def test_a_report_naming_no_http_url_writes_nothing(self, tmp_path, capsys):
+        co = self._tree(tmp_path, reports={self.REPORT: _our_report("N/A")})
+        self._assert_untouched(co, capsys)
+
+    def test_a_missing_report_writes_nothing(self, tmp_path, capsys):
+        co = self._tree(tmp_path, reports={})
+        self._assert_untouched(co, capsys)
+
+    def test_a_reservation_lock_is_not_a_report(self, tmp_path, capsys):
+        """The number resolves to career-ops' `NNN-RESERVED.md` alone — a
+        killed run's lock, not an evaluation. Skipped by its name, so the body
+        here is a report's, to show it is never read."""
+        co = self._tree(tmp_path, reports={"229-RESERVED.md": _our_report()})
+        self._assert_untouched(co, capsys)
+
+    def test_a_dead_link_is_resolved_by_its_number(self, tmp_path):
+        """The model invents the link's slug (#162); the report readers resolve
+        a dead link by its number, and so does this."""
+        co = self._tree(tmp_path, reports={"229-acme-2026-09-01.md": _our_report()})
+        _batch_common._backfill_report_urls(co)
+        assert self._notes(co).endswith("— https://x/j/7")
+
+    def test_a_dealbreaker_skip_has_no_report_and_gets_no_url(self, tmp_path, capsys):
+        """The accepted gap: a SKIP's Report cell is `-`, so there is nothing to
+        read the URL from."""
+        row = self.ROW.replace("[229](../reports/229-acme-corp-2026-09-01.md)", "-")
+        co = self._tree(tmp_path, rows=(row,))
+        self._assert_untouched(co, capsys)
+
+    @pytest.mark.parametrize("row", [
+        ROW.replace("| Platform Engineer |", "| Platform Engineer | Remote |"),
+        ROW.replace(" APPLY strong match |", ""),
+    ], ids=["injected-cell", "no-notes-cell"])
+    def test_a_row_whose_cells_are_not_where_its_header_says_is_left_alone(
+            self, tmp_path, capsys, row):
+        """The cell read must be the cell written. Read by header, an injected
+        cell's row has its Report cell for Notes, while the row editor writes
+        where the Report anchor puts them; a row short of its Notes cell has
+        none to read or write."""
+        co = self._tree(tmp_path, rows=(row,))
+        self._assert_untouched(co, capsys)
+
+    def test_a_number_two_rows_share_is_left_alone(self, tmp_path, capsys):
+        """The row editor writes the FIRST row with the number, which need not
+        be the row whose report was read."""
+        other = self.ROW.replace("Acme Corp", "Initech").replace(
+            "[229](../reports/229-acme-corp-2026-09-01.md)", "-")
+        co = self._tree(tmp_path, rows=(other, self.ROW))
+        self._assert_untouched(co, capsys)
+
+    def test_the_notes_cell_is_found_by_its_header(self, tmp_path):
+        """A Via-layout tracker gets the URL in Notes, not in the agency's cell."""
+        header = ("# Applications Tracker\n\n"
+                  "| # | Date | Company | Via | Role | Score | Status | PDF | Report | Notes |\n"
+                  "|---|------|---------|-----|------|-------|--------|-----|--------|-------|\n")
+        row = self.ROW.replace("| Acme Corp |", "| Acme Corp | Hays |")
+        co = self._tree(tmp_path, rows=(row,), header=header)
+        _batch_common._backfill_report_urls(co)
+        written = tracker_row(co / "data" / "applications.md", "11")
+        assert written["via"] == "Hays" and written["notes"].endswith("— https://x/j/7")
+
+    def test_a_second_pass_is_byte_identical_and_silent(self, tmp_path, capsys):
+        notes = "https://x/j/old — APPLY. Re-eval 2026-09-01 (4→4.7): APPLY strong match"
+        co = self._tree(tmp_path, rows=(
+            self.ROW, self.ROW.replace("| 11 |", "| 12 |").replace("Acme Corp", "Globex")
+            .replace("229-acme-corp", "230-globex").replace("[229]", "[230]")
+            .replace("| APPLY strong match |", f"| {notes} |")),
+            reports={self.REPORT: _our_report(), "230-globex-2026-09-01.md": _our_report("https://x/j/8")})
+        _batch_common._backfill_report_urls(co)
+        assert "into the Notes of 2 tracker row" in capsys.readouterr().out
+        self._assert_untouched(co, capsys)
+
+    def test_no_override_is_queued(self, tmp_path):
+        """A `--batch` row is local — the cloud tracker never had it — and an
+        override carries a status the cloud applies by row number alone (#254).
+        The tracker file is the whole record."""
+        from pipeline.app import data
+        co = self._tree(tmp_path)
+        _batch_common._backfill_report_urls(co)
+        assert "https://x/j/7" in self._notes(co)
+        assert data.load_status_overrides() == {}
+
+    def test_the_url_survives_a_refresh_of_a_cloud_tracker_without_the_row(self, tmp_path):
+        """Refresh keeps a local-only row with its cells, so the local file is
+        enough for the URL to stay."""
+        from pipeline.app import data
+        co = self._tree(tmp_path)
+        _batch_common._backfill_report_urls(co)
+        artifact = tmp_path / "artifact"
+        (artifact / "data").mkdir(parents=True)
+        (artifact / "data" / "applications.md").write_text(
+            _APPS_HEADER + self.ROW.replace("Acme Corp", "Initech").replace("[229]", "[1]")
+            .replace("| 11 |", "| 1 |"), encoding="utf-8")
+        data.sync_pulled_tracker(artifact, co)
+        acme = [r for r in data.parse_applications(co / "data" / "applications.md")
+                if r["company"] == "Acme Corp"]
+        assert [data.extract_url(r["notes"]) for r in acme] == ["https://x/j/7"]
+
+    def test_run_merge_tracker_backfills_before_node_whatever_it_exits(self, tmp_path, mocker):
+        """Beside recovery, ahead of the merge: the runner's rows get their URL
+        even when this merge itself fails."""
+        co = self._tree(tmp_path)
+        seen = {}
+
+        def run(*a, **kw):
+            seen["notes"] = self._notes(co)
+            return mocker.MagicMock(returncode=1, stdout="", stderr="boom")
+        mocker.patch("pipeline._batch_common.subprocess.run", side_effect=run)
+        assert run_merge_tracker(co) is False
+        assert seen["notes"].endswith("— https://x/j/7")
+
+    def test_a_second_re_eval_of_the_same_posting_moves_off_the_first(self, tmp_path, capsys):
+        """The first `--batch` re-eval had the report's URL written after its
+        marker; a second one of the same posting has none after its own, so
+        `extract_url` falls back to the FIRST posting. The URL is already a
+        clause of the cell — an older evaluation's — and the row editor's dedup
+        refused it: the row stayed on the dead posting for good, every merge
+        setting out to fix it and changing nothing. Written again after the last
+        marker, it is the posting from then on, and the next pass is a no-op."""
+        from pipeline.app import data
+        notes = ("https://x/j/1 — Re-eval 2026-10-01 (3.0→4.0): fits — https://x/j/7 — "
+                 "Re-eval 2026-11-01 (4.0→4.1): still fits")
+        co = self._tree(tmp_path, rows=(self.ROW.replace("| APPLY strong match |", f"| {notes} |"),))
+        text = self._tracker(co)
+        assert data.extract_url(self._notes(co)) == "https://x/j/1"               # the premise
+        assert data.append_note_in_text(text, "11", "https://x/j/7") == text       # ...and the dedup
+        _batch_common._backfill_report_urls(co)
+        assert self._notes(co) == f"{notes} — https://x/j/7"
+        assert data.extract_url(self._notes(co)) == "https://x/j/7"
+        assert "into the Notes of 1 tracker row" in capsys.readouterr().out
+        self._assert_untouched(co, capsys)
+
+    @pytest.mark.parametrize("sep", [" ", "\x0c"], ids=["U+2028", "form-feed"])
+    def test_a_url_the_readers_would_not_see_is_named_not_written(self, tmp_path, capsys, sep):
+        """`data_rows` splits lines as `splitlines()` does and the row editor on
+        "\\n" alone, so with such a separator inside Notes the editor appends
+        past where every reader stops. Written, the row would read back with no
+        URL and be written again on every merge."""
+        co = self._tree(tmp_path, rows=(
+            self.ROW.replace("| APPLY strong match |", f"| APPLY{sep}strong match |"),))
+        before = self._tracker(co)
+        _batch_common._backfill_report_urls(co)
+        assert self._tracker(co) == before
+        out = capsys.readouterr().out
+        assert "left 1 tracker row(s) without the posting URL its report names (#11)" in out
+        assert "into the Notes of" not in out
+
+    def test_a_crlf_tracker_comes_back_byte_for_byte_but_the_row(self, tmp_path):
+        other = self.ROW.replace("| 11 |", "| 12 |").replace("Acme Corp", "Initech").replace(
+            "[229](../reports/229-acme-corp-2026-09-01.md)", "-")
+        co = self._tree(tmp_path, rows=(self.ROW, other))
+        apps = co / "data" / "applications.md"
+        apps.write_bytes(apps.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+        before = apps.read_bytes()
+        _batch_common._backfill_report_urls(co)
+        assert apps.read_bytes() == before.replace(
+            b"| APPLY strong match |\r\n| 12 |",
+            "| APPLY strong match — https://x/j/7 |\r\n| 12 |".encode("utf-8"))
+
+    def test_a_tracker_changed_while_it_was_read_is_not_overwritten(self, tmp_path, capsys, mocker):
+        """career-ops' writers take career-ops' tracker lock, not ours, so a
+        `--batch` merge can land between the parse and the replace. It is not
+        undone: this pass writes nothing, and the next writes the URL over the
+        tracker as it now is."""
+        co = self._tree(tmp_path)
+        apps = co / "data" / "applications.md"
+        landed = self.ROW.replace("| 11 |", "| 12 |").replace("Acme Corp", "Globex").replace(
+            "[229](../reports/229-acme-corp-2026-09-01.md)", "-")
+        real = _batch_common.resolve_report
+
+        def resolve(*a, **kw):
+            with apps.open("a", encoding="utf-8") as f:
+                f.write(landed)
+            return real(*a, **kw)
+        mocker.patch.object(_batch_common, "resolve_report", side_effect=resolve)
+        _batch_common._backfill_report_urls(co)
+        assert self._tracker(co) == _APPS_HEADER + self.ROW + landed
+        assert "applications.md changed while posting URLs were being read" in capsys.readouterr().out
+        mocker.stopall()
+        _batch_common._backfill_report_urls(co)
+        assert self._notes(co).endswith("— https://x/j/7")
+        assert tracker_row(apps, "12")["company"] == "Globex"
+
+    def test_a_failed_write_says_so(self, tmp_path, capsys, mocker):
+        co = self._tree(tmp_path)
+        before = self._tracker(co)
+        mocker.patch.object(_batch_common, "atomic_write_text",
+                            side_effect=PermissionError(13, "Permission denied"))
+        _batch_common._backfill_report_urls(co)
+        assert self._tracker(co) == before
+        out = capsys.readouterr().out
+        assert "could not write posting URLs into applications.md" in out
+        assert "Permission denied" in out and "into the Notes of" not in out
+
+    def test_an_over_long_report_link_skips_its_row_and_the_merge_runs(
+            self, tmp_path, capsys, mocker):
+        """A model-written link longer than a filename may be: `is_file()`
+        raises ENAMETOOLONG on Python 3.12. That row is skipped and named; the
+        others are written, and node still runs."""
+        name = f"230-{'x' * 300}.md"
+        co = self._tree(tmp_path, rows=(self.ROW, self.ROW.replace("| 11 |", "| 12 |").replace(
+            "[229](../reports/229-acme-corp-2026-09-01.md)", f"[230](../reports/{name})")))
+        ran = mocker.patch("pipeline._batch_common.subprocess.run",
+                           return_value=mocker.MagicMock(returncode=0, stdout="", stderr=""))
+        run_merge_tracker(co)
+        assert ran.call_args.args[0] == ["node", "merge-tracker.mjs"]
+        assert self._notes(co).endswith("— https://x/j/7")
+        assert "https://" not in tracker_row(co / "data" / "applications.md", "12")["notes"]
+        try:
+            (co / "reports" / name).is_file()
+            raises = False      # an interpreter that answers False just finds no report
+        except OSError:
+            raises = True
+        assert ("could not read the report of 1 tracker row(s) for a posting URL (#12; OSError"
+                in capsys.readouterr().out) == raises
+
+    def test_a_tracker_the_backfill_cannot_read_leaves_the_merge_running(
+            self, tmp_path, capsys, mocker):
+        """Its read failing — a sharing violation on Windows while another
+        writer replaces the file — is one line, never a merge that does not run."""
+        co = self._tree(tmp_path)
+        real = Path.read_bytes
+
+        def read_bytes(path):
+            if path.name == "applications.md":
+                raise PermissionError(13, "The process cannot access the file", str(path))
+            return real(path)
+        mocker.patch.object(Path, "read_bytes", read_bytes)
+        ran = mocker.patch("pipeline._batch_common.subprocess.run",
+                           return_value=mocker.MagicMock(returncode=0, stdout="", stderr=""))
+        run_merge_tracker(co)
+        assert ran.call_args.args[0] == ["node", "merge-tracker.mjs"]
+        assert ("skipped writing posting URLs from reports into the tracker (PermissionError"
+                in capsys.readouterr().out)
+
+    def test_a_tracker_that_is_not_utf8_is_one_line_not_a_raise(self, tmp_path, capsys):
+        co = self._tree(tmp_path)
+        apps = co / "data" / "applications.md"
+        apps.write_bytes(apps.read_bytes().replace(b"Acme Corp", b"Acme \xff Corp"))
+        before = apps.read_bytes()
+        _batch_common._backfill_report_urls(co)
+        assert apps.read_bytes() == before
+        out = capsys.readouterr().out
+        assert "skipped writing posting URLs" in out and "UnicodeDecodeError" in out
+
+    def test_an_import_failure_is_one_line_not_a_raise(self, tmp_path, capsys, monkeypatch):
+        import sys
+        co = self._tree(tmp_path)
+        before = self._tracker(co)
+        monkeypatch.setitem(sys.modules, "pipeline.app.data", None)
+        _batch_common._backfill_report_urls(co)
+        assert self._tracker(co) == before
+        assert ("skipped writing posting URLs from reports into the tracker "
+                "(ModuleNotFoundError: import of pipeline.app.data halted"
+                in capsys.readouterr().out)
 
 
 class TestLivenessMarks:

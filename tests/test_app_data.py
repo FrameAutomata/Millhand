@@ -1040,6 +1040,16 @@ class TestExtractUrl:
     def test_none_and_empty(self):
         assert data.extract_url("") == "" and data.extract_url(None) == ""
 
+    def test_newest_evaluation_url_is_the_half_without_the_fallback(self):
+        """What the #190 backfill asks: does the newest evaluation name a
+        posting of its own? Where it does not, `extract_url`'s answer is an
+        older evaluation's."""
+        assert data.newest_evaluation_url("https://a/1 — APPLY. Re-eval 2026-09-08 (4→4.7)") == ""
+        assert data.newest_evaluation_url(
+            "https://a/1. Re-eval 2026-09-08 (4→4.7): https://a/2.") == "https://a/2"
+        assert data.newest_evaluation_url("https://a/1 — APPLY") == "https://a/1"   # no marker
+        assert data.newest_evaluation_url("") == "" and data.newest_evaluation_url(None) == ""
+
 
 class TestAppendNoteInText:
     """The row editor behind set_status_in_text can append to Notes in the same
@@ -1058,6 +1068,33 @@ class TestAppendNoteInText:
 
     def test_unknown_num_unchanged(self):
         assert data.append_note_in_text(self.APPS, "999", "note") == self.APPS
+
+    def test_a_note_already_a_clause_is_not_appended_unless_asked(self):
+        assert data.append_note_in_text(self.APPS, "2", "maybe") == self.APPS
+        out = data.append_note_in_text(self.APPS, "2", "maybe", dedupe=False)
+        assert _row_cells(out, "2")[9] == "maybe — maybe"
+
+    # An untouched row holding separators `splitlines()` breaks on — U+2028, a
+    # form feed, U+0085 — and a trailing blank line.
+    ODD = APPS.replace("| apply now |", "| apply now\x0c\u0085 |") + "\n"
+
+    @pytest.mark.parametrize("eol", ["\n", "\r\n"], ids=["lf", "crlf"])
+    def test_an_edit_changes_only_its_row(self, eol):
+        """Split on "\\n" alone: `splitlines()` rejoined with "\\n" turned each
+        separator into a line break that cut its row in two, a "\\r\\n" file
+        into "\\n" and dropped the trailing blank line — on every edit of ANY
+        row, a status write's included."""
+        text = self.ODD.replace("\n", eol)
+        assert data.append_note_in_text(text, "2", "n") == text.replace("| maybe |", "| maybe — n |")
+        assert data.set_status_in_text(text, "2", "Applied") == text.replace(
+            "| Evaluated | ❌ | [002]", "| Applied | ❌ | [002]")
+
+    def test_a_row_not_found_changes_no_byte_and_counts_nothing(self):
+        """A Push of a number the tracker lacks: the normalisation used to make
+        the text differ, which `apply_cloud_overrides` counted as applied."""
+        text = self.ODD.replace("\n", "\r\n")
+        assert data.append_note_in_text(text, "999", "note") == text
+        assert data.apply_cloud_overrides(text, {"999": "Applied"}) == (text, 0)
 
     def test_status_and_note_in_one_edit(self):
         out = data._edit_row_cells(self.APPS, "2", status="Discarded", note="n")
