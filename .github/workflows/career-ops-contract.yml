@@ -3,7 +3,8 @@ name: career-ops Contract
 # Runs the career-ops contract tests against a REAL career-ops checkout (#192).
 #
 # tests/test_merge_tracker_contract.py drives the real merge-tracker.mjs, and
-# tests/test_batch_runner_contract.py drives batch-runner.sh's argument parser.
+# tests/test_batch_runner_contract.py drives batch-runner.sh's argument parser
+# and its `--cli` gate.
 # They are the only thing that notices when upstream stops honouring what this
 # repo relies on. In tests.yml they skip, because no checkout is installed
 # there. Before this workflow they ran only on someone's machine, so a

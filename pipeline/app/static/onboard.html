@@ -379,11 +379,12 @@
         <!-- The agent CLI that applies for you and runs --batch. The options
              are relabelled from /api/onboard/providers (label, tier,
              installed?); the static list below is the fallback and mirrors
-             pipeline/agent_cli.py's registry — a test keeps them equal. -->
+             pipeline/agent_cli.py's registry — a test keeps them equal, and
+             keeps "apply only" on exactly the CLIs --batch can't run. -->
         <label style="margin-top:8px">Agent CLI <span class="muted">(applies for you, runs --batch and career skills — free options first)</span>
           <select id="local-cli-select">
             <option value="opencode">OpenCode — free</option>
-            <option value="agy">Antigravity CLI — free</option>
+            <option value="agy">Antigravity CLI — free, apply only (no --batch)</option>
             <option value="gemini">Gemini CLI — free</option>
             <option value="claude">Claude Code — paid</option>
             <option value="qwen">Qwen Code — paid</option>

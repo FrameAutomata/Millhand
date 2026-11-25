@@ -13,6 +13,7 @@ read, so a change here is a deliberate one.
 """
 
 import ast
+import dataclasses
 import os
 import json
 import re
@@ -27,8 +28,9 @@ import pytest
 
 from pipeline import agent_cli
 from pipeline.agent_cli import (
-    AGENT_CLIS, AGENT_MODEL_ENV, DEFAULT_CLI, PLAYWRIGHT_MCP_COMMAND,
-    REGISTER_MCP_CMD, AgentCli, cli_available, installed, playwright_mcp_note,
+    AGENT_CLIS, AGENT_MODEL_ENV, APPLY_ONLY_LABEL, DEFAULT_CLI,
+    PLAYWRIGHT_MCP_COMMAND, REGISTER_MCP_CMD, AgentCli, batch_clis,
+    batch_refusal, cli_available, installed, playwright_mcp_note,
     register_playwright_mcp, resolve_cli, resolve_model, shell_command,
 )
 
@@ -61,6 +63,20 @@ class TestRegistry:
         # paid path (any provider key) — one CLI for both halves of the goal.
         assert DEFAULT_CLI == "opencode"
         assert AGENT_CLIS[DEFAULT_CLI].tier == "free"
+
+    def test_batch_capability_is_the_runners_set_at_the_pin(self):
+        # Read off batch-runner.sh's `--cli` case at career-ops.ref's pin —
+        # claude | opencode | gemini | qwen | grok, where grok is the runner's
+        # and not the registry's. tests/test_batch_runner_contract.py checks it
+        # against the real runner; this pins the reading, so a flip is an edit.
+        assert {c.id: c.batch for c in AGENT_CLIS.values()} == {
+            "opencode": True, "agy": False, "gemini": True, "claude": True, "qwen": True}
+
+    def test_batch_is_a_required_field(self):
+        # Explicit by construction: a new entry cannot inherit an answer.
+        f = next(f for f in dataclasses.fields(AgentCli) if f.name == "batch")
+        assert f.default is dataclasses.MISSING
+        assert f.default_factory is dataclasses.MISSING
 
     def test_every_entry_is_complete_and_keyed_by_its_id(self):
         for cid, c in AGENT_CLIS.items():
@@ -201,6 +217,99 @@ class TestResolveModel:
         assert resolve_model(AGENT_CLIS["claude"]) == "x/y"
         monkeypatch.delenv(AGENT_MODEL_ENV)
         assert resolve_model(AGENT_CLIS["claude"]) == ""
+
+
+# ── batch_refusal / --check-batch ────────────────────────────────────────────
+
+class TestBatchRefusal:
+    """`--batch` runs career-ops' batch-runner.sh, which knows a fixed set of
+    CLIs and rejected the rest only after run.sh had spent a whole scrape
+    (#187). The wrappers now ask `--check-batch` before the first-run profile
+    gate and orchestrate.py; these drive that entry and the one function
+    behind it."""
+
+    AGY_REFUSAL = batch_refusal(AGENT_CLIS["agy"])
+
+    def test_agy_is_refused_with_one_message_naming_what_can(self):
+        why = self.AGY_REFUSAL
+        assert why.startswith("BATCH_CLI=agy: Antigravity CLI can apply for you but cannot run --batch")
+        assert f"The CLIs that can: {', '.join(c.id for c in batch_clis())}." in why
+        # The shell form first: BATCH_CLI is also the CLI that applies and the
+        # one that runs the career skills, so the .env edit would move those too.
+        assert f"set it in the shell for that run: BATCH_CLI={DEFAULT_CLI} ./run.sh --batch," in why
+        assert "applying and the career skills stay on agy" in why
+        assert "setting BATCH_CLI in .env moves all three" in why
+        assert why.index("in the shell") < why.index("in .env")
+        assert "--evaluate-batch" in why
+        assert "\n" not in why
+
+    def test_the_claim_is_scoped_to_the_pinned_runner(self):
+        # `batch` was read off the runner at career-ops.ref's pin; a person's
+        # checkout tracks main and may have moved on, so the message says which
+        # version it means and that the check follows the pin.
+        why = self.AGY_REFUSAL
+        assert "does not accept it at the version this copy pins (career-ops.ref)" in why
+        assert "tracks main" in why and "when the pin moves" in why
+        assert "does not support it" not in why
+
+    def test_the_powershell_form_does_not_outlast_the_run(self):
+        # `$env:` lasts the session, so "set it first" would also move a later
+        # run-ui.ps1 or hand-off — the very thing the shell form exists to avoid.
+        why = self.AGY_REFUSAL
+        assert (f"$env:BATCH_CLI='{DEFAULT_CLI}'; ./run.ps1 --batch; "
+                f"Remove-Item Env:BATCH_CLI") in why
+
+    def test_agent_model_rides_along(self):
+        # The wrappers hand AGENT_MODEL to whichever CLI --batch runs
+        # (--resolved-model), and a model named for agy may mean nothing there.
+        why = self.AGY_REFUSAL
+        assert f"{AGENT_MODEL_ENV} the same way if it names a model for agy" in why
+        assert "as --model" in why
+        assert why.index(AGENT_MODEL_ENV) < why.index("in .env")
+
+    @pytest.mark.parametrize("cid", [c.id for c in batch_clis()])
+    def test_check_batch_is_silent_and_exits_0_for_every_capable_cli(self, cid, capsys, monkeypatch):
+        monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: False)
+        monkeypatch.setenv("BATCH_CLI", cid)
+        assert agent_cli.main(["--check-batch"]) == 0
+        assert capsys.readouterr() == ("", "")
+
+    def test_check_batch_accepts_the_unset_default(self, capsys, monkeypatch):
+        monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: False)
+        assert agent_cli.main(["--check-batch"]) == 0
+        assert capsys.readouterr() == ("", "")
+
+    def test_check_batch_reads_dotenv(self, monkeypatch):
+        # The wizard writes BATCH_CLI to .env and a wrapper cannot read it, so
+        # the check must — or it would pass a CLI the runner then rejects.
+        monkeypatch.setattr("dotenv.load_dotenv",
+                            lambda *a, **k: monkeypatch.setenv("BATCH_CLI", "agy"))
+        assert agent_cli.main(["--check-batch"]) == 1
+
+    def test_a_shell_value_outranks_dotenv(self, tmp_path, monkeypatch):
+        # The refusal's advice — name another CLI in the shell, leave .env as
+        # it is — holds only while loading .env never overrides the process env.
+        import dotenv
+        real = dotenv.load_dotenv
+        (tmp_path / ".env").write_text("BATCH_CLI=agy\n", encoding="utf-8")
+        monkeypatch.setattr("dotenv.load_dotenv",
+                            lambda *a, **k: real(tmp_path / ".env", **k))
+        monkeypatch.setenv("BATCH_CLI", DEFAULT_CLI)
+        assert agent_cli.main(["--check-batch"]) == 0
+
+    def test_check_batch_as_the_module_the_wrappers_run(self):
+        # The exact entry run.sh/run.ps1 invoke, in a real interpreter. That
+        # loads the checkout's real .env, so stderr may carry more than ours (a
+        # dotenv parse warning, say): the refusal is asserted as one whole line
+        # in it, not as all of it.
+        proc = subprocess.run(
+            [sys.executable, "-m", "pipeline.agent_cli", "--check-batch"],
+            cwd=str(ROOT), capture_output=True, text=True, timeout=60,
+            env={**os.environ, "BATCH_CLI": "agy"},
+        )
+        assert proc.returncode == 1, proc.stderr
+        assert proc.stdout == ""
+        assert f"[agent-cli] {self.AGY_REFUSAL}" in proc.stderr.splitlines()
 
 
 # ── interactive_argv ─────────────────────────────────────────────────────────
@@ -585,8 +694,11 @@ class TestMain:
         for c in AGENT_CLIS.values():
             assert re.search(rf"^{c.id}\s.*\b{c.tier}\b", out, re.M), c.id
         assert re.search(rf"^{DEFAULT_CLI}\s.*\byes\b.*\(default\)", out, re.M)
-        assert re.search(r"^agy\s.*\bfree\b.*\bno\b", out, re.M)
+        assert re.search(r"^agy\s.*\bfree\s+no\b", out, re.M)
         assert re.search(r"^claude\s.*\bno\b", out, re.M)
+        marked = {c.id for c in AGENT_CLIS.values()
+                  if re.search(rf"^{c.id}\s.*{re.escape(APPLY_ONLY_LABEL)}", out, re.M)}
+        assert marked == {c.id for c in AGENT_CLIS.values() if not c.batch}
 
     def test_check_exits_1_with_the_hint_when_not_installed(self, capsys, mocker):
         mocker.patch("pipeline.agent_cli.shutil.which", return_value=None)
@@ -712,13 +824,15 @@ class TestEnvExampleMirror:
             start -= 1
         return lines[start:idx], lines[idx]
 
+    @classmethod
+    def _rows(cls):
+        """The registry lines as {id: (tier, line)}, in file order."""
+        comments, _ = cls._block()
+        return {m.group(1): (m.group(2), line) for line in comments
+                if (m := re.match(r"^#\s{3}(\w+)\s+(free|paid)\b", line))}
+
     def test_ids_and_tiers_equal_the_registry(self):
-        comments, _ = self._block()
-        found = {}
-        for line in comments:
-            m = re.match(r"^#\s{3}(\w+)\s+(free|paid)\b", line)
-            if m:
-                found[m.group(1)] = m.group(2)
+        found = {cid: tier for cid, (tier, _) in self._rows().items()}
         assert found == {c.id: c.tier for c in AGENT_CLIS.values()}
         # Free first, as the registry orders them.
         assert list(found) == list(AGENT_CLIS)
@@ -728,12 +842,17 @@ class TestEnvExampleMirror:
         assert assignment == f"BATCH_CLI={DEFAULT_CLI}"
 
     def test_gemini_line_no_longer_claims_a_personal_login(self):
-        comments, _ = self._block()
-        line = next(l for l in comments if re.match(r"^#\s{3}gemini\b", l))
+        _, line = self._rows()["gemini"]
         assert "personal Google login" not in line or "ended" in line
         assert "GEMINI_API_KEY" in line
         # The launch model is restated here too; keep it the registry's.
         assert f"-m {GEMINI_MODEL}" in line
+
+    def test_apply_only_marks_exactly_the_clis_batch_cannot_run(self):
+        # A reader picking `agy` here used to find out at the end of a scrape
+        # (#187); the line says so first, and follows the registry's `batch`.
+        marked = {cid for cid, (_, line) in self._rows().items() if "apply only" in line}
+        assert marked == {c.id for c in AGENT_CLIS.values() if not c.batch}
 
     def test_agent_model_is_documented_with_the_registry_default(self):
         m = re.search(r"^#?\s*" + AGENT_MODEL_ENV + r"=", self.text, re.M)
@@ -795,6 +914,26 @@ class TestWrapperMirror:
         assert re.search(r"-m pipeline\.agent_cli --resolved-model\b", src), name
         assert "OLLAMA_MODEL" in src
 
+    @pytest.mark.parametrize("name", ["run.sh", "run.ps1"])
+    def test_checks_batch_before_the_profile_gate_and_the_scrape(self, name):
+        # #187: the runner's own refusal arrives after orchestrate.py has spent
+        # the scrape, so the registry is asked first — and ahead of the
+        # first-run profile gate too, or a fresh copy sits through the whole
+        # setup interview to be refused at the end of it. Code lines only — a
+        # comment naming any of them proves nothing about the order they run in.
+        code = [line for line in (ROOT / name).read_text(encoding="utf-8").splitlines()
+                if not line.lstrip().startswith("#")]
+        check = [i for i, line in enumerate(code)
+                 if re.search(r"-m pipeline\.agent_cli --check-batch\b", line)]
+        gate = [i for i, line in enumerate(code)
+                if "profile.yml" in line or "setup-profile.mjs" in line]
+        scrape = [i for i, line in enumerate(code) if "orchestrate.py" in line]
+        assert len(check) == 1, f"{name} must ask --check-batch exactly once"
+        assert gate, f"{name} no longer has the first-run profile gate; update this guard"
+        assert scrape, f"{name} no longer calls orchestrate.py; update this guard"
+        assert check[0] < gate[0], f"{name} asks --check-batch after the profile gate"
+        assert check[0] < scrape[0], f"{name} asks --check-batch after the scrape"
+
     def test_no_literal_default_remains(self):
         sh = (ROOT / "run.sh").read_text(encoding="utf-8")
         ps = (ROOT / "run.ps1").read_text(encoding="utf-8")
@@ -827,7 +966,7 @@ class TestDocsMirror:
     release, so the guard has to hold against the docs drifting back."""
 
     DOCS = ("README.md", "QUICKSTART.md")
-    _ROW = re.compile(r"^\|\s*`(\w+)`([^|]*)\|([^|]*)\|", re.M)
+    _ROW = re.compile(r"^\|\s*`(\w+)`([^|]*)\|([^|]*)\|.*$", re.M)
 
     @classmethod
     def _text(cls, name):
@@ -835,9 +974,10 @@ class TestDocsMirror:
 
     @classmethod
     def _rows(cls, name):
-        """The agent table's rows as {id: (name cell, tier cell)}; other tables'
-        rows don't start with a backticked registry id, so they don't match."""
-        return {m.group(1): (m.group(2), m.group(3))
+        """The agent table's rows as {id: (name cell, tier cell, whole row)};
+        other tables' rows don't start with a backticked registry id, so they
+        don't match."""
+        return {m.group(1): (m.group(2), m.group(3), m.group(0))
                 for m in cls._ROW.finditer(cls._text(name))
                 if m.group(1) in AGENT_CLIS}
 
@@ -847,13 +987,13 @@ class TestDocsMirror:
 
     @pytest.mark.parametrize("name", DOCS)
     def test_each_row_states_that_cli_s_tier(self, name):
-        for cid, (_, tier_cell) in self._rows(name).items():
+        for cid, (_, tier_cell, _) in self._rows(name).items():
             word = tier_cell.strip().strip("*").split()[0].lower()
             assert word == AGENT_CLIS[cid].tier, (name, cid, tier_cell)
 
     @pytest.mark.parametrize("name", DOCS)
     def test_exactly_one_row_is_marked_default(self, name):
-        marked = [cid for cid, (cell, _) in self._rows(name).items()
+        marked = [cid for cid, (cell, _, _) in self._rows(name).items()
                   if "default" in cell.lower()]
         assert marked == [DEFAULT_CLI], (name, marked)
 
@@ -871,6 +1011,14 @@ class TestDocsMirror:
             named = {cid for spelling, cid in names.items() if spelling in low}
             if named:
                 assert DEFAULT_CLI in named, (name, line)
+
+    @pytest.mark.parametrize("name", DOCS)
+    def test_apply_only_marks_exactly_the_clis_batch_cannot_run(self, name):
+        # The table is where a reader picks; "apply only" on a row is what
+        # stops them learning about the runner's limit at the end of a scrape.
+        marked = {cid for cid, (_, _, row) in self._rows(name).items()
+                  if "apply only" in row.lower()}
+        assert marked == {c.id for c in AGENT_CLIS.values() if not c.batch}, name
 
     @pytest.mark.parametrize("name", DOCS)
     def test_env_table_row_carries_the_registry_default(self, name):
@@ -920,7 +1068,7 @@ class TestAgentCliDataclass:
 
     def test_custom_entry_shapes(self):
         c = AgentCli(id="x", label="X", binary="x", tier="paid", tier_note="n",
-                     install_hint="i", docs_url="https://x", prompt_flag="--go")
+                     install_hint="i", docs_url="https://x", batch=False, prompt_flag="--go")
         assert c.interactive_argv("p", model="") == ["x", "--go", "p"]
         # No model flag: a model is ignored rather than rendered as a positional.
         assert c.interactive_argv("p", model="m") == ["x", "--go", "p"]

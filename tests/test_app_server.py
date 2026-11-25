@@ -931,6 +931,8 @@ class TestAgentCliSurface:
             assert (c["label"], c["tier"]) == (reg.label, reg.tier)
             assert c["tier_note"] == reg.tier_note
             assert c["install_hint"] == reg.install_hint
+            # The words onboard.js appends for a CLI --batch can't run (#187).
+            assert c["batch_note"] == ("" if reg.batch else agent_cli.APPLY_ONLY_LABEL)
         assert [c["id"] for c in tools if c["default"]] == [agent_cli.DEFAULT_CLI]
 
     def test_providers_payload_carries_the_submit_policies(self, client):

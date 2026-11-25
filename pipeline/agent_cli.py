@@ -10,7 +10,8 @@ Four things used to answer "which CLI" independently — `skills.cli_name()`,
 wizard's default — and every one of them said claude, which has no free tier.
 The product goal is a loop that runs free by default, so the default is a
 free CLI (`DEFAULT_CLI`) and the wrappers ask this module (`--resolved`)
-rather than carrying a default of their own.
+rather than carrying a default of their own. Not every CLI here can run
+`--batch`: see `AgentCli.batch` (#187).
 
 What "free" means changed under this module once already, so the facts are
 dated. Verified 2026-09-09 (WebSearch and the Gemini CLI GitHub discussion
@@ -288,6 +289,13 @@ class AgentCli:
     tier_note: str     # one line: what free means / what paid costs
     install_hint: str  # one line: how to install
     docs_url: str
+    # Whether `--batch` can run it: career-ops' batch/batch-runner.sh takes
+    # `--cli` from a literal `case` and rejects any other value — but only once
+    # run.sh has spent the whole scrape (#187). Required rather than defaulted,
+    # so a new entry has to answer it; `--check-batch` refuses the rest before
+    # the scrape, and tests/test_batch_runner_contract.py checks every answer
+    # against the real runner, both ways.
+    batch: bool
     # The option that seeds an INTERACTIVE session with a prompt; "" means the
     # prompt is the positional argument.
     prompt_flag: str = ""
@@ -390,6 +398,7 @@ AGENT_CLIS: dict = {c.id: c for c in (
         ),
         install_hint="curl -fsSL https://opencode.ai/install | bash   (or: npm install -g opencode-ai)",
         docs_url="https://opencode.ai/docs/",
+        batch=True,
         prompt_flag="--prompt",
         model_flag="--model",   # provider/model form, e.g. google/<model>
         verified_against="opencode 1.18.30",
@@ -416,6 +425,7 @@ AGENT_CLIS: dict = {c.id: c for c in (
             "(Windows: irm https://antigravity.google/cli/install.ps1 | iex)"
         ),
         docs_url="https://antigravity.google/",
+        batch=False,  # no `agy)` arm in the runner's `--cli` case at the pin
         # `-i` (`--prompt-interactive`) and `--model` per Google's docs as
         # quoted by third parties — NOT read off the binary (its installer
         # returns 403 from this sandbox), hence no `verified_against`.
@@ -442,6 +452,7 @@ AGENT_CLIS: dict = {c.id: c for c in (
         ),
         install_hint="npm install -g @google/gemini-cli   (then put a GEMINI_API_KEY from aistudio.google.com in .env)",
         docs_url="https://geminicli.com/docs/",
+        batch=True,
         prompt_flag="-i",
         model_flag="-m",
         default_model="gemini-3.1-flash-lite",
@@ -459,6 +470,7 @@ AGENT_CLIS: dict = {c.id: c for c in (
         ),
         install_hint="npm install -g @anthropic-ai/claude-code",
         docs_url="https://docs.claude.com/en/docs/claude-code",
+        batch=True,
         model_flag="--model",
         verified_against="claude --help",
         # Its scope DEFAULT is `local` — keyed on the cwd — so a server added
@@ -477,6 +489,7 @@ AGENT_CLIS: dict = {c.id: c for c in (
         ),
         install_hint="npm install -g @qwen-code/qwen-code",
         docs_url="https://qwenlm.github.io/qwen-code-docs/",
+        batch=True,
         prompt_flag="-i",
         model_flag="-m",
         verified_against="qwen 0.23.2",
@@ -485,6 +498,15 @@ AGENT_CLIS: dict = {c.id: c for c in (
 )}
 
 assert DEFAULT_CLI in AGENT_CLIS
+# An unset BATCH_CLI resolves to the default, so a default `--batch` cannot run
+# would refuse every `./run.sh --batch` that configured nothing.
+assert AGENT_CLIS[DEFAULT_CLI].batch
+
+# How a CLI `--batch` cannot run is labelled: by `--list`, and by the wizard's
+# select — onboard.js gets the words in the providers payload (`batch_note`),
+# while onboard.html's static options restate them, since markup can't import
+# (tests/test_app_onboard.py::TestOnboardHtmlAgentClis holds that copy).
+APPLY_ONLY_LABEL = "apply only (no --batch)"
 
 _warned: set = set()
 
@@ -515,6 +537,48 @@ def resolve_model(cli: AgentCli, env=None) -> str:
     registry's `default_model` for that CLI ("" for every CLI but gemini)."""
     env = os.environ if env is None else env
     return (env.get(AGENT_MODEL_ENV) or "").strip() or cli.default_model
+
+
+def batch_clis() -> list:
+    """The registry's CLIs `--batch` can run, in display order."""
+    return [c for c in AGENT_CLIS.values() if c.batch]
+
+
+def batch_refusal(cli: AgentCli) -> str:
+    """Why `--batch` cannot run `cli`, as one plain message; "" when it can.
+
+    Here rather than in run.sh/run.ps1, which are slated for deletion: their
+    share is one `--check-batch` call, and whatever replaces them asks this.
+
+    It claims what the registry knows and no more: `batch` was read off the
+    runner at career-ops.ref's pin, while a person's own checkout tracks main
+    and may have moved on. So it names the pinned version, says the check
+    follows the pin, and does not probe their runner — the capability is the
+    answer, and a probe would be a second one.
+
+    The shell form leads because `BATCH_CLI` also picks the CLI that applies
+    for you and the one that runs the career skills: an environment value
+    outranks `.env` (`_load_env` never overrides), so it moves `--batch` alone,
+    where the `.env` edit moves all three. The PowerShell form unsets it after
+    the run, because `$env:` lasts the session and a later run-ui.ps1 or
+    hand-off would pick it up. `AGENT_MODEL` rides along because the wrappers
+    hand it to whichever CLI `--batch` runs (`--resolved-model`), and a model
+    named for this CLI may mean nothing to that one."""
+    if cli.batch:
+        return ""
+    can = ", ".join(c.id for c in batch_clis())
+    env, model = BATCH_CLI_ENV, AGENT_MODEL_ENV
+    return (f"{env}={cli.id}: {cli.label} can apply for you but cannot run --batch: "
+            f"career-ops' batch runner does not accept it at the version this copy pins "
+            f"(career-ops.ref). The CLIs that can: {can}. To use one for --batch alone, "
+            f"set it in the shell for that run: {env}={DEFAULT_CLI} ./run.sh --batch, or in "
+            f"PowerShell $env:{env}='{DEFAULT_CLI}'; ./run.ps1 --batch; Remove-Item Env:{env} "
+            f"— and {model} the same way if it names a model for {cli.id}, since --batch "
+            f"passes it to that CLI as --model. A shell value outranks .env, so applying and "
+            f"the career skills stay on {cli.id}; setting {env} in .env moves all three. Or "
+            f"evaluate with --evaluate-batch instead. If your own career-ops checkout, which "
+            f"tracks main, has gained {cli.id} since, this check changes when the pin moves "
+            f"to a commit that has it.")
 
 
 def cli_available(cli: AgentCli) -> bool:
@@ -690,7 +754,8 @@ def _print_list() -> None:
     for c in AGENT_CLIS.values():
         mark = "yes" if cli_available(c) else "no"
         tag = "  (default)" if c.id == DEFAULT_CLI else ""
-        print(f"{c.id:<9} {c.label:<16} {c.tier:<5} {mark}{tag}")
+        only = "" if c.batch else f"  {APPLY_ONLY_LABEL}"
+        print(f"{c.id:<9} {c.label:<16} {c.tier:<5} {mark}{tag}{only}")
 
 
 def _load_env() -> None:
@@ -723,6 +788,9 @@ def main(argv=None) -> int:
     ap.add_argument("--resolved-model", action="store_true",
                     help=f"print the model the resolved CLI starts with — {AGENT_MODEL_ENV}, "
                          "else its registry default, else nothing (reads .env)")
+    ap.add_argument("--check-batch", action="store_true",
+                    help="exit 1, saying why, if --batch cannot run the resolved CLI; "
+                         "silent when it can (reads .env)")
     args = ap.parse_args(argv)
 
     # Not at import: the module stays import-clean for the UI venv and tests.
@@ -734,10 +802,17 @@ def main(argv=None) -> int:
     # disagreeing with nothing to say so. `--check`/`--list` stay out: they
     # print what is installed, and pulling `.env` in would also make every
     # test that drives them depend on the developer's file.
-    if (args.resolved or args.resolved_model
+    if (args.resolved or args.resolved_model or args.check_batch
             or args.register_mcp is not None or args.register_mcp_all_installed):
         _load_env()
 
+    if args.check_batch:
+        # stderr, so the message is seen whatever the caller does with stdout.
+        why = batch_refusal(resolve_cli())
+        if why:
+            print(f"[agent-cli] {why}", file=sys.stderr)
+            return 1
+        return 0
     if args.resolved or args.resolved_model:
         cli = resolve_cli()
         # `--resolved-model` may print an empty line: the wrappers pass

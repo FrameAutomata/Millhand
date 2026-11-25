@@ -6,11 +6,6 @@
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 
-if (-not (Test-Path "$root\career-ops\config\profile.yml")) {
-    Write-Host "Profile not found — running first-time setup..."
-    node "$root\setup-profile.mjs"
-}
-
 # Parse flags — index loop required to consume --min-score's value argument
 $runBatch = $false
 $skipPdf = $false
@@ -25,6 +20,23 @@ while ($i -lt $args.Count) {
         default       { $orchestrateArgs += $args[$i] }
     }
     $i++
+}
+
+# Before the first-run profile gate and the scrape, not after them: career-ops'
+# runner rejects a CLI it does not know only once the whole run has been spent
+# (#187), and a fresh copy would sit through the setup interview first. It needs
+# only the flags parsed above — the CLI comes from BATCH_CLI and .env, neither
+# of which the profile gate writes. The rule is the registry's
+# (pipeline/agent_cli.py); this only asks it, and it says why.
+if ($runBatch) {
+    Push-Location $root
+    try { & "$root\.venv\Scripts\python.exe" -m pipeline.agent_cli --check-batch } finally { Pop-Location }
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+
+if (-not (Test-Path "$root\career-ops\config\profile.yml")) {
+    Write-Host "Profile not found — running first-time setup..."
+    node "$root\setup-profile.mjs"
 }
 
 & "$root\.venv\Scripts\python.exe" "$root\orchestrate.py" @orchestrateArgs
