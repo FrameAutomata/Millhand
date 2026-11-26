@@ -302,6 +302,43 @@ class TestModelResolution:
         assert result == "   "
 
 
+class TestGroqDefault:
+    """#223: Groq's default was a model Groq had already shut down for every
+    key this pipeline is likely to run on."""
+
+    SHUT_DOWN = frozenset({
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "qwen/qwen3-32b",
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "qwen/qwen3.6-27b",
+    })
+
+    def test_groq_default_is_not_shut_down(self):
+        assert PROVIDER_DEFAULTS["groq"] not in self.SHUT_DOWN
+
+
+class TestProviderDefaultMirrors:
+    """A guard: QUICKSTART's provider table restates PROVIDER_DEFAULTS where a
+    user looks for the default model, and #223 had to move both. It passes
+    before and after that change and fails when one side moves alone."""
+
+    def test_quickstart_provider_table(self):
+        lines = (eval_mod.ROOT / "QUICKSTART.md").read_text(encoding="utf-8").splitlines()
+        header = [i for i, line in enumerate(lines)
+                  if line.startswith("| Provider | Env var | Default model |")]
+        assert len(header) == 1, header
+        rows = []
+        for line in lines[header[0] + 2:]:              # past the |---| rule
+            if not line.startswith("|"):
+                break
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            # The label's first word is the provider id ("Ollama (local)" -> ollama).
+            rows.append((cells[0].split()[0].lower(), cells[2].strip("`")))
+        assert sorted(rows) == sorted(PROVIDER_DEFAULTS.items()), \
+            f"QUICKSTART.md provider table parsed as {rows!r}"
+
+
 class TestIsRateLimitError:
     """Test the cross-provider rate-limit detector. Uses string matching as
     a fallback so we don't have to import every SDK's exception classes."""
@@ -340,6 +377,36 @@ class TestIsRateLimitError:
         assert not _is_rate_limit_error(Exception("model not found"))
         assert not _is_rate_limit_error(Exception("connection refused"))
         assert not _is_rate_limit_error(ValueError("bad input"))
+
+
+# Groq's answer to one evaluation sent on a free-tier key (#223), as the openai
+# SDK stringifies it: 413 has no subclass of its own, so it is an APIStatusError
+# carrying `status_code` and, copied off the body, `code`. The body's code is
+# `rate_limit_exceeded`, which _RATE_LIMIT_MARKERS matches.
+_GROQ_413 = ("Error code: 413 - {'error': {'message': 'Request too large for model "
+             "`openai/gpt-oss-120b` in organization `org_test` service tier `on_demand` "
+             "on tokens per minute (TPM): Limit 8000, Requested 17702, please reduce "
+             "your message size and try again.', 'type': 'tokens', "
+             "'code': 'rate_limit_exceeded'}}")
+
+
+class _RequestTooLarge(Exception):
+    status_code = 413
+    code = "rate_limit_exceeded"
+
+
+class _Throttled(Exception):
+    status_code = 429
+    code = "rate_limit_exceeded"
+
+
+def _groq_429(window: str) -> str:
+    """A real Groq throttle on `window`, worded as the 413 is and carrying the
+    same code."""
+    return ("Error code: 429 - {'error': {'message': 'Rate limit reached for model "
+            "`openai/gpt-oss-120b` in organization `org_test` service tier `on_demand` "
+            f"on {window}: Limit 250000, Used 241000, Requested 17702. Please try "
+            "again in 2.1s.', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}")
 
 
 class TestTransientProviderErrors:
@@ -504,6 +571,69 @@ class TestTransientProviderErrors:
             _call_with_retry(counted, "s", "u", max_attempts=6, budget=600.0,
                              sleep=lambda _: None, monotonic=fake_monotonic)
         assert len(calls) == 1      # gave up after the budget was blown, not 6
+
+    # ── A request larger than the tier admits (#223) ──
+
+    # A free Groq key answers every evaluation with this 413, whose body says
+    # `rate_limit_exceeded` — which is why it read as a throttle. A wrapper that
+    # drops the status keeps only the message, so each marker has to hold on its
+    # own; Anthropic's SDK renders the whole error body into the message, so
+    # anything else in it reaches the rate-limit markers too — here an invented
+    # request id that happens to contain `429`.
+    @pytest.mark.parametrize("exc", [
+        _RequestTooLarge(_GROQ_413),
+        Exception(_GROQ_413),
+        Exception("Error code: 413 - {'type': 'error', 'error': {'type': 'request_too_large', "
+                  "'message': 'Request exceeds the maximum allowed number of bytes.'}, "
+                  "'request_id': 'req_011CW429xyz'}"),
+    ], ids=["groq-413", "groq-message-no-status", "anthropic-message-no-status"])
+    def test_request_too_large_is_not_transient(self, exc):
+        assert _is_transient_provider_error(exc) is False
+
+    def test_413_status_alone_is_not_transient(self):
+        """The status half of the rule, on its own: a 413 whose body no longer
+        says "Request too large" but still carries `rate_limit_exceeded` is the
+        same failure. An illustrative rewording, not a captured response — what
+        it holds is that the rule does not hang on Groq's current phrasing."""
+        reworded = ("Error code: 413 - {'error': {'message': 'Payload exceeds the "
+                    "tokens per minute (TPM) limit: Limit 8000, Requested 17702', "
+                    "'type': 'tokens', 'code': 'rate_limit_exceeded'}}")
+        assert "too large" not in reworded.lower() and "too_large" not in reworded.lower()
+        assert _is_transient_provider_error(_RequestTooLarge(reworded)) is False
+
+    def test_413_on_the_lead_does_not_fail_over(self, monkeypatch):
+        """The failover chain keys on _is_transient_provider_error, and every
+        member shares the tier, so the lead's 413 is raised as it came and the
+        backup is never asked."""
+        from pipeline.batch_evaluate import _build_failover_caller
+        lead_413 = _RequestTooLarge(_GROQ_413)
+        asked = []
+        def too_large(system, user):
+            asked.append("primary")
+            raise lead_413
+        def backup(system, user):
+            asked.append("backup")
+            return "from-backup"
+        monkeypatch.setattr(
+            "pipeline.batch_evaluate._build_single_caller",
+            lambda provider, model, disable_thinking=False:
+                too_large if model == "primary" else backup)
+        call = _build_failover_caller("groq", ["primary", "backup"])
+        with pytest.raises(_RequestTooLarge) as exc:
+            call("s", "u")
+        assert exc.value is lead_413
+        assert asked == ["primary"]
+
+    @pytest.mark.parametrize("window", [
+        "tokens per minute (TPM)", "tokens per day (TPD)", "requests per minute (RPM)",
+    ], ids=["tpm", "tpd", "rpm"])
+    def test_groq_429_still_transient(self, window):
+        """A guard: passes before and after #223. A real throttle carries the
+        413's `rate_limit_exceeded` code, and testing the 413 first must not
+        take its backoff away — the minute and the day both end."""
+        body = _groq_429(window)
+        assert _is_transient_provider_error(_Throttled(body)) is True
+        assert _is_transient_provider_error(Exception(body)) is True
 
 
 class TestClientHardening:
@@ -876,8 +1006,18 @@ class TestFailureAllowance:
             h.run()
         assert {j: h.jobs()[j]["status"] for j in ("1", "2")} == {"1": "abandoned", "2": "abandoned"}
 
-    def test_a_transient_failure_never_counts(self, h):
-        exc = h.failing["Acme"] = RuntimeError("Error code: 429 - rate limit exceeded")
+    @pytest.mark.parametrize("exc", [
+        RuntimeError("Error code: 429 - rate limit exceeded"),
+        # A guard (#223; passes before it too): the 413 left the transient class
+        # without entering the countable one. It is the tier failing, not the
+        # job — a free Groq key 413s on every job — so counting it would abandon
+        # the whole backlog in MAX_ATTEMPTS runs.
+        _RequestTooLarge(_GROQ_413),
+    ], ids=["429", "413-request-too-large"])
+    def test_an_uncountable_failure_never_counts(self, h, exc):
+        # Acme has failed before, so the run-wide exemption cannot be what spares it.
+        h.seed({"1": {"status": "failed", "error": "earlier"}})
+        h.failing["Acme"] = exc
         runs = eval_mod.MAX_ATTEMPTS + 1
         for _ in range(runs):
             h.run()
@@ -981,6 +1121,7 @@ class TestFailureAllowance:
         pytest.param(RuntimeError("anthropic returned empty content (stop_reason=end_turn)"),
                      False, id="empty-but-ended-naturally"),
         pytest.param(RuntimeError("Error code: 404 - model not found"), False, id="config-error"),
+        pytest.param(_RequestTooLarge(_GROQ_413), False, id="413-request-too-large"),
     ])
     def test_which_failures_count(self, exc, countable):
         assert eval_mod._is_countable_failure(exc) is countable
@@ -1077,6 +1218,19 @@ class TestCallWithRetry:
                 max_attempts=3, base_delay=0.1, sleep=lambda _: None,
             )
         assert len(calls) == 3  # tried exactly max_attempts times
+
+    def test_request_too_large_is_tried_once(self):
+        """#223: read as a throttle, a free Groq key's 413 cost every job six
+        requests and ~31s of backoff for an answer that cannot come."""
+        calls = []
+        def too_large(system, user):
+            calls.append(1)
+            raise _RequestTooLarge(_GROQ_413)
+        with pytest.raises(_RequestTooLarge):
+            # An explicit budget: an env LLM_JOB_BUDGET=0 would also stop at one.
+            _call_with_retry(too_large, "sys", "usr", max_attempts=6, budget=600.0,
+                             sleep=lambda _: None)
+        assert len(calls) == 1
 
     def test_pacer_wait_is_not_charged_to_the_job_budget(self):
         """#148: a job that queued 599.6s on OUR token budget, then met a

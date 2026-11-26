@@ -249,7 +249,7 @@ Provider auto-detection order: Gemini → Groq → DeepInfra → OpenRouter → 
 | Provider | Env var | Free tier |
 |---|---|---|
 | Gemini | `GEMINI_API_KEY` | Free, no credit card; ~2,400 evaluations/day on the recommended model |
-| Groq | `GROQ_API_KEY` | Yes — fast open-source models |
+| Groq | `GROQ_API_KEY` | No — paid Developer plan only; its free tier cannot fit one evaluation (see below) |
 | DeepInfra | `DEEPINFRA_API_KEY` | No — pay-as-you-go open-weight models |
 | OpenRouter | `OPENROUTER_API_KEY` | No — pay-as-you-go, many models via one key |
 | DeepSeek | `DEEPSEEK_API_KEY` | No — pay-as-you-go, cheaper than frontier |
@@ -258,6 +258,8 @@ Provider auto-detection order: Gemini → Groq → DeepInfra → OpenRouter → 
 | Ollama | `OLLAMA_BASE_URL` | Local — no API key needed |
 
 Set in `.env` or as repository secrets for GitHub Actions. `BATCH_PROVIDER` overrides auto-detection.
+
+**Groq is not a free option for this pipeline, whatever the model** (#223). Its free tier caps every chat model at 8,000 tokens/minute and 200K/day, and Groq counts a request's declared `max_tokens` toward that minute (measured by third parties, not documented) — `MAX_TOKENS` alone is 8,192 — so a free key gets a 413 "Request too large" on every job; the paid Developer plan lifts the minute to 250K. That 413's body says `rate_limit_exceeded`, so `_is_transient_provider_error` tests status 413 and `_TOO_LARGE_MARKERS` before the rate-limit markers: it fails after one request, does not fail over, and does not count toward `MAX_ATTEMPTS` — the tier failing, not the job — while real 429 throttles are still retried. The default, `openai/gpt-oss-120b`, replaces a `llama-3.3-70b-versatile` Groq had shut down (the reasoning is at `PROVIDER_DEFAULTS`) and is unverified live. Like Claude's caller, gpt-oss models on Groq get their own answer budget, `GROQ_REASONING_MAX_TOKENS` (16,384 against the shared 8,192): they reason before they answer, Groq cannot turn that off, and a cut-off counts against the job (#206). Neither neighbouring tool would catch either failure: `pipeline.verify_models` checks an ID against a catalog that cannot see a tier gate, and pacing Groq (#149, open) cannot shrink a request larger than its minute. `TestProviderDefaultMirrors` holds QUICKSTART's provider table to `PROVIDER_DEFAULTS`.
 
 **The Claude caller reads the answer, not the first block.** Current Claude models think before they answer, so a response usually leads with a thinking block that has no text; `_build_anthropic_caller` ([pipeline/batch_evaluate.py](pipeline/batch_evaluate.py)) joins the text blocks, where reading `content[0]` crashed whenever the model thought first. A response that did not end naturally (`end_turn`/`stop_sequence`) is raised as empty content even when some text came back, because only the caller can see why an answer ended, and raising there gets the cut-off an in-run retry and failover before `write_job_result` would reject it (#204, below); the Gemini and OpenAI-compatible callers raise likewise on their own listed cut-off and withheld finish reasons (see the allowance paragraph below). Thinking counts toward `max_tokens`, so Claude gets `ANTHROPIC_MAX_TOKENS` rather than the shared 8K, sized from measured runs to end inside `LLM_TIMEOUT` because the call is not streamed — which is also why `ANTHROPIC_EFFORT` (`vars.ANTHROPIC_EFFORT` in the cloud) takes only `low`/`medium`/`high`: `xhigh` and `max` think past that ceiling, and a model slower than Haiku or Sonnet needs `LLM_TIMEOUT` raised for the same reason. The effort travels in `extra_body`, not the SDK's typed keyword, because setup never upgrades an existing venv's unpinned `anthropic`; a model with no effort parameter (Haiku 4.5) rejects it with a 400 on job 1, the loud failure a misconfiguration is meant to get. The system prompt, the same for every job in a run, is sent as a cached block. `disable_thinking` is not honoured on Claude: it exists because vLLM-served reasoning models garble short outputs, which Claude does not, and honouring it would take a per-model rule — `thinking: disabled` is accepted by Haiku 5.5 and rejected by Sonnet 5.5, Opus 5.5 and Fable — to save about $0.001 a call on the default model. The default model is `claude-haiku-5-5` (the reasoning is at `PROVIDER_DEFAULTS`), and since that table is shared, a copy on Anthropic with no `BATCH_MODEL`/`TAILOR_MODEL`/`COVER_MODEL` moves cover letters and tailoring to it too — where it now thinks at the model's default effort, as Sonnet 4.6 did not.
 
@@ -313,7 +315,7 @@ Cloud automation workflows:
 
    Required: `CV_MD_B64` (`career-ops/cv.md`), `PROFILE_YML_B64` (`career-ops/config/profile.yml`), `SEARCH_CONFIG_B64` (`config/search.yml`), `RESUME_TXT_B64` (`resumes/resume.txt` — run setup locally to generate the .txt), plus at least one LLM provider key:
      - `GEMINI_API_KEY` — free tier, recommended; get one at aistudio.google.com
-     - `GROQ_API_KEY` — free tier with fast open-source models
+     - `GROQ_API_KEY` — Groq's paid Developer plan only (its free tier cannot fit one evaluation; see Multi-provider evaluation)
      - `OPENAI_API_KEY` — OpenAI
      - `ANTHROPIC_API_KEY` — Anthropic
 
