@@ -50,6 +50,21 @@ def _which(available):
     return lambda name, path=None: f"/usr/bin/{name}" if name in available else None
 
 
+def _seed(cid, home, text):
+    """`cid`'s MCP config file under `home`, holding `text` (None: no file)."""
+    path = AGENT_CLIS[cid].mcp_registration(home=home, env={}).config_path
+    if text is not None:
+        path.parent.mkdir(parents=True)
+        path.write_text(text)
+    return path
+
+
+def _register(cid, home, mocker, env=None):
+    """Register the Playwright MCP server with an installed `cid`; the message."""
+    mocker.patch("pipeline.agent_cli.shutil.which", side_effect=_which({cid}))
+    return register_playwright_mcp(AGENT_CLIS[cid], home=home, env={} if env is None else env)
+
+
 # ── Registry integrity ───────────────────────────────────────────────────────
 
 class TestRegistry:
@@ -515,9 +530,21 @@ class TestMcpRegistration:
         assert not reg.is_argv
         assert reg.config_path == tmp_path / ".config" / "opencode" / "opencode.json"
         assert reg.servers_key == "mcp"
+        # The flat map only: the merge never creates `mcp.servers` (#224).
         assert reg.merge == {"mcp": {"playwright": {
             "type": "local", "command": list(PLAYWRIGHT_MCP_COMMAND), "enabled": True,
         }}}
+        # Named so an entry already there can be refreshed, in V2's spelling.
+        assert reg.native_key == "servers"
+        assert reg.native_entry == {"type": "local", "command": list(PLAYWRIGHT_MCP_COMMAND)}
+
+    def test_opencode_entries_hold_their_own_command_lists(self):
+        """The two OpenCode constants spell one server, but share no list, so
+        a caller mutating one entry's argv cannot reach the other."""
+        flat, nested = agent_cli.OPENCODE_PLAYWRIGHT_ENTRY, agent_cli.OPENCODE_V2_PLAYWRIGHT_ENTRY
+        assert flat["command"] == nested["command"] == list(PLAYWRIGHT_MCP_COMMAND)
+        assert flat["command"] is not nested["command"]
+        assert list(flat) == ["type", "command", "enabled"] and list(nested) == ["type", "command"]
 
     def test_opencode_honours_xdg_config_home(self, tmp_path):
         reg = AGENT_CLIS["opencode"].mcp_registration(
@@ -536,6 +563,7 @@ class TestMcpRegistration:
         assert reg.merge == {"mcpServers": {"playwright": {
             "command": "npx", "args": ["-y", "@playwright/mcp@latest"],
         }}}
+        assert reg.native_key == "" and reg.native_entry == {}   # one map only
 
 
 class TestRegisterPlaywrightMcp:
@@ -625,15 +653,6 @@ class TestRegisterPlaywrightMcp:
         assert cfg.read_text() == before
         assert "already" in second and "already" not in first
 
-    def test_opencode_corrupt_config_is_left_alone(self, tmp_path, mocker):
-        mocker.patch("pipeline.agent_cli.shutil.which", side_effect=_which({"opencode"}))
-        cfg = tmp_path / ".config" / "opencode" / "opencode.json"
-        cfg.parent.mkdir(parents=True)
-        cfg.write_text("{not json")
-        msg = register_playwright_mcp(AGENT_CLIS["opencode"], home=tmp_path, env={})
-        assert cfg.read_text() == "{not json"
-        assert "left it alone" in msg and "playwright" in msg
-
     def test_agy_merge_keeps_other_servers_under_mcpservers_and_is_idempotent(self, tmp_path, mocker):
         mocker.patch("pipeline.agent_cli.shutil.which", side_effect=_which({"agy"}))
         cfg = tmp_path / ".gemini" / "antigravity" / "mcp_config.json"
@@ -657,6 +676,194 @@ class TestRegisterPlaywrightMcp:
         assert json.loads(cfg.read_text()) == {"mcpServers": {"playwright": {
             "command": "npx", "args": ["-y", "@playwright/mcp@latest"]}}}
 
+    @pytest.mark.parametrize("cid,key", [("opencode", "mcp"), ("agy", "mcpServers")])
+    # null and [] are not an absent map: OpenCode rejects them as it rejects "x".
+    @pytest.mark.parametrize("bad", ["x", True, [1], 5, None, []])
+    def test_a_non_object_server_map_is_left_alone(self, tmp_path, mocker, cid, key, bad):
+        """A server map that is not a JSON object is the user's value: the file
+        is left untouched, and the message names the map and gives the entry
+        to add by hand."""
+        cfg = _seed(cid, tmp_path, json.dumps({key: bad}))
+        before = cfg.read_bytes()
+        msg = _register(cid, tmp_path, mocker)
+        assert cfg.read_bytes() == before
+        assert f"`{key}`" in msg and "left it alone" in msg
+        assert json.dumps(AGENT_CLIS[cid].mcp_registration(home=tmp_path, env={}).merge) in msg
+
+    @pytest.mark.parametrize("cid", ["opencode", "agy"])
+    def test_an_unreadable_file_hint_covers_the_entry_it_cannot_see(self, tmp_path, mocker, cid):
+        """A file the merge cannot parse is left untouched, and the hint gives
+        the entry to add by hand. OpenCode parses files `json.loads` cannot
+        (comments, a BOM), so one may hold `mcp.servers.playwright` unseen,
+        and its hint also says to replace that entry rather than add a flat
+        one beside it. agy has one map, so its hint has one shape — that case
+        is a guard: it held before #224 too, and fails if OpenCode's
+        nested-entry wording ever leaks into a one-map CLI's hint."""
+        reg = AGENT_CLIS[cid].mcp_registration(home=tmp_path, env={})
+        cfg = _seed(cid, tmp_path, "{not json")
+        msg = _register(cid, tmp_path, mocker)
+        assert cfg.read_text() == "{not json"
+        assert "left it alone" in msg and json.dumps(reg.merge) in msg
+        assert ("replace that entry" in msg) == (cid == "opencode")
+        if cid == "opencode":
+            assert "`mcp.servers.playwright`" in msg and json.dumps(reg.native_entry) in msg
+
+    # ── OpenCode's two server maps (#224; pipeline/agent_cli.py's docstring) ──
+
+    CHROME = "/opt/chrome"      # PLAYWRIGHT_CHROMIUM_PATH is taken verbatim
+    ENV = {agent_cli.CHROMIUM_PATH_ENV: CHROME}
+    PINNED = [*PLAYWRIGHT_MCP_COMMAND, *agent_cli.CHROMIUM_PIN_ARGS, CHROME]
+    # A pin a `nix flake update` has since garbage-collected.
+    STALE = [*PLAYWRIGHT_MCP_COMMAND, *agent_cli.CHROMIUM_PIN_ARGS, "/nix/store/gone-chromium/chrome"]
+    FLAT = {"type": "local", "command": PINNED, "enabled": True}
+    NATIVE = {"type": "local", "command": PINNED}     # V2's spelling: no `enabled`
+    OTHER = {"type": "remote", "url": "http://x"}
+    # A stale entry with keys only a merge into it would keep: `disabled`
+    # (V2's off switch) and `enabled` (the key V2 replaced).
+    OLD = {"type": "local", "command": STALE, "enabled": True, "disabled": True,
+           "environment": {"A": "1"}}
+
+    @pytest.mark.parametrize("seed", [
+        None,                                                          # no file yet
+        {"mcp": {"other": OTHER}},                                     # flat servers only
+        {"mcp": {"playwright": {"type": "local", "command": STALE, "enabled": True}}},
+        # A nested map holding OTHER servers: playwright goes in flat beside it.
+        {"mcp": {"servers": {"other": OTHER}}},
+    ], ids=["no-file", "other-flat", "stale-flat", "other-nested"])
+    def test_opencode_never_creates_mcp_servers(self, tmp_path, mocker, seed):
+        """A guard: the merge must never create or add to `mcp.servers`, so
+        playwright goes in flat wherever the nested map does not already name
+        it."""
+        cfg = _seed("opencode", tmp_path, None if seed is None else json.dumps(seed, indent=2))
+        _register("opencode", tmp_path, mocker, self.ENV)
+        got = json.loads(cfg.read_text())["mcp"]
+        assert got["playwright"] == self.FLAT
+        assert got.get("servers") == (seed or {}).get("mcp", {}).get("servers")
+
+    @pytest.mark.parametrize("seed,want", [
+        ({"servers": {"other": OTHER, "playwright": OLD}},
+         {"servers": {"other": OTHER, "playwright": NATIVE}}),
+        ({"playwright": OLD, "servers": {"playwright": OLD}},
+         {"playwright": FLAT, "servers": {"playwright": NATIVE}}),
+    ], ids=["native-only", "both"])
+    def test_opencode_refreshes_an_existing_native_entry(self, tmp_path, mocker, seed, want):
+        """A playwright entry already in `mcp.servers` is overwritten in place,
+        wholesale and in V2's spelling, with its neighbours kept; a flat one is
+        rewritten only where one already was."""
+        cfg = _seed("opencode", tmp_path, json.dumps({"theme": "dark", "mcp": seed}, indent=2))
+        msg = _register("opencode", tmp_path, mocker, self.ENV)
+        got = json.loads(cfg.read_text())
+        assert got == {"theme": "dark", "mcp": want}
+        assert "registered in" in msg and "already" not in msg
+        assert "`mcp.servers`" in msg      # says which map it refreshed
+
+    def test_opencode_current_native_entry_is_already_registered(self, tmp_path, mocker):
+        """"Already" means "nothing changed": a nested entry that already pins
+        the browser is left byte for byte, and no flat sibling is added."""
+        cfg = _seed("opencode", tmp_path, json.dumps({"mcp": {"servers": {"playwright": self.NATIVE}}}))
+        before = cfg.read_bytes()
+        msg = _register("opencode", tmp_path, mocker, self.ENV)
+        assert cfg.read_bytes() == before
+        assert "already registered in" in msg
+
+    # Each seed carries a key named playwright: without one, the merge leaves
+    # `mcp.servers` alone whatever the map rules answer, so a seed without it
+    # could not tell the readings apart.
+    @pytest.mark.parametrize("own", [
+        {"type": "local", "command": ["my-server"], "playwright": {"type": "local", "command": ["x"]}},
+        # An on/off stub to both majors: V2 drops it, 1.x reads one server.
+        {"enabled": False, "playwright": {"type": "local", "command": ["x"]}},
+        {"enabled": True, "playwright": {"type": "local", "command": ["x"]}},
+    ], ids=["server-with-playwright-key", "enabled-false-stub", "enabled-true-stub"])
+    def test_a_server_literally_named_servers_is_left_alone(self, tmp_path, mocker, own):
+        """A guard: an `mcp.servers` that no OpenCode reads as a map of servers
+        is left exactly as it is, and playwright goes in flat."""
+        cfg = _seed("opencode", tmp_path, json.dumps({"mcp": {"servers": own}}))
+        _register("opencode", tmp_path, mocker, self.ENV)
+        assert json.loads(cfg.read_text())["mcp"] == {"servers": own, "playwright": self.FLAT}
+
+    # The shapes probed on 2.4.1, 1.19.6 and 1.15.10 (module docstring), each
+    # `mcp.servers` holding a stale playwright beside one other key.
+    SERVER_NAMED_TYPE = {"type": "local", "command": ["my-type-server"]}
+
+    @pytest.mark.parametrize("other,flat", [
+        # V2 launches the nested entry, so it is refreshed. Both 1.x reject
+        # the file, reading `mcp.servers` as one malformed server, and the
+        # flat entry is written as wherever 1.x cannot see the nested one.
+        ({"type": "stdio"}, True),
+        ({"type": None}, True),
+        ({"type": ["x"]}, True),
+        # V2 launches the nested entry; both 1.x accept the file, read it as
+        # one on/off server and launch nothing — so each needs its own entry.
+        ({"type": SERVER_NAMED_TYPE, "enabled": True}, True),
+        # A guard: a server named `type` is a map to V2 and 1.19.6 alike, so
+        # the nested entry alone is refreshed, as it was before.
+        ({"type": SERVER_NAMED_TYPE}, False),
+        ({"type": {"command": ["my-type-server"]}}, False),
+    ], ids=["type-stdio", "type-null", "type-list", "named-type-beside-enabled",
+            "named-type", "named-type-incomplete"])
+    def test_opencode_refreshes_a_nested_entry_v2_would_launch(self, tmp_path, mocker, other, flat):
+        """A playwright in an `mcp.servers` V2 reads as a map is refreshed
+        wherever 1.x reads it otherwise: V2 would launch the stale entry while
+        the registration reported success. The flat entry is written exactly
+        where 1.x cannot see the nested one."""
+        servers = {**other, "playwright": self.OLD}
+        cfg = _seed("opencode", tmp_path, json.dumps({"mcp": {"servers": servers}}, indent=2))
+        msg = _register("opencode", tmp_path, mocker, self.ENV)
+        want = {"servers": {**other, "playwright": self.NATIVE}}
+        if flat:
+            want["playwright"] = self.FLAT
+        assert json.loads(cfg.read_text())["mcp"] == want
+        assert "registered in" in msg and "already" not in msg
+        assert ("`mcp.servers` and `mcp`" in msg) == flat and "`mcp.servers`" in msg
+
+    @pytest.mark.parametrize("bad", [None, [], "x"])
+    def test_a_non_object_nested_map_is_left_alone(self, tmp_path, mocker, bad):
+        """An `mcp.servers` that is not a JSON object is no server either, so
+        OpenCode 1.x rejects the file over it: the file is left untouched
+        rather than given a flat entry beside it, and the message names the
+        nested map and gives the entry to add by hand."""
+        cfg = _seed("opencode", tmp_path, json.dumps({"mcp": {"servers": bad}}))
+        before = cfg.read_bytes()
+        msg = _register("opencode", tmp_path, mocker, self.ENV)
+        assert cfg.read_bytes() == before
+        assert "`mcp.servers` in" in msg and "is not a JSON object; left it alone" in msg
+        reg = AGENT_CLIS["opencode"].mcp_registration(home=tmp_path, env=self.ENV)
+        assert json.dumps(reg.merge) in msg
+
+    def test_a_non_boolean_enabled_is_not_already_registered(self, tmp_path, mocker):
+        """"Already" is decided on the JSON, not Python's `==`, which takes
+        `1` for `True`; OpenCode wants a boolean there, so the entry is
+        rewritten."""
+        cfg = _seed("opencode", tmp_path, json.dumps({"mcp": {"playwright": {**self.FLAT, "enabled": 1}}}))
+        msg = _register("opencode", tmp_path, mocker, self.ENV)
+        assert "registered in" in msg and "already" not in msg
+        assert json.loads(cfg.read_text())["mcp"]["playwright"]["enabled"] is True
+
+    @pytest.mark.parametrize("value,v2,v1", [
+        ({"playwright": {"type": "local", "command": ["x"]}}, True, True),
+        ({}, True, True),
+        # Servers literally named `type` and `enabled` hold objects: a map.
+        ({"type": SERVER_NAMED_TYPE, "enabled": SERVER_NAMED_TYPE}, True, True),
+        ({"type": "local"}, False, False),
+        ({"type": "remote", "url": "u"}, False, False),
+        ({"enabled": True}, False, False),          # V2 drops the stub; 1.x reads one server
+        ({"enabled": False}, False, False),
+        # Where V2 sees a map and 1.x one server.
+        ({"type": "stdio"}, True, False),
+        ({"type": None}, True, False),
+        ({"type": ["local"]}, True, False),
+        ({"type": SERVER_NAMED_TYPE, "enabled": True}, True, False),
+        ({"enabled": "yes"}, True, False),
+    ])
+    def test_the_two_majors_map_rules(self, value, v2, v1):
+        """Each OpenCode major's own rule for when `mcp.servers` is a map of
+        servers (module docstring). 1.x's is the narrower, which is what lets
+        the merge skip the flat entry only where it refreshes a nested one."""
+        assert agent_cli._v2_reads_server_map(value) is v2
+        assert agent_cli._v1_reads_server_map(value) is v1
+        assert v2 or not v1
+
 
 class TestPlaywrightMcpNote:
     @pytest.mark.parametrize("cid", ["gemini", "claude", "qwen"])
@@ -673,6 +880,19 @@ class TestPlaywrightMcpNote:
         assert "merge the `playwright` server into" in note
         assert "opencode/opencode.json" in note
         assert "claude mcp add" not in note
+        assert note.endswith(f"`{REGISTER_MCP_CMD}` does this for you")
+
+    @pytest.mark.parametrize("cid", ["opencode", "agy"])
+    def test_a_nested_map_is_named_in_the_note(self, cid):
+        """OpenCode V2 runs an `mcp.servers.playwright` over the flat entry,
+        so a note telling the person to merge the flat one also says to
+        replace that one if it is there — the clause the unreadable-file hint
+        carries. agy has one map, so its note does not — that case is a guard:
+        it held before #224 too, and fails if the clause leaks into a one-map
+        CLI's note."""
+        note = playwright_mcp_note(AGENT_CLIS[cid])
+        clause = ", or replace `mcp.servers.playwright` if it is there"
+        assert (clause in note) == (cid == "opencode")
         assert note.endswith(f"`{REGISTER_MCP_CMD}` does this for you")
 
     def test_agy_config_form_names_its_file(self):
@@ -1153,6 +1373,26 @@ class TestChromiumIsPinned:
     def _entry(self, cid, tmp_path, env):
         reg = AGENT_CLIS[cid].mcp_registration(home=tmp_path, env=env)
         return reg.merge[reg.servers_key][agent_cli.PLAYWRIGHT_MCP_SERVER]
+
+    @pytest.mark.parametrize("seed", ["nested", "both"])
+    def test_the_pin_reaches_every_entry_opencode_might_run(self, tmp_path, mocker, seed):
+        """Every playwright entry OpenCode's file holds after a registration
+        carries the glob-resolved pin, and none is dropped: a pin on only one
+        map is one some major never sees. The seeds are unpinned, as
+        `opencode mcp add` or an older registration leaves them."""
+        env = self._browsers(tmp_path, 1234)
+        pin = [*agent_cli.CHROMIUM_PIN_ARGS,
+               str(tmp_path / "browsers" / "chromium-1234" / "chrome-linux64" / "chrome")]
+        nested = {"servers": {"playwright": {"type": "local", "command": list(PLAYWRIGHT_MCP_COMMAND)}}}
+        flat = {"playwright": {"type": "local", "command": list(PLAYWRIGHT_MCP_COMMAND), "enabled": True}}
+        seeds = {"nested": nested, "both": {**flat, **nested}}
+        cfg = _seed("opencode", tmp_path, json.dumps({"mcp": seeds[seed]}))
+        _register("opencode", tmp_path, mocker, env)
+        got = json.loads(cfg.read_text())["mcp"]
+        entries = [m["playwright"] for m in (got, got.get("servers", {})) if "playwright" in m]
+        assert len(entries) == (2 if seed == "both" else 1)
+        for e in entries:
+            assert e["command"][-4:] == pin, e
 
     def test_override_is_taken_verbatim(self, tmp_path):
         env = self._browsers(tmp_path, 1234)

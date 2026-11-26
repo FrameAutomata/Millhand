@@ -67,6 +67,28 @@ changing one:
   DEFAULTS to `project`, and Claude Code's to `local` (per cwd), so `-s user`
   is required on both or the registration lands in the directory setup ran
   from and `cd career-ops && <cli> …` — a separate checkout — never sees it.
+  OpenCode's file has a second map, `mcp.servers`, and what the releases do
+  with it was read off 1.15.10–1.19.6, 2.0.0 and 2.4.1 on 2026-11-24.
+  OpenCode 2 documents it and still reads the flat map; a 1.x before 1.18.24
+  (the dev shell's 1.15.10 included) rejects the whole file once it exists;
+  and a name in both maps is settled opposite ways — V2 runs the nested
+  entry, 1.x from 1.18.24 the flat one. They also disagree on when
+  `mcp.servers` is a map at all. V2 calls it one server only when `type` is
+  `local`/`remote`, and drops it as an on/off stub when it has no `type` and
+  a boolean `enabled`; anything else is a map, a malformed member skipped
+  with a warning. 1.x from 1.18.24 calls it one server whenever `type` or
+  `enabled` holds a non-object, and then decodes it as one. Read off 2.4.1,
+  1.19.6 and 1.15.10 on 2026-11-25, `mcp.servers` holding a stale
+  `playwright` beside one other key:
+    - `"type": "stdio"`, `null` or `["x"]`: V2 launches the nested
+      `playwright`; both 1.x reject the file.
+    - `"enabled": true`, no `type`: all three accept it, and launch nothing.
+    - `"type": {…}`, a server named `type`: V2 and 1.19.6 launch the nested
+      `playwright`; 1.15.10 rejects the file.
+    - the same server beside `"enabled": true`: V2 launches the nested
+      `playwright`; both 1.x read `mcp.servers` as one on/off server and
+      launch nothing.
+  `_merge_config` has the rule this produces.
 """
 
 import argparse
@@ -106,8 +128,15 @@ REGISTER_MCP_CMD = "python -m pipeline.agent_cli --register-mcp"
 # provider-env fixture, like `BATCH_CLI`.
 XDG_CONFIG_HOME_ENV = "XDG_CONFIG_HOME"
 
-# The two config-merge shapes. Each CLI's file holds a map of servers under a
-# top-level key, and the entry for one server is spelled its way.
+# The config-merge entries. Each CLI's file holds a map of servers under a
+# top-level key, and the entry for one server is spelled its way — OpenCode's
+# twice, because its file has two maps (module docstring): the flat `mcp` one
+# keeps `enabled`, and the nested `mcp.servers` one is spelled V2's way, which
+# replaced `enabled` with `disabled`. Each holds its own `command` list.
+OPENCODE_V2_PLAYWRIGHT_ENTRY = {
+    "type": "local",
+    "command": list(PLAYWRIGHT_MCP_COMMAND),
+}
 OPENCODE_PLAYWRIGHT_ENTRY = {
     "type": "local",
     "command": list(PLAYWRIGHT_MCP_COMMAND),
@@ -245,14 +274,14 @@ def resolve_chromium(env: dict | None = None) -> str:
 CHROMIUM_PIN_ARGS = ("--browser", "chromium", "--executable-path")
 
 
-def _pin_chromium(command, env: dict) -> list:
-    """`command` with the chromium pin appended, when we found a browser.
+def _pin_chromium(command, browser: str) -> list:
+    """`command` with the chromium pin appended, when `browser` names one
+    (`resolve_chromium`'s answer; "" registers bare).
 
     Always a FRESH list, on both branches: `_pin_entry`'s shallow `dict(entry)`
     would otherwise alias a module-level registry constant into the merge dict,
     where a later caller could mutate the registry itself."""
-    path = resolve_chromium(env)
-    return [*command, *CHROMIUM_PIN_ARGS, path] if path else [*command]
+    return [*command, *CHROMIUM_PIN_ARGS, browser] if browser else [*command]
 
 
 _GEMINI_API_TERMS_URL = "https://ai.google.dev/gemini-api/terms"
@@ -265,7 +294,10 @@ class McpRegistration:
     Exactly one of the two forms is populated: `argv` (run it), or
     `config_path` + `merge` (read the JSON there, merge the `playwright` entry
     into the server map under `servers_key`, write back atomically, creating
-    parents). A config merge is idempotent by construction; an argv
+    parents). OpenCode's file has a second, nested map, `native_key` under
+    `servers_key`: a `playwright` entry already in it is refreshed to
+    `native_entry`, and the merge never creates the map or a key in it
+    (`_merge_config`). A config merge is idempotent by construction; an argv
     registration is made idempotent by the caller (`register_playwright_mcp`
     reads "already" as success)."""
     argv: tuple = ()
@@ -274,6 +306,9 @@ class McpRegistration:
     # `hash=False`: a frozen dataclass advertises hashability, and a dict
     # field would make `hash()` raise. The value is immutable data in practice.
     merge: dict = field(default_factory=dict, hash=False)
+    # OpenCode's nested server map and its entry, empty elsewhere.
+    native_key: str = ""
+    native_entry: dict = field(default_factory=dict, hash=False)
 
     @property
     def is_argv(self) -> bool:
@@ -318,6 +353,9 @@ class AgentCli:
     # `hash=False` keeps AgentCli hashable (set members, dict keys) despite
     # the dict: with eq=True, frozen=True the generated __hash__ would raise.
     mcp_server_entry: dict = field(default_factory=dict, hash=False)
+    # A nested server map and its entry shape; OpenCode only (`_merge_config`).
+    mcp_native_key: str = ""
+    mcp_native_entry: dict = field(default_factory=dict, hash=False)
 
     def interactive_argv(self, prompt: str, *, model: str | None = None) -> list:
         """The argv that opens the CLI interactively, seeded with `prompt`.
@@ -344,11 +382,13 @@ class AgentCli:
         browser note above for why the default is not usable here."""
         home = Path.home() if home is None else Path(home)
         env = os.environ if env is None else env
+        # Once per registration, so every entry it writes pins the same browser.
+        browser = resolve_chromium(env)
         if self.mcp_add_args:
             # For every CLI taking this form the SERVER command is the tail of
             # these args, so the flag appends cleanly to the whole sequence.
             return McpRegistration(
-                argv=(self.binary, *_pin_chromium(self.mcp_add_args, env)))
+                argv=(self.binary, *_pin_chromium(self.mcp_add_args, browser)))
         if self.mcp_config_base == "home":
             base = home
         else:
@@ -358,11 +398,13 @@ class AgentCli:
             config_path=base / self.mcp_config_rel,
             servers_key=self.mcp_servers_key,
             merge={self.mcp_servers_key: {
-                PLAYWRIGHT_MCP_SERVER: _pin_entry(self.mcp_server_entry, env)}},
+                PLAYWRIGHT_MCP_SERVER: _pin_entry(self.mcp_server_entry, browser)}},
+            native_key=self.mcp_native_key,
+            native_entry=_pin_entry(self.mcp_native_entry, browser),
         )
 
 
-def _pin_entry(entry: dict, env: dict) -> dict:
+def _pin_entry(entry: dict, browser: str) -> dict:
     """A server entry with the chromium flag on whichever key holds the argv.
 
     Two shapes ship here and they disagree about where the arguments live:
@@ -371,9 +413,9 @@ def _pin_entry(entry: dict, env: dict) -> dict:
     a config that merges cleanly and launches nothing."""
     out = dict(entry)
     if isinstance(out.get("command"), list):
-        out["command"] = _pin_chromium(out["command"], env)
+        out["command"] = _pin_chromium(out["command"], browser)
     elif isinstance(out.get("args"), list):
-        out["args"] = _pin_chromium(out["args"], env)
+        out["args"] = _pin_chromium(out["args"], browser)
     return out
 
 
@@ -406,6 +448,8 @@ AGENT_CLIS: dict = {c.id: c for c in (
         mcp_config_base="xdg",
         mcp_servers_key="mcp",
         mcp_server_entry=OPENCODE_PLAYWRIGHT_ENTRY,
+        mcp_native_key="servers",
+        mcp_native_entry=OPENCODE_V2_PLAYWRIGHT_ENTRY,
     ),
     AgentCli(
         id="agy",
@@ -640,6 +684,8 @@ def playwright_mcp_note(cli: AgentCli) -> str:
         how = f"`{shlex.join(reg.argv)}`"
     else:
         how = f"merge the `{PLAYWRIGHT_MCP_SERVER}` server into {_display_path(reg.config_path)}"
+        if reg.native_key:
+            how += f", or replace `{_native_name(reg)}` if it is there"
     return (f"Needs the Playwright MCP server registered with {cli.label} (one-time):  "
             f"{how} — `{REGISTER_MCP_CMD}` does this for you")
 
@@ -663,6 +709,8 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
 def _merge_config(reg: McpRegistration) -> str:
     path = reg.config_path
     key = reg.servers_key
+    where = _display_path(path)
+    hint = f"Add the `{PLAYWRIGHT_MCP_SERVER}` server by hand: {json.dumps(reg.merge)}"
     existing: dict = {}
     if path.exists():
         try:
@@ -670,20 +718,73 @@ def _merge_config(reg: McpRegistration) -> str:
         except (OSError, ValueError) as e:
             # Never clobber a config we can't read back: the rest of the user's
             # CLI setup lives in this file.
-            return (f"Could not read {_display_path(path)} ({e}); left it alone. "
-                    f"Add the `{PLAYWRIGHT_MCP_SERVER}` server by hand: {json.dumps(reg.merge)}")
+            if reg.native_key:
+                # The CLI reads comments and a BOM we can't, so a nested entry
+                # may be there unseen, and V2 would run it over a flat one
+                # added beside it.
+                hint += (f" — or, if it already has `{_native_name(reg)}`, "
+                         f"replace that entry with {json.dumps(reg.native_entry)} "
+                         "instead of adding a flat one")
+            return f"Could not read {where} ({e}); left it alone. {hint}"
         if not isinstance(existing, dict):
-            return (f"{_display_path(path)} is not a JSON object; left it alone. "
-                    f"Add the `{PLAYWRIGHT_MCP_SERVER}` server by hand: {json.dumps(reg.merge)}")
-    servers = dict(existing.get(key) or {})
-    entry = reg.merge[key][PLAYWRIGHT_MCP_SERVER]
-    already = servers.get(PLAYWRIGHT_MCP_SERVER) == entry
-    servers[PLAYWRIGHT_MCP_SERVER] = entry
+            return f"{where} is not a JSON object; left it alone. {hint}"
+    servers = existing.get(key, {})
+    if not isinstance(servers, dict):
+        # The CLI cannot read this either, but the value is the user's.
+        return f"`{key}` in {where} is not a JSON object; left it alone. {hint}"
+    servers = dict(servers)
+    native = servers.get(reg.native_key) if reg.native_key else None
+    if reg.native_key and reg.native_key in servers and not isinstance(native, dict):
+        # No server is a non-object, so 1.x rejects the file over this too.
+        return f"`{key}.{reg.native_key}` in {where} is not a JSON object; left it alone. {hint}"
+    # OpenCode's two maps (module docstring), each kept for the major that
+    # reads it: a nested entry already there is overwritten wholesale wherever
+    # V2 would launch it, and the flat one is written if it is there too or 1.x
+    # would not launch the nested one — so the pair is never created where
+    # both majors run the nested entry, and a file holding both gets both.
+    nested = native is not None and PLAYWRIGHT_MCP_SERVER in native
+    in_native = nested and _v2_reads_server_map(native)
+    write_flat = PLAYWRIGHT_MCP_SERVER in servers or not (nested and _v1_reads_server_map(native))
+    if in_native:
+        servers[reg.native_key] = {**native, PLAYWRIGHT_MCP_SERVER: reg.native_entry}
+    if write_flat:
+        servers[PLAYWRIGHT_MCP_SERVER] = reg.merge[key][PLAYWRIGHT_MCP_SERVER]
     merged = {**existing, key: servers}
-    if not already:
+    # Nothing changed, no write. Compared as JSON, since `==` takes an
+    # `"enabled": 1` for the boolean OpenCode requires there.
+    changed = json.dumps(merged, sort_keys=True) != json.dumps(existing, sort_keys=True)
+    if changed:
         _write_json_atomic(path, merged)
-    verb = "already registered in" if already else "registered in"
-    return f"Playwright MCP server {verb} {_display_path(path)}."
+    verb = "registered in" if changed else "already registered in"
+    if in_native:
+        where += (f" (`{key}.{reg.native_key}` and `{key}`)" if write_flat
+                  else f" (`{key}.{reg.native_key}`)")
+    return f"Playwright MCP server {verb} {where}."
+
+
+def _native_name(reg: McpRegistration) -> str:
+    """The nested entry's dotted name, `mcp.servers.playwright`."""
+    return f"{reg.servers_key}.{reg.native_key}.{PLAYWRIGHT_MCP_SERVER}"
+
+
+def _v2_reads_server_map(value: dict) -> bool:
+    """Whether OpenCode 2 reads `mcp.servers` as a map of servers, by its own
+    rule (module docstring): unless `type` is `local`/`remote` (one server) or
+    it has no `type` and a boolean `enabled` (an on/off stub, dropped). A
+    `playwright` in such a map is one V2 launches, so the merge refreshes it.
+    The rule is wider than 1.x's, but where they part 1.x reads one server and
+    either rejects the file already or ignores the key, so overwriting a key
+    that is there changes nothing 1.x does."""
+    return (value.get("type") not in ("local", "remote")
+            and ("type" in value or not isinstance(value.get("enabled"), bool)))
+
+
+def _v1_reads_server_map(value: dict) -> bool:
+    """Whether OpenCode 1.x from 1.18.24 reads `mcp.servers` as a map of
+    servers, by its rule (module docstring): neither `type` nor `enabled`
+    holds a non-object. Where it does not, 1.x cannot see a `playwright` in
+    it, so the merge writes the flat entry for 1.x to launch."""
+    return not any(k in value and not isinstance(value[k], dict) for k in ("type", "enabled"))
 
 
 def _pinned_path(argv) -> str:

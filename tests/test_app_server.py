@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from pipeline import agent_cli, state_sync
+from tests.test_agent_cli import _which
 
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
@@ -1079,6 +1080,24 @@ class TestAgentCliSurface:
         assert r.status_code == 400
         assert "notacli" in r.json()["detail"]
         reg.assert_not_called()
+
+    def test_register_bridge_answers_a_non_object_server_map_with_a_message(
+            self, client, mocker, monkeypatch, tmp_path):
+        """The real registry, not a mock: `{"mcp": "x"}` in OpenCode's file
+        used to raise out of the merge, so the button got a 500 for a file the
+        message can tell the person how to fix (#224)."""
+        mocker.patch("pipeline.agent_cli.shutil.which", side_effect=_which({"opencode"}))
+        monkeypatch.setenv(agent_cli.XDG_CONFIG_HOME_ENV, str(tmp_path / "xdg"))
+        # Hermetic: no Playwright browsers dir from the real home is globbed.
+        monkeypatch.setenv(agent_cli.BROWSERS_PATH_ENV, str(tmp_path / "absent"))
+        cfg = tmp_path / "xdg" / "opencode" / "opencode.json"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text('{"mcp": "x"}', encoding="utf-8")
+        r = client.post("/api/agent-cli/register", json={"cli": "opencode"})
+        assert r.status_code == 200, r.text
+        assert r.json()["cli"] == "opencode"
+        assert "left it alone" in r.json()["message"]
+        assert cfg.read_text(encoding="utf-8") == '{"mcp": "x"}'
 
 
 class TestSubmitPolicySave:
