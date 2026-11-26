@@ -6,8 +6,11 @@ extraction are guarded so the suite still passes without node / pdfplumber.
 
 import base64
 import functools
+import json
+import os
 import re
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -19,6 +22,18 @@ from pipeline.agent_cli import AGENT_CLIS, APPLY_ONLY_LABEL
 from pipeline.app import onboard
 from pipeline.handoff import SUBMIT_POLICIES
 from pipeline.sites import SUPPORTED_SITES
+
+# The seven form fields #227 retired, with what a stale tab would post for them —
+# spelled out rather than read off onboard.RETIRED_FORM_FIELDS, since iterating
+# the constant would pass if it were emptied. tests/test_app_server.py shares it.
+RETIRED_FORM_VALUES = {
+    "eeo_gender": "Female", "eeo_race": "Asian",
+    "eeo_veteran": "I am a protected veteran",
+    "eeo_disability": "Yes, I have a disability",
+    "data_processing_consent": "yes", "save_answers": "yes", "share_answers": "yes",
+}
+# The four answers: unlike "yes", none can turn up in a payload by coincidence.
+RETIRED_ANSWERS = tuple(v for v in RETIRED_FORM_VALUES.values() if v != "yes")
 
 
 @pytest.fixture
@@ -91,15 +106,10 @@ class TestBuildOnboardingJson:
             "results_wanted": "100",
             "sites": ["indeed", "linkedin"],
             "include_easy_apply": True,
-            "eeo_gender": "Female",
-            "eeo_disability": "No, I do not have a disability",
         }
         payload = onboard.build_onboarding_json(form, resume_text="resume body")
         assert payload["resumeText"] == "resume body"
         assert payload["info"]["name"] == "Jane Dev"
-        assert payload["info"]["eeoGender"] == "Female"
-        assert payload["info"]["eeoDisability"] == "No, I do not have a disability"
-        assert payload["info"]["eeoVeteran"] == ""        # unset → blank → declines
         assert payload["criteria"]["targetRoles"] == ["Senior Full-Stack Engineer", "Backend Engineer"]
         assert payload["criteria"]["negativeRoles"] == ["Intern", "Manager"]
         locs = payload["searchSettings"]["locations"]
@@ -134,18 +144,6 @@ class TestBuildOnboardingJson:
             {"sites": ["glassdoor", "google"]}, resume_text=""
         )
         assert payload["searchSettings"]["sites"] == ["indeed", "linkedin"]
-
-    def test_maps_indeed_consent_toggles(self):
-        info = onboard.build_onboarding_json(
-            {"data_processing_consent": "no", "save_answers": "yes"}, "")["info"]
-        assert info["eeoConsent"] is False        # explicit decline honored
-        assert info["eeoSaveAnswers"] is True
-        assert info["eeoShareAnswers"] is False
-
-    def test_indeed_consent_defaults(self):
-        info = onboard.build_onboarding_json({}, "")["info"]
-        assert info["eeoConsent"] is True         # auto-agree the required consent
-        assert info["eeoSaveAnswers"] is False and info["eeoShareAnswers"] is False
 
 
 class TestParseResumeInfo:
@@ -280,8 +278,6 @@ class TestNodeRoundTrip:
             "citizenship": "Canadian", "requires_sponsorship": "yes",
             "work_auth_regions": "Canada", "eligible_countries": "Canada, United States",
             "work_permit_type": "Needs sponsorship",
-            "eeo_gender": "Female", "eeo_race": "Asian",
-            "data_processing_consent": "no", "save_answers": "yes", "share_answers": "no",
             "locations": "US Remote, Dallas, TX", "sites": ["indeed"],
             "hours_old": "48", "results_wanted": "75", "distance": "25",
             "include_easy_apply": True,
@@ -292,6 +288,24 @@ class TestNodeRoundTrip:
         for key, sent in form.items():
             assert key in derived, f"{key} was written but derive_form doesn't read it back"
             assert derived[key] == sent, f"{key} did not survive the round trip"
+
+    def test_generated_profile_has_no_self_id_section(self, tmp_path):
+        """The real generator writes no self-ID section, whatever it is sent
+        (#227) — a stale tab's form fields AND the camelCase keys an older
+        build_onboarding_json put in `info`, so the generator holds on its own
+        rather than only because the mapping stopped passing them."""
+        work = _node_workdir(tmp_path)
+        payload = onboard.build_onboarding_json(
+            {"name": "Jane Dev", **RETIRED_FORM_VALUES}, "Jane Dev\nSKILLS\nPython")
+        payload["info"].update(
+            eeoGender="Female", eeoRace="Asian", eeoVeteran="I am a protected veteran",
+            eeoDisability="Yes, I have a disability",
+            eeoConsent=True, eeoSaveAnswers=True, eeoShareAnswers=True)
+        assert onboard.run_generation(work, payload).get("ok") is True
+        text = (work / "career-ops" / "config" / "profile.yml").read_text(encoding="utf-8")
+        assert "voluntary_disclosures" not in yaml.safe_load(text)
+        for leak in ("voluntary_disclosures", *RETIRED_ANSWERS, "save_answers", "share_answers"):
+            assert leak not in text, leak
 
 
 @pytest.mark.skipif(not _node_deps_available(),
@@ -630,6 +644,7 @@ work_authorization:
   requires_sponsorship: false
   work_permit_type: Citizen
   eligible_countries: [United States]
+# Written by setup before #227 and not yet scrubbed: derive_form must ignore it.
 voluntary_disclosures:
   gender: ""
   race_ethnicity: Asian
@@ -685,7 +700,6 @@ class TestDeriveFromProfile:
         # box — the exact symptom this exists to fix.
         assert "phone" not in derived
         assert "github" not in derived
-        assert "eeo_gender" not in derived
 
     def test_target_roles_come_from_archetypes_not_primary(self, derived):
         # `primary` is the same list truncated to two, so reading it would drop
@@ -703,10 +717,24 @@ class TestDeriveFromProfile:
 
     def test_booleans_keep_both_answers(self, derived):
         # Keyed on the key being present, not the value being non-blank: `false`
-        # is an answer, and it serializes the way the form's select/checkbox do.
+        # is an answer, and it serializes the way the form's select does.
         assert derived["requires_sponsorship"] == "no"
-        assert derived["data_processing_consent"] == "yes"
-        assert derived["save_answers"] == "no"
+
+    def test_self_id_section_is_not_read_back(self, profile):
+        """A profile.yml written before #227 still carries the section until it
+        is scrubbed, and reading it back would put the answers into the form —
+        and into the sidecar the next Save writes. None of the seven comes back,
+        however fully the section is filled in."""
+        profile["voluntary_disclosures"] = {
+            "gender": "Female", "race_ethnicity": "Asian",
+            "veteran_status": "I am a protected veteran",
+            "disability_status": "Yes, I have a disability",
+            "data_processing_consent": True, "save_answers": True, "share_answers": True,
+        }
+        derived = onboard.derive_from_profile(profile)
+        for key in RETIRED_FORM_VALUES:
+            assert key not in derived, key
+        assert not {"Female", "Asian"} & set(derived.values())
 
     def test_missing_booleans_are_omitted(self):
         assert "requires_sponsorship" not in onboard.derive_from_profile({})
@@ -947,10 +975,8 @@ class TestPrefillMerge:
         # prefillForm looks each key up as `[name="<key>"]`, so a derived key
         # that doesn't name a field is prefill that silently does nothing —
         # which is the symptom (blank fields), not an error anyone would see.
-        # Guards a rename on either side, over EVERY key the two derivations can
-        # emit (the blank-omitting rule would otherwise hide the EEO fields).
-        profile["voluntary_disclosures"].update(
-            gender="Female", veteran_status="No", disability_status="No")
+        # Guards a rename on either side, over every key the two derivations
+        # emit from the fixtures.
         keys = set(onboard.derive_from_profile(profile))
         keys |= set(onboard.derive_from_search(search))
         assert len(keys) > 20, "fixtures should exercise most of the form"
@@ -1053,57 +1079,159 @@ class TestProfileMasterSecretWiring:
         assert "too large" in capsys.readouterr().out  # and it says why
 
 
-class TestEeoDatalists:
-    """The four voluntary self-ID fields offer standard answers as dropdown
-    suggestions, but must stay free-text so a user can type the employer's exact
-    wording (the answers are fuzzy-matched per form) or a non-US category. That
-    means an <input list="..."> wired to a <datalist> — never a hard <select>,
-    which would lock in one (US-centric) option set and drop free typing."""
+class TestSelfIdStaysOutOfCareerOps:
+    """Self-identification answers do not reach career-ops/ at all (#227; see
+    _batch_common.scrub_profile_yml_file): not asked for, not mapped, not
+    generated, and not kept in the sidecar a later Save could feed back.
+    """
 
-    EEO_FIELDS = ["eeo_gender", "eeo_race", "eeo_veteran", "eeo_disability"]
+    ROOT = Path(__file__).resolve().parent.parent
 
-    def _input_tag(self, html, name):
-        m = re.search(rf'<input\b[^>]*\bname="{re.escape(name)}"[^>]*>', html)
-        assert m, f"no <input name={name!r}> found"
-        return m.group(0)
+    def test_generator_never_writes_voluntary_disclosures(self):
+        from pipeline._batch_common import _REDACTED_PROFILE_SECTION
+        src = (self.ROOT / "setup-profile.mjs").read_text(encoding="utf-8")
+        assert _REDACTED_PROFILE_SECTION not in src
+        # Neither the interactive interview nor any info.eeo* plumbing is left.
+        assert not re.search(r"\beeo[A-Z]", src)
 
-    def test_each_eeo_field_is_input_not_select(self, html):
-        # A <select name="eeo_*"> would mean we lost free-text entry.
-        for name in self.EEO_FIELDS:
-            assert not re.search(rf'<select\b[^>]*\bname="{re.escape(name)}"', html), \
-                f"{name} must stay an <input> (free-text), not a <select>"
-            self._input_tag(html, name)  # the <input> still exists
+    def test_wizard_collects_no_self_id(self, html):
+        assert 'name="eeo_' not in html
+        for name in RETIRED_FORM_VALUES:
+            assert f'name="{name}"' not in html, name
+        js = (self.ROOT / "pipeline" / "app" / "static" / "onboard.js").read_text(encoding="utf-8")
+        assert "CONSENT_TOGGLES" not in js
 
-    def test_each_eeo_input_references_an_existing_datalist(self, html):
-        datalist_ids = set(re.findall(r'<datalist\b[^>]*\bid="([^"]+)"', html))
-        for name in self.EEO_FIELDS:
-            tag = self._input_tag(html, name)
-            m = re.search(r'\blist="([^"]+)"', tag)
-            assert m, f"{name} input is missing a list= attribute"
-            assert m.group(1) in datalist_ids, \
-                f"{name} list={m.group(1)!r} has no matching <datalist id>"
+    def test_onboarding_json_carries_no_self_id(self):
+        # A browser tab opened before the upgrade still posts these fields.
+        payload = onboard.build_onboarding_json(dict(RETIRED_FORM_VALUES), "")
+        info = payload["info"]
+        assert not [k for k in info if k.lower().startswith("eeo")], sorted(info)
+        dumped = json.dumps(payload)
+        for value in RETIRED_ANSWERS:
+            assert value not in dumped, value
 
-    def test_each_eeo_input_reenables_autocomplete(self, html):
-        # The form sets autocomplete="off" (so the browser doesn't autofill
-        # name/email across the wizard). Chromium suppresses <datalist>
-        # suggestions whenever the input's effective autocomplete is "off", so
-        # each EEO input must override it back to "on" or the dropdown is dead.
-        for name in self.EEO_FIELDS:
-            tag = self._input_tag(html, name)
-            m = re.search(r'\bautocomplete="([^"]+)"', tag)
-            assert m, f"{name} input must set autocomplete to override the form default"
-            assert m.group(1).lower() != "off", \
-                f"{name} input has autocomplete=off — its datalist won't show in Chromium"
+    def test_save_sidecar_drops_retired_fields(self, tmp_path):
+        onboard.save_sidecar(tmp_path, {"name": "Jane", **RETIRED_FORM_VALUES})
+        raw = (tmp_path / ".ui-cache" / "onboarding.json").read_text(encoding="utf-8")
+        assert json.loads(raw) == {"name": "Jane"}
 
-    def test_datalists_offer_standard_and_decline_options(self, html):
-        # Spot-check that the suggestion sets carry the usual wording, including
-        # an explicit "prefer not to say" so declining is one click, not just blank.
-        assert "Non-binary" in html
-        assert "Black or African American" in html
-        assert "protected veteran" in html
-        assert "do not have a disability" in html
-        assert re.search(r"[Pp]refer not to (say|answer)|don't wish to answer|do not want to answer", html)
+    def test_an_old_sidecar_prefills_none_of_them(self, tmp_path):
+        """A sidecar written before #227 holds the answers until the next Save
+        rewrites it, and prefill is what hands it to the browser — so they are
+        dropped on the read too, not only on save."""
+        sidecar = tmp_path / ".ui-cache" / "onboarding.json"
+        sidecar.parent.mkdir(parents=True)
+        sidecar.write_text(json.dumps({"name": "Jane", **RETIRED_FORM_VALUES}), encoding="utf-8")
+        form = onboard.prefill_form(tmp_path, tmp_path / "career-ops")
+        assert form.get("name") == "Jane"
+        for name in RETIRED_FORM_VALUES:
+            assert name not in form, name
+        dumped = json.dumps(form)
+        for value in RETIRED_ANSWERS:
+            assert value not in dumped, value
 
+
+    OTHER_FIELDS = {
+        "name": "Jane Roe", "location_city": "Montréal",
+        "sites": ["indeed", "linkedin"], "results_wanted": 75, "include_easy_apply": True,
+        "hours_old": None, "exit_story": "Line one.\nLine two \"quoted\".",
+    }
+
+    def _old_sidecar(self, tmp_path, payload) -> Path:
+        sidecar = tmp_path / ".ui-cache" / "onboarding.json"
+        sidecar.parent.mkdir(parents=True)
+        sidecar.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return sidecar
+
+    def test_an_old_sidecar_is_rewritten_without_them(self, tmp_path):
+        """Dropping them on the read kept them out of the browser and left them
+        on disk until the next Save, which an upgrade does not make anyone do."""
+        sidecar = self._old_sidecar(tmp_path, {**self.OTHER_FIELDS, **RETIRED_FORM_VALUES})
+        assert onboard.load_sidecar(tmp_path) == self.OTHER_FIELDS
+        raw = sidecar.read_text(encoding="utf-8")
+        assert json.loads(raw) == self.OTHER_FIELDS         # every other value, as it was
+        for name in RETIRED_FORM_VALUES:
+            assert name not in raw, name
+        for value in RETIRED_ANSWERS:
+            assert value not in raw, value
+        assert [p.name for p in sidecar.parent.iterdir()] == ["onboarding.json"]
+
+    def test_a_clean_sidecar_is_not_rewritten(self, tmp_path):
+        """A forward guard: only a sidecar holding a retired field is written."""
+        sidecar = self._old_sidecar(tmp_path, self.OTHER_FIELDS)
+        stamp = 1_000_000_000 * 10**9
+        os.utime(sidecar, ns=(stamp, stamp))
+        assert onboard.load_sidecar(tmp_path) == self.OTHER_FIELDS
+        assert sidecar.stat().st_mtime_ns == stamp
+
+    def test_a_failed_rewrite_still_loads(self, tmp_path, monkeypatch):
+        """The rewrite never raises: prefill must not fail over a sidecar it
+        could not rewrite, and that sidecar is left as it was."""
+        sidecar = self._old_sidecar(tmp_path, {**self.OTHER_FIELDS, **RETIRED_FORM_VALUES})
+        before = sidecar.read_bytes()
+
+        def refuse(*a, **k):
+            raise PermissionError("read-only")
+        monkeypatch.setattr(onboard, "atomic_write_text", refuse)
+        assert onboard.load_sidecar(tmp_path) == self.OTHER_FIELDS
+        assert sidecar.read_bytes() == before
+
+    def test_a_save_landing_meanwhile_is_not_overwritten(self, tmp_path, monkeypatch):
+        """The rewrite re-reads the bytes first: a Save between the read and the
+        rewrite wrote no retired field, and the older text must not replace it."""
+        sidecar = self._old_sidecar(tmp_path, {**self.OTHER_FIELDS, **RETIRED_FORM_VALUES})
+        real, reads = Path.read_bytes, []
+
+        def read_then_a_save_lands(self):
+            data = real(self)
+            if self == sidecar and not reads:
+                reads.append(self)
+                onboard.save_sidecar(tmp_path, {"name": "Saved meanwhile"})
+            return data
+        monkeypatch.setattr(Path, "read_bytes", read_then_a_save_lands)
+        assert onboard.load_sidecar(tmp_path) == self.OTHER_FIELDS
+        assert reads == [sidecar]
+        assert json.loads(sidecar.read_text(encoding="utf-8")) == {"name": "Saved meanwhile"}
+
+    def test_the_rewrite_keeps_the_files_own_mode(self, tmp_path, monkeypatch):
+        """The sidecar holds a person's prefill, so an owner-only one must not
+        come back under the umask's 0644. The spy holds the call on every
+        platform and under any umask; the mode check alone passes under a 077
+        umask with `mode` dropped."""
+        sidecar = self._old_sidecar(tmp_path, {**self.OTHER_FIELDS, **RETIRED_FORM_VALUES})
+        sidecar.chmod(0o600)
+        mode = stat.S_IMODE(sidecar.stat().st_mode)
+        calls, real = [], onboard.atomic_write_text
+
+        def spy(path, content, **kwargs):
+            calls.append(kwargs)
+            return real(path, content, **kwargs)
+        monkeypatch.setattr(onboard, "atomic_write_text", spy)
+        assert onboard.load_sidecar(tmp_path) == self.OTHER_FIELDS
+        assert calls == [{"mode": mode}]
+        assert stat.S_IMODE(sidecar.stat().st_mode) == mode
+        assert json.loads(sidecar.read_text(encoding="utf-8")) == self.OTHER_FIELDS
+
+    def test_a_symlinked_sidecar_has_its_target_rewritten(self, tmp_path):
+        """Replacing the link itself left every answer in the file it pointed
+        at, and quietly cut the link (as for profile.yml)."""
+        real = tmp_path / "elsewhere" / "onboarding.json"
+        real.parent.mkdir()
+        real.write_text(json.dumps({**self.OTHER_FIELDS, **RETIRED_FORM_VALUES}), encoding="utf-8")
+        link = tmp_path / ".ui-cache" / "onboarding.json"
+        link.parent.mkdir()
+        try:
+            link.symlink_to(real)
+        except OSError:
+            pytest.skip("symlinks need a privilege this machine lacks")
+        assert onboard.load_sidecar(tmp_path) == self.OTHER_FIELDS
+        assert link.is_symlink()
+        raw = real.read_text(encoding="utf-8")
+        assert json.loads(raw) == self.OTHER_FIELDS
+        for value in RETIRED_ANSWERS:
+            assert value not in raw, value
+        assert [p.name for p in link.parent.iterdir()] == ["onboarding.json"]
+        assert [p.name for p in real.parent.iterdir()] == ["onboarding.json"]
 
 class TestPortfolioUrls:
     def test_combines_portfolio_csv_and_github(self):

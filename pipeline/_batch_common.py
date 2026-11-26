@@ -2,10 +2,12 @@
 
 import contextlib
 import csv
+import io
 import json
 import math
 import os
 import re
+import stat
 import subprocess
 import threading
 import time
@@ -51,11 +53,19 @@ def parse_date_posted(val: str) -> datetime | None:
     return None
 
 
-def atomic_write_text(path: Path, content: str, newline: str | None = None) -> None:
+def atomic_write_text(path: Path, content: str, newline: str | None = None,
+                      mode: int | None = None) -> None:
     """Write content atomically — write to a tmp sibling then os.replace.
     os.replace is atomic on POSIX and Windows. `newline` is `open()`'s: the
     default translates "\\n" to the platform's separator, and `""` writes the
     text exactly, for a caller that read the file's own separators in.
+
+    `mode` is the permission bits the result gets — the file's own, for a
+    caller rewriting someone's file, since the sibling is otherwise created
+    under the umask and the replace hands THAT mode to the file: a 0600 file
+    came back 0644. The sibling is created owner-only first, so the text is
+    never readable more widely than the file it replaces, and chmodded only
+    after the write, since a read-only mode would refuse the write.
 
     The sibling is named per writer (process and thread), because one name
     shared by every writer of a file is a torn write between two of them: the
@@ -75,9 +85,16 @@ def atomic_write_text(path: Path, content: str, newline: str | None = None) -> N
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}-{threading.get_native_id()}.tmp")
     try:
+        if mode is not None:
+            tmp.touch(mode=0o600)
         tmp.write_text(content, encoding="utf-8", newline=newline)
+        if mode is not None:
+            os.chmod(tmp, mode)
         os.replace(tmp, path)
     except BaseException:
+        if mode is not None:
+            with contextlib.suppress(OSError):
+                os.chmod(tmp, 0o600)    # Windows will not unlink a read-only file
         with contextlib.suppress(OSError):
             tmp.unlink()
         raise
@@ -3383,11 +3400,13 @@ def _hint_missing_node_modules(stderr: str) -> None:
 
 # ── Protected characteristics never reach a prompt ───────────────────────────
 #
-# The wizard collects EEO self-ID answers for the BROWSER AGENT to use on an
-# application form, and setup-profile.mjs writes them into profile.yml under
-# `voluntary_disclosures:`. Five prompt builders in this repo eat the candidate
-# files, so redaction belongs on the READ, not on one builder: a sixth builder
-# is otherwise safe only if its author remembers. `tests/test_batch_common.py::
+# Setup used to write the wizard's EEO self-ID answers into profile.yml under
+# `voluntary_disclosures:`, and a file nothing has scrubbed yet still carries
+# them (#227; see scrub_profile_yml_file).
+#
+# Five prompt builders in this repo eat the candidate files, so redaction
+# belongs on the READ, not on one builder: a sixth builder is otherwise safe
+# only if its author remembers. `tests/test_batch_common.py::
 # TestNoUnredactedProfileReads` pins that no prompt code reads either file raw.
 #
 # Two separate harms, and only one is about privacy: a model that scores or
@@ -3395,13 +3414,42 @@ def _hint_missing_node_modules(stderr: str) -> None:
 # rest on, which holds on a paid tier and with consent; and on a free provider
 # tier those answers may additionally be retained.
 #
-# The WHOLE yaml section goes, not just the four EEO keys — the rest is the
+# The WHOLE yaml section goes, not just the four EEO keys — the rest was the
 # site-consent booleans, apply-path form data no prompt has a use for.
 #
-# Line-based rather than yaml.safe_load + dump: this module is stdlib-only on
-# sites.py's terms, and a round trip would reorder keys and drop comments in a
-# document otherwise passed through verbatim.
+# Line-based first, rather than yaml.safe_load + dump: this module is
+# stdlib-only on sites.py's terms, and a round trip would reorder keys and drop
+# comments in a document otherwise passed through verbatim. A line-based read
+# can still misjudge a shape a parser would not, so its result is checked
+# against a lazily imported PyYAML (`_scrub_problem`) wherever it is used: the
+# person's own file is not rewritten without that check passing, and a prompt
+# falls back to PyYAML's own reading (`redact_profile_yml`).
 _REDACTED_PROFILE_SECTION = "voluntary_disclosures"
+# The section's key line, as YAML reads it: quoted or not, spaced before the
+# colon — or commented out (`# voluntary_disclosures:`), the line an editor's
+# toggle-comment leaves above answers that are comments now too, which
+# career-ops' agents read as plainly as keys. The indent and the BOM are for a
+# pasted copy, where they come before the key (the leftover sweep below); the
+# line read matches column-0 lines only, so for it both are empty, and it reads
+# the commented form exactly as the key. Narrower on purpose than what ENDS the
+# section below: every key form it misses is one PyYAML still catches, where a
+# missed end would hand the rest of the file to the section.
+_SECTION_KEY_RE = re.compile(
+    rf"^[ \t]*\ufeff?(?:#+[ \t]*)?[\"']?{re.escape(_REDACTED_PROFILE_SECTION)}[\"']?[ \t]*:",
+    re.MULTILINE)
+# What ends the section: a column-0 line shaped like a top-level mapping key —
+# plain, quoted or an explicit `? `, behind any tag or anchor — or a document
+# marker. Any other column-0 line under the section is still the section's: a
+# hand-written flow mapping's closing `}`, a compact sequence's `- gender: F`, a
+# multi-line scalar's continuation. Ending at any of those wrote the rest of
+# the answer back as a top-level line, and a broken file with it.
+_TOP_LEVEL_KEY_RE = re.compile(
+    r"(?:[!&]\S*[ \t]+)*"                                       # a tag or an anchor
+    r"(?:\"(?:[^\"\\\r\n]|\\.)*\"|'(?:[^'\r\n]|'')*'"           # a quoted key
+    r"|(?:[^\s#'\"\-?:,\[\]{}&*!|>%@`]|[-?:](?=\S))[^\r\n]*?)"   # a plain one
+    r"[ \t]*:(?=[ \t\r\n]|$)"
+    r"|\?(?=[ \t\r\n]|$)"                                       # an explicit key
+    r"|(?:---|\.\.\.)(?=[ \t\r\n]|$)")                          # a document marker
 
 # PROFILE.md needs its own pass: it is markdown, it SUPERSEDES the seeds, and it
 # is non-clobber — an install seeded before this keeps those bullets forever and
@@ -3457,19 +3505,183 @@ _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 _MD_HEADING_RE = re.compile(r" {0,3}(#{1,6})(?=\s|$)")
 
 
+def _real_lines(text: str) -> list[str]:
+    """`text` split on real line endings only — "\\n", "\\r\\n", "\\r" — each
+    kept. `str.splitlines` also breaks on U+2028, U+2029, U+0085, "\\x0b",
+    "\\x0c" and "\\x1c"-"\\x1e", none of which js-yaml (YAML 1.2, career-ops'
+    reader) ends a line on, so an answer holding one came apart and its tail
+    landed at column 0, outside the section."""
+    return io.StringIO(text, newline="").readlines()
+
+
+def _names_protected(line: str) -> bool:
+    """Does this line name a protected characteristic? `redact_profile_master`'s
+    word-anchored stems, read with `_` as a word break, since it joins a YAML
+    key's words (`race_ethnicity`) and is a word character to `\\b`."""
+    return bool(_PROTECTED_RE.search(line.replace("_", " ")))
+
+
+# A line shaped like a key, commented out or not, quoted or not, a list item's
+# or not: `gender: Female`, `  #   race_ethnicity: Asian`, `- "veteran": no`.
+_KEY_SHAPE_RE = re.compile(
+    r"[ \t]*(?:#+[ \t]*)?(?:-[ \t]+)?[\"']?([^\"'#:\r\n]+?)[\"']?[ \t]*:(?=[ \t\r\n]|$)")
+
+
+def _leaves_an_answer(text: str) -> bool:
+    """Does `text` still hold a line shaped like a key whose key names a
+    protected characteristic (`_KEY_SHAPE_RE`, `_names_protected`)? What a
+    rewrite said to remove the section must not leave behind."""
+    return any((m := _KEY_SHAPE_RE.match(line)) and _names_protected(m.group(1))
+               for line in _real_lines(text))
+
+
+def _holds_commented_key(text: str) -> bool:
+    """Is the section's key in `text` commented out at column 0 — the line
+    `_redact_profile_yml_lines` opens a commented-out section at?"""
+    return any(line.startswith("#") and _SECTION_KEY_RE.match(line)
+               for line in _real_lines(text.removeprefix("\ufeff")))
+
+
 def redact_profile_yml(text: str) -> str:
-    """`profile.yml` with the protected-characteristics section dropped."""
+    """`profile.yml` with the protected-characteristics section dropped: the
+    guard on every prompt read.
+
+    The line read (`_redact_profile_yml_lines`), whenever PyYAML confirms it
+    is the file minus that one key — or, where PyYAML finds no such key, the
+    file minus comments only, a commented-out section — or is not installed
+    (`_scrub_problem`). When PyYAML refuses it, it takes PyYAML's own reading
+    instead (`_section_free_dump`). Three cases reach that: a column-0 line
+    shaped like a key inside a quoted scalar or a flow collection ended the
+    section early; the key is in a form the line read does not recognise (an
+    anchor, a tag, a `?` key, a flow mapping); or a commented-out section was
+    cut and a line naming a protected characteristic is still there
+    (`_leaves_an_answer`), which PyYAML's reading drops with every comment.
+    The scrub refuses to rewrite exactly those files, so this read is all
+    that keeps their answers out of a prompt, and a prompt needs no byte
+    fidelity.
+
+    When PyYAML finds no top-level key of that name but the line read cut more
+    than comments, the line read is kept on purpose. What it took is then a
+    line PyYAML reads as part of another value. Either a quoted scalar or a
+    flow collection continued at column 0, which career-ops' js-yaml rejects
+    in a block-style file ("deficient indentation") and reads in a file
+    written as one flow mapping (JSON, say). Or the key line was commented out
+    above answers that were not, which YAML reads as the key above's, so
+    PyYAML's reading would hand them to the prompt. Either way the cut is more
+    than the section, never less: for a prompt that is the privacy-safe
+    choice, at the cost of what else it took, and the scrub writes none of it
+    back (`_scrub_problem`'s quiet refusal, said aloud for a commented key).
+
+    Both readings are of the file with NEL, LS and PS turned into spaces.
+    PyYAML (YAML 1.1) ends a line at each of them, where career-ops' js-yaml
+    (1.2) and the line read do not. Read as written, an answer's tail after
+    one became a top-level key of PyYAML's mapping, and the dump handed it to
+    the prompt.
+
+    A text holding a NUL reaches no prompt at all. A NUL is no YAML character,
+    and js-yaml and PyYAML both refuse it; such a text is a UTF-16 or UTF-32
+    file with no BOM, read as UTF-8, which puts a NUL between its ASCII
+    characters. Neither reading saw the key, so the file went to the prompt
+    whole, answers included, NULs and all, which a model reads easily."""
+    text = text or ""
+    if "\x00" in text:
+        return ""
+    text = text.translate(_YAML_1_1_ONLY_BREAKS)
+    lines = _redact_profile_yml_lines(text)
+    if not _scrub_problem(text, lines):
+        return lines
+    return _section_free_dump(text)
+
+
+_YAML_1_1_ONLY_BREAKS = dict.fromkeys(map(ord, "\x85\u2028\u2029"), " ")
+
+
+def _section_free_dump(text: str) -> str:
+    """For a prompt, when PyYAML refuses the line read: the file's mapping
+    minus the section, dumped. An alias anywhere could carry the section's
+    answers out under another key, and a file that does not parse has no
+    mapping to dump, so for either, `text` is cut at the first line naming the
+    section instead. A file that parses but never spells the name (an escaped
+    key) is dropped whole. Reached only once `_scrub_problem` has imported
+    PyYAML."""
+    import yaml
+    try:
+        data = yaml.safe_load(text)
+    except Exception:
+        data = None
+    else:
+        try:
+            if not any(isinstance(e, yaml.AliasEvent)
+                       for e in yaml.parse(text, Loader=yaml.SafeLoader)):
+                rest = {k: v for k, v in data.items() if k != _REDACTED_PROFILE_SECTION}
+                return yaml.safe_dump(rest, sort_keys=False, allow_unicode=True) if rest else ""
+        except Exception:
+            pass
+    at = text.find(_REDACTED_PROFILE_SECTION)
+    if at < 0:
+        return text if data is None else ""
+    return text[:max(text.rfind("\n", 0, at), text.rfind("\r", 0, at)) + 1]
+
+
+def _redact_profile_yml_lines(text: str) -> str:
+    """`profile.yml` with the protected-characteristics section dropped, line
+    by line, and every other byte as it was — what `scrub_profile_yml_file`
+    writes back. A prompt reads it through `redact_profile_yml`.
+
+    The section runs from its key to the next column-0 line shaped like a
+    top-level key, or a document marker (`_TOP_LEVEL_KEY_RE`), so a flow
+    mapping, a compact sequence or a multi-line scalar under it goes with it.
+    A column-0 comment does not end it: one inside it goes with it, and so does
+    one sitting straight against its last line, the shape of an answer
+    commented out by hand — better to lose a comment than to reopen the file
+    and leak what follows. What it does not take is the gap after it: blank
+    lines, and a comment block a blank line separates from it, are the next
+    key's, and are held until the next line says which — an indented one means
+    the section went on, and they go with it. That matters since
+    `scrub_profile_yml_file` writes this back to the person's own file, where a
+    lost heading comment is lost for good. A comment naming a protected
+    characteristic (`# gender: Female`) is never held: it goes wherever it sits
+    in the section's span.
+
+    A COMMENTED-OUT section is read exactly as the section is: a column-0
+    comment holding the key (`# voluntary_disclosures:`, `_SECTION_KEY_RE`'s
+    commented form) opens it as the key does, and the next top-level key ends
+    it. Ending it at the first line that is not a column-0 comment left three
+    shapes an editor makes of the section behind: answers commented at their
+    own indent (Home, then `# `), a blank line a toggle-comment leaves as it
+    is, and answers left uncommented under a commented key. YAML reads that
+    last shape as the key above's, so `_scrub_problem` refuses its rewrite and
+    the scrub says so, while a prompt gets this read, with them cut. career-ops'
+    agents read the file whole, comments and all. Lines split on real line
+    endings only (`_real_lines`)."""
+    text = text or ""
+    bom = "\ufeff" if text.startswith("\ufeff") else ""     # an old Notepad save
     out: list[str] = []
+    held: list[str] = []
     skipping = False
-    for line in (text or "").splitlines(keepends=True):
-        # A top-level key ends the previous block; a column-0 COMMENT does not,
-        # so one inside the block is dropped with it — better to lose a comment
-        # than to reopen the file and leak the keys after it.
-        if line[:1].strip() and not line.lstrip().startswith("#"):
-            skipping = line.split(":", 1)[0].strip() == _REDACTED_PROFILE_SECTION
+    for line in _real_lines(text[len(bom):]):
+        col0 = bool(line[:1].strip())           # neither blank nor indented
+        if col0 and _SECTION_KEY_RE.match(line):      # commented out or not
+            skipping, held = True, []
+            continue
         if not skipping:
             out.append(line)
-    return "".join(out)
+            continue
+        comment = line.startswith("#")
+        if col0 and not comment and _TOP_LEVEL_KEY_RE.match(line):
+            skipping = False
+            out.extend(held)
+            out.append(line)
+            held = []
+            continue
+        if comment and _names_protected(line):
+            continue                # a commented-out answer: never put back
+        if not line.strip() or (held and comment):
+            held.append(line)
+        else:
+            held = []
+    out.extend(held)          # the section was the file's last: its gap is kept
+    return bom + "".join(out)
 
 
 def _indent(line: str) -> int:
@@ -3555,6 +3767,295 @@ def redact_profile_master(text: str) -> str:
 def profile_yml_for_prompt(career_ops) -> str:
     """The one sanctioned read of `profile.yml` for anything a model will see."""
     return redact_profile_yml(read_text(Path(career_ops) / "config" / "profile.yml"))
+
+
+# career-ops' batch-runner.sh writes each offer's worker prompt to
+# `batch/.resolved-prompt-<id>.md` beside itself, with profile.yml pasted in
+# whole under "## Runtime personalization" (every line indented four spaces by
+# `sed 's/^/    /'`, so ahead of a BOM too), and deletes it only once that
+# offer's worker loop ends — so a run interrupted mid-offer leaves a copy of
+# the file taken before any scrub, in the folder career-ops' agents read.
+# `batch/batch-runner.pid` is the runner's lock: taken before the first offer,
+# removed by its EXIT trap.
+_RESOLVED_PROMPT_GLOB = ".resolved-prompt-*.md"
+_BATCH_RUNNER_LOCK = "batch-runner.pid"
+
+
+def _runner_holds_lock(batch: Path) -> bool:
+    """Is `batch-runner.pid` there? Anything but a plain "no such file" reads
+    as yes, so a doubt keeps the leftovers rather than pulling a live prompt."""
+    try:
+        os.lstat(batch / _BATCH_RUNNER_LOCK)
+    except FileNotFoundError:
+        return False
+    except Exception:
+        pass
+    return True
+
+
+def _remove_leftover_resolved_prompts(career_ops) -> int:
+    """Delete the worker prompts an interrupted `--batch` run left in
+    `career_ops/batch/` that still hold the self-ID section (#227); how many
+    went.
+
+    Only a leftover carrying the section's key line goes — one without is not
+    ours to judge — and only while no runner holds the lock, re-checked before
+    every unlink, since a live runner's prompt is its worker's system prompt.
+    A file that cannot be read or unlinked is skipped and the rest still go;
+    the file I/O never raises, on `scrub_profile_yml_file`'s terms."""
+    try:
+        batch = Path(career_ops) / "batch"
+        leftovers = sorted(batch.glob(_RESOLVED_PROMPT_GLOB))
+    except Exception:
+        return 0
+    if not leftovers or _runner_holds_lock(batch):
+        return 0
+    removed = 0
+    for path in leftovers:
+        try:
+            if not path.is_file() or not _SECTION_KEY_RE.search(_loose_text(path.read_bytes())):
+                continue
+            if _runner_holds_lock(batch):
+                break
+            path.unlink()
+            removed += 1
+        except Exception:
+            continue
+    if removed:
+        print(f"[profile] removed {removed} leftover --batch worker prompt(s) "
+              f"({_RESOLVED_PROMPT_GLOB}) from {batch}: an interrupted run left "
+              f"each holding a pasted copy of profile.yml's "
+              f"`{_REDACTED_PROFILE_SECTION}:` section, in the folder "
+              "career-ops' agents read (#227).")
+    return removed
+
+
+def _loose_text(raw: bytes) -> str:
+    """`raw` read only to look for the section in, never to write back:
+    decoded as UTF-8 with what does not decode replaced, then with every NUL
+    and every replacement character removed. A UTF-16 or UTF-32 file — what
+    Windows PowerShell 5.1's `>` and `Out-File` write by default — puts NULs
+    between its ASCII characters, and its BOM and its non-ASCII characters
+    decode to replacement characters, so the key, which is ASCII, reads as
+    written only once both are gone. Read with the NULs in, such a file never
+    showed the key at all, and a profile.yml or a pasted copy holding the
+    section was passed over in silence."""
+    return raw.decode("utf-8", errors="replace").replace("\x00", "").replace("\ufffd", "")
+
+
+def _say_remove_by_hand(path, why) -> None:
+    print(f"[profile] could not remove the `{_REDACTED_PROFILE_SECTION}:` section "
+          f"(self-identification answers) from {path} ({why}): career-ops' agents "
+          "still read that file whole — delete the section by hand (#227).")
+
+
+def _scrub_problem(text: str, scrubbed: str) -> str | None:
+    """Why `scrubbed` must not replace `text` on disk, or None when it may.
+
+    The safety net under the line-based read (#227), for the one caller that
+    writes its result back and for the prompt read, which falls back to
+    PyYAML's own reading on a refusal: PyYAML must parse both, and the result
+    must be the original's top-level mapping minus the section's key, by dict
+    equality — so a shape the line-based read misjudges (a multi-line scalar
+    whose continuation looks like a key, a file it splits where a parser would
+    not) costs a refusal, never the person's file.
+
+    Where PyYAML finds no such top-level key, a result that parses to what
+    the original does may replace it too: the line read removed comments only
+    — a commented-out section (`_redact_profile_yml_lines`) — so the YAML is
+    unchanged. Unless a line naming a protected characteristic is still in it
+    (`_leaves_an_answer`): then the rewrite is refused aloud, since the scrub
+    would otherwise say it removed the section while an answer is still on
+    disk. Any other result there is `""`, a quiet refusal: the line read cut
+    more than comments, and as far as the YAML says, there is no section to
+    tell anyone to remove. That holds unless the key was commented out above
+    lines YAML reads as the key above's, which `scrub_profile_yml_file` says
+    aloud itself, because the prompt read keeps the line read on `""` and
+    PyYAML's reading would hand those lines to the prompt.
+
+    Both texts are parsed with NEL, LS and PS read as spaces
+    (`_YAML_1_1_ONLY_BREAKS`), as career-ops' js-yaml reads them, so one in a
+    value outside the section no longer makes PyYAML refuse a file js-yaml
+    parses; the caller writes `scrubbed` as it is."""
+    try:
+        import yaml     # a pipeline dependency; lazy, so this module stays stdlib-only
+    except Exception:
+        # Without PyYAML there is nothing to check against, so the line-based
+        # result is written unchecked.
+        return None
+    try:
+        before = yaml.safe_load(text.translate(_YAML_1_1_ONLY_BREAKS))
+    except Exception:
+        return "it does not parse as one YAML document, so no rewrite of it could be checked"
+    if not isinstance(before, dict) or _REDACTED_PROFILE_SECTION not in before:
+        try:
+            after = yaml.safe_load(scrubbed.translate(_YAML_1_1_ONLY_BREAKS))
+        except Exception:
+            return ""
+        if after != before:
+            return ""
+        if _leaves_an_answer(scrubbed):
+            return ("removing it line by line would have left an answer in the "
+                    "file, so it was not rewritten")
+        return None
+    refused = ("removing it line by line would have changed more of the file "
+               "than that section, so it was not rewritten")
+    try:
+        after = yaml.safe_load(scrubbed.translate(_YAML_1_1_ONLY_BREAKS))
+    except Exception:
+        return refused
+    if after is None:
+        after = {}                      # the section was all the file held
+    expected = {k: v for k, v in before.items() if k != _REDACTED_PROFILE_SECTION}
+    if (not isinstance(after, dict) or _REDACTED_PROFILE_SECTION in after
+            or after != expected):
+        return refused
+    return None
+
+
+def _yaml_holds_section(text: str) -> bool:
+    """Does PyYAML read the section as a top-level key of `text`, NEL, LS and
+    PS read as spaces as in `_scrub_problem`? False when it cannot say: not
+    installed, or the file does not parse."""
+    try:
+        import yaml     # lazy, as in _scrub_problem
+        data = yaml.safe_load(text.translate(_YAML_1_1_ONLY_BREAKS))
+    except Exception:
+        return False
+    return isinstance(data, dict) and _REDACTED_PROFILE_SECTION in data
+
+
+def scrub_profile_yml_file(career_ops) -> bool:
+    """Remove the self-ID section from `career_ops/config/profile.yml` on disk
+    (#227). True when the file was rewritten.
+
+    Redacting our own reads covers every prompt this repo builds and none that
+    career-ops builds: `batch-runner.sh` pastes this file whole into every
+    `--batch` worker prompt, and the skill router behind every CLI skill tells
+    the agent to read it. Neither passes through Python we can filter, so the
+    section has to be gone from the file itself — and nothing rewrites an
+    existing profile until the person next saves the Setup wizard, which an
+    upgrade does not make them do. That is why `scrub_profile_yml_files` runs
+    this at the top of every pipeline run and before the UI hands out a
+    CLI-skill command.
+
+    Only the section goes (`_redact_profile_yml_lines` says exactly what that takes),
+    and the file is otherwise the person's as they left it: decoded from bytes
+    and written with `newline=""`, so a CRLF file stays CRLF and a BOM stays
+    where it was; written with its own permission bits (`atomic_write_text`'s
+    `mode`); and resolved first, so a profile.yml that is a symlink (a dotfiles
+    copy, a separate data root) has its TARGET rewritten — replacing the link
+    itself left every answer in the file it pointed at and quietly cut the
+    link. A hard link is not followed: no atomic replace keeps one.
+
+    Nothing is written that PyYAML does not confirm is the same file minus
+    that one key, or minus comments only (`_scrub_problem`; a commented-out
+    section), and nothing over a file that changed since
+    it was read — a wizard Save rewrites it, and replacing that with the older
+    text would undo the Save; the next run retries. The bytes are re-read just
+    before the replace, `_write_report_urls`' optimistic shape.
+
+    A file that is missing or unreadable is left exactly as it is, and the
+    file I/O never raises — a scrub that cannot happen must not be what stops
+    a pipeline run or a UI route — so its excepts are broad. A section found
+    but not removed (a refused rewrite, a key commented out above lines YAML
+    reads as another key's, a key PyYAML reads that the line read does not, a
+    file that is not UTF-8 — a UTF-16 or UTF-32 one included,
+    read through `_loose_text` — a read-only target, a full disk) is said
+    aloud, since career-ops reads it on regardless and silence would read as
+    done. Only the `<repo>/career-ops` copy's line names the cloud copy: that
+    is the file the Setup wizard encodes into PROFILE_YML_B64."""
+    try:
+        path = (Path(career_ops) / "config" / "profile.yml").resolve()
+        raw = path.read_bytes()
+    except Exception:
+        return False
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = None
+    if text is None or "\x00" in text:
+        # Not rewritten, since its encoding would be a guess; but not silently.
+        # A NUL is no YAML character: in bytes that decode as UTF-8 it is the
+        # mark of an ASCII-only UTF-16 file with no BOM.
+        loose = _loose_text(raw)
+        if _redact_profile_yml_lines(loose) != loose or _yaml_holds_section(loose):
+            _say_remove_by_hand(path, "it is not UTF-8, so it was not rewritten")
+        return False
+    try:
+        scrubbed = _redact_profile_yml_lines(text)
+        if scrubbed == text:
+            if _yaml_holds_section(text):
+                _say_remove_by_hand(path, "its key is written in a form the line-by-line "
+                                          "removal does not recognise, so it was not rewritten")
+            return False
+        mode = stat.S_IMODE(path.stat().st_mode)
+        problem = _scrub_problem(text, scrubbed)
+    except Exception:
+        return False
+    if problem is not None:
+        if not problem and _holds_commented_key(text):
+            problem = ("it is commented out, but YAML reads lines under it as part "
+                       "of another key, so removing them line by line would have "
+                       "changed that key, and it was not rewritten")
+        if problem:
+            _say_remove_by_hand(path, problem)
+        return False
+    try:
+        now = path.read_bytes()
+    except Exception:
+        now = None
+    if now != raw:
+        print(f"[profile] {path} changed while the `{_REDACTED_PROFILE_SECTION}:` "
+              "section was being removed, so it was not rewritten — the next run "
+              "retries (#227).")
+        return False
+    try:
+        atomic_write_text(path, scrubbed, newline="", mode=mode)
+    except Exception as exc:
+        _say_remove_by_hand(path, exc)
+        return False
+    try:
+        ours = path == (Path(REPO_CAREER_OPS) / "config" / "profile.yml").resolve()
+    except Exception:
+        ours = False
+    print(f"[profile] removed the `{_REDACTED_PROFILE_SECTION}:` section "
+          f"(self-identification answers and site-consent toggles) from {path}: "
+          "career-ops' agents read that file whole, so a stored answer reached "
+          "every --batch worker and CLI skill (#227)."
+          + (" Save the Setup wizard once to refresh the cloud copy (PROFILE_YML_B64)."
+             if ours else ""))
+    return True
+
+
+# The checkout career-ops' agents run in whatever CAREER_OPS_PATH says:
+# run.sh/run.ps1 always start `<repo>/career-ops/batch/batch-runner.sh`, and
+# skills.skill_command's `cd career-ops && …` is run from the repo root. So a
+# CAREER_OPS_PATH pointing elsewhere (a non-default `.env` value, or
+# `run-ui.sh --data <dir>`, which exports it) leaves this one unscrubbed unless
+# it is named. career-ops' own data-root resolution is not followed here.
+# Module-level so tests/conftest.py can point it at tmp for every test.
+REPO_CAREER_OPS = Path(__file__).resolve().parent.parent / "career-ops"
+
+
+def scrub_profile_yml_files(career_ops) -> int:
+    """Remove the self-ID section from every checkout a `--batch` run or a CLI
+    skill might read (#227) — `career_ops` (CAREER_OPS_PATH, as the caller
+    resolved it) and `REPO_CAREER_OPS`, once per resolved path, under the
+    spelling given first, which the sweep's line names: its leftover worker
+    prompts (`_remove_leftover_resolved_prompts`), then its profile.yml
+    (`scrub_profile_yml_file`). How many profile.yml files were rewritten."""
+    checkouts: dict[Path, object] = {}
+    for co in (career_ops, REPO_CAREER_OPS):
+        try:
+            checkouts.setdefault(Path(co).resolve(), co)
+        except Exception:
+            continue                    # a bad argument costs only itself
+    rewritten = 0
+    for co in checkouts.values():
+        _remove_leftover_resolved_prompts(co)
+        rewritten += scrub_profile_yml_file(co)
+    return rewritten
 
 
 def profile_master_for_prompt(path) -> str:

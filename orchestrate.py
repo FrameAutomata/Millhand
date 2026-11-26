@@ -29,7 +29,12 @@ from pipeline.search_config import (  # noqa: E402
 
 from pipeline import scrape, filter as filter_step, screen, bridge, batch_prep, batch_evaluate, notify  # noqa: E402
 # env_float is shared with batch_evaluate's timeout/budget knobs.
-from pipeline._batch_common import APPLY_MIN_SCORE, MERGE_NOT_CLEAN_LINE, env_float  # noqa: E402
+from pipeline._batch_common import (  # noqa: E402
+    APPLY_MIN_SCORE,
+    MERGE_NOT_CLEAN_LINE,
+    env_float,
+    scrub_profile_yml_files,
+)
 # Only the board vocabulary is needed at arg-parse time; handoff.run itself is
 # still lazy-imported below to keep the hot pipeline path free of its tailoring
 # deps. This module-level import is cheap (handoff pulls only _batch_common + app.data).
@@ -123,6 +128,9 @@ def main() -> int:
     # silently uses the CWD as the career-ops path. The `or` form treats
     # unset and empty-string both as "use the default".
     career_ops = resolve(os.environ.get("CAREER_OPS_PATH") or "career-ops")
+    # Before any stage, and before the --batch runner the wrappers start next
+    # (#227; see _batch_common.scrub_profile_yml_file).
+    scrub_profile_yml_files(career_ops)
 
     config_path = resolve_search_config(args.config)
     if config_path == resolve(LOCAL_SEARCH_CONFIG):

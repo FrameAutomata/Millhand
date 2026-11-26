@@ -114,17 +114,12 @@ function showBanner(text, kind) {
   statusBanner.hidden = false;
 }
 
-// Voluntary self-ID (EEO) consent toggles — serialized as explicit "yes"/"no"
-// (a bare checkbox is absent when unchecked, which collides with consent's
-// default-on), and restored by .checked rather than .value.
-const CONSENT_TOGGLES = ["data_processing_consent", "save_answers", "share_answers"];
-
 // The two Provider-step checkboxes that write a repository VARIABLE, serialized
-// the same explicit way and for the same reason: an unchecked box is simply
-// absent from FormData, which the server would read as "the form never
-// mentioned it" and leave the variable as it is — so unticking either in edit
-// mode would silently do nothing. Both default ON, so "no" is the answer that
-// has to survive the trip.
+// as an explicit "yes"/"no" and restored by .checked rather than .value: an
+// unchecked box is simply absent from FormData, which the server would read as
+// "the form never mentioned it" and leave the variable as it is — so unticking
+// either in edit mode would silently do nothing. Both default ON, so "no" is
+// the answer that has to survive the trip.
 const VARIABLE_TOGGLES = ["gemini_free_tier", "auto_update_weekly"];
 
 // ── Gemini free-tier limits ──────────────────────────────────────────────────
@@ -186,7 +181,7 @@ function collectForm() {
   }
   obj.sites = [...form.querySelectorAll('input[name="sites"]:checked')].map((c) => c.value);
   obj.include_easy_apply = form.querySelector('input[name="include_easy_apply"]').checked;
-  for (const name of [...CONSENT_TOGGLES, ...VARIABLE_TOGGLES]) {
+  for (const name of VARIABLE_TOGGLES) {
     const cb = form.querySelector(`input[name="${name}"]`);
     if (cb) obj[name] = cb.checked ? "yes" : "no";
   }
@@ -311,7 +306,6 @@ function validateStep(i) {
 function prefillForm(saved) {
   for (const [k, v] of Object.entries(saved)) {
     if (k === "sites" || k === "include_easy_apply") continue;
-    if (CONSENT_TOGGLES.includes(k)) continue;
     if (VARIABLE_TOGGLES.includes(k)) continue;
     // A repository variable already answered this one — see cloudVariableFields.
     if (cloudVariableFields.has(k)) continue;
@@ -326,11 +320,6 @@ function prefillForm(saved) {
   }
   const easyCb = form.querySelector('input[name="include_easy_apply"]');
   if (easyCb && "include_easy_apply" in saved) easyCb.checked = !!saved.include_easy_apply;
-  // Consent toggles: saved as "yes"/"no"; default consent on, save/share off.
-  CONSENT_TOGGLES.forEach((name) => {
-    const cb = form.querySelector(`input[name="${name}"]`);
-    if (cb) cb.checked = name in saved ? saved[name] === "yes" : name === "data_processing_consent";
-  });
   // Both default ON in the markup, so an absent answer keeps that default —
   // only an explicit "no" from a previous submit unticks them.
   VARIABLE_TOGGLES.forEach((name) => {
