@@ -9,8 +9,10 @@ import re
 import subprocess
 import threading
 import time
+import unicodedata
 from collections import Counter
 from datetime import datetime
+from itertools import groupby
 from pathlib import Path
 
 from pipeline.work_location import (
@@ -195,11 +197,128 @@ def has_pending_tracker_additions(tracker_dir: Path) -> bool:
 
 
 def normalize_company(s: str) -> str:
-    """Lowercase + strip everything non-alphanumeric — the canonical company
-    key used for identity matching (mirrors merge-tracker.mjs's normalizeCompany).
-    One definition so filename lookup, cover-letter caching, and tracker
-    re-anchoring can't drift apart."""
+    """Lowercase + strip everything but ASCII letters and digits — the
+    canonical company key used for identity matching here. One definition so
+    filename lookup, cover-letter caching, and tracker re-anchoring can't drift
+    apart. Not merge-tracker's own key, which the loss guard reads through
+    `_company_identity`."""
     return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
+# A port of tracker-utils.mjs's corporate-form match at the pin, the two lists
+# copied verbatim and in order; test_the_corporate_form_vocabulary_is_the_checkouts
+# (tests/test_merge_tracker_contract.py) holds them to the checkout.
+LEGAL_SUFFIXES = (
+    # US / UK
+    "incorporated", "inc", "corporation", "corp", "company", "co",
+    "limited", "ltd", "llc", "llp", "lp", "plc", "pc", "apc",
+    # DE / AT / CH
+    "gmbh", "ag", "kgaa", "mbh", "ug",
+    # FR / BE / CH / LU
+    "sas", "sarl", "eurl", "snc", "scs", "sca", "sa",
+    # IT / ES / PT / LATAM
+    "spa", "srl", "ltda", "saa", "sl", "sll", "slu",
+    # NL / BE
+    "bv", "nv", "cv",
+    # Nordics / Baltics
+    "ab", "as", "oy", "oyj", "kf", "sf", "aps", "se",
+    # Central / Eastern Europe
+    "jsc", "pjsc", "zao", "ooo", "doo", "kft", "rt", "zrt",
+    # Commonwealth / Asia
+    "pty", "pte", "pvt", "sdn", "bhd",
+)
+GENERIC_DESCRIPTORS = (
+    "group", "holdings", "technologies", "technology", "solutions",
+    "canada", "international",
+)
+_CORPORATE_FORM_WORDS = frozenset(LEGAL_SUFFIXES + GENERIC_DESCRIPTORS)
+# The shortest stem that may carry a corporate-form tail: upstream refuses a
+# two-letter one as an initialism unrelated employers share.
+MIN_STEM_CHARS = 3
+
+
+def _company_tokens(name: str) -> list[str]:
+    """`normalizeTextKey(name, ' ').split(' ').filter(Boolean)`, the tokens
+    upstream compares — joined, they are its `normalizeCompany` key: NFKC,
+    lowercase, the combining dot that lowercasing a Turkish dotted capital
+    leaves behind dropped, then each maximal run of letters, marks and numbers —
+    of any script, so "Яндекс" is a token where `normalize_company` deletes it.
+    Nothing else: upstream has no rule for `&` or brackets, so they separate
+    like any other punctuation.
+
+    The character classes and case mappings are this Python's `unicodedata`
+    (3.12: Unicode 15.0), while node's come from its ICU (node 24: Unicode
+    17.0), so a code point assigned in between — a letter to node, unassigned
+    and therefore a separator here — can tokenize differently. Nothing closes
+    that short of a newer `unicodedata`; such characters do not occur in
+    company names, which is why it is stated rather than worked around."""
+    folded = unicodedata.normalize("NFKC", name or "").lower().replace("\u0307", "")
+    return ["".join(run) for keep, run in groupby(
+        folded, lambda ch: unicodedata.category(ch)[0] in "LMN") if keep]
+
+
+def _company_identity(name: str, tokens: list[str] | None = None) -> tuple[str, str]:
+    """What merge-tracker's `companiesMatch` compares a company cell by: its
+    `normalizeCompany` key, and — only where that key is empty — the trimmed
+    cell itself, so "?" pairs with "?" but not with "" or "—". `tokens` is
+    `_company_tokens(name)` when the caller already has them."""
+    key = "".join(_company_tokens(name) if tokens is None else tokens)
+    return key, "" if key else (name or "").strip()
+
+
+def _collapse_initialisms(tokens: list[str]) -> list[str]:
+    """Each run of single-character tokens joined into one: ["l", "l", "c"]
+    → ["llc"], so a dotted "L.L.C." tail reads as the "LLC" it spells."""
+    out: list[str] = []
+    run = ""
+    for token in tokens:
+        if len(token) == 1:
+            run += token
+            continue
+        if run:
+            out.append(run)
+        run = ""
+        out.append(token)
+    if run:
+        out.append(run)
+    return out
+
+
+def _corporate_form_tokens_match(ta: list[str], tb: list[str]) -> bool:
+    """`corporateFormTokensMatch`: `companies_match_ignoring_corporate_form`
+    over tokens a caller already has. The prefix is compared before the stem is
+    joined and measured — the same conjunction as upstream's, in the order that
+    rejects most pairs cheapest."""
+    stem, full = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    if not stem or len(stem) == len(full) or full[:len(stem)] != stem:
+        return False
+    if len("".join(stem).encode("utf-16-le")) // 2 < MIN_STEM_CHARS:
+        return False
+    return all(token in _CORPORATE_FORM_WORDS
+               for token in _collapse_initialisms(full[len(stem):]))
+
+
+def companies_match_ignoring_corporate_form(a: str, b: str) -> bool:
+    """True when two company cells name one employer under a different
+    corporate form ("Acme" and "Acme Holdings Inc."), by upstream's
+    `companiesMatchIgnoringCorporateForm` over `_company_tokens`:
+
+    - the shorter name's tokens are a prefix of the longer's — never a
+      stripped key, which would fold "Acme Solutions" onto "Acme Technologies";
+    - and every token after that prefix is a corporate-form word, once runs of
+      single letters are joined ("Acme L.L.C."), so "Acme Robotics" and
+      "Acme X Y" stay other employers;
+    - equal token counts never match: two identical names are the exact key's
+      business, and any other pair disagrees on a substantive token;
+    - an empty stem never matches — the blind-employer `?` and every other
+      punctuation-only cell;
+    - and the stem is at least `MIN_STEM_CHARS` long, counted as JavaScript's
+      `.length` counts it, in UTF-16 code units, so a name outside the Basic
+      Multilingual Plane clears the floor exactly where upstream's does.
+
+    A script written without spaces is one token, so its corporate forms never
+    match here, as upstream's do not (career-ops#2570)."""
+    return _corporate_form_tokens_match(_company_tokens(a), _company_tokens(b))
 
 
 def _company_slug(company: str) -> str:
@@ -2668,34 +2787,9 @@ def _reopen_reposted(closed_before: dict[str, dict], career_ops: Path) -> None:
         print(f"[batch]   #{num} {company} — {role}")
 
 
-def _addition_key(company: str, role: str) -> str:
-    """The company::role identity, normalized the way merge-tracker's own dedup
-    normalizes it. Not stable across a merge on its own — see `_report_key`."""
-    return f"{normalize_company(company)}::{normalize_company(role)}"
-
-
-def _report_key(company: str, num: str) -> str:
-    """The company + report-number identity, which a merge DOES preserve.
-
-    merge-tracker matches an addition against the tracker on four tiers, and only
-    two of them are provable identity: an exact posting URL, and an exact report
-    number. On the GUESSED tiers — entry number, fuzzy title — it updates the row
-    but deliberately keeps THE ROW'S OWN TITLE, so that a fuzzy false positive
-    cannot also destroy the evidence that two reqs were distinct
-    (`role: (reportNumMatched || dupReason === 'url') ? addition.role :
-    duplicate.role`). Its `🔄 Update` log line prints the ADDITION's role, so the
-    substitution is invisible there too.
-
-    The report link, the score and the company are written through on every one
-    of those tiers, so they are what survives. Company is part of the key because
-    merge-tracker's own report-number tier requires it: report-file numbering and
-    tracker-row numbering drift, so a bare number can name an unrelated row.
-
-    Not a replacement for `_addition_key` — a second reading of the same row. An
-    unscoreable re-eval is skipped with the existing score, report and PDF left
-    standing, so there the row keeps its company::role and never receives the new
-    report number. Each key covers the other's blind spot."""
-    return f"{normalize_company(company)}::{num}"
+def _same_employer(a: str, b: str) -> bool:
+    """merge-tracker's `companiesMatch`, by `_company_identity`."""
+    return _company_identity(a) == _company_identity(b)
 
 
 def _addition_cells(text: str) -> list[str]:
@@ -2763,36 +2857,77 @@ def _pending_additions(tracker_dir: Path) -> list[dict]:
     return additions
 
 
-def _classify_landing(records: list[dict], career_ops: Path) -> tuple[list[dict], list[tuple[dict, str]]]:
-    """(lost, retitled) for every addition record: which of the two readings of
-    "did it land" found it in the tracker, or neither.
+def _classify_landing(
+    records: list[dict], career_ops: Path,
+) -> tuple[list[dict], list[tuple[dict, str, str]]]:
+    """(lost, by_report) for every addition record: which of the two readings
+    of "did it land" found it in the tracker, or neither — `by_report` holding
+    (addition, the row's company cell, the row's role) for each one only the
+    second reading found.
+
+    **company::role**, and **company + report number**. The first is not stable
+    across a merge on its own. merge-tracker matches an addition against the
+    tracker on four tiers, and only two of them are provable identity: an exact
+    posting URL, and an exact report number. On the GUESSED tiers — entry
+    number, fuzzy title — it updates the row but deliberately keeps THE ROW'S
+    OWN TITLE, so that a fuzzy false positive cannot also destroy the evidence
+    that two reqs were distinct (`role: (reportNumMatched || dupReason ===
+    'url') ? addition.role : duplicate.role`). Its `🔄 Update` log line prints
+    the ADDITION's role, so the substitution is invisible there too. The report
+    link and the score are written through on every one of those tiers, so the
+    second reading finds what the first cannot. Company is part of it because
+    merge-tracker's own report-number tier requires it: report-file numbering
+    and tracker-row numbering drift, so a bare number can name an unrelated
+    row.
+
+    The second is not a replacement for the first. An unscoreable re-eval is
+    skipped with the existing score, report and PDF left standing, so there the
+    row keeps its company::role and never receives the new report number. Each
+    reading covers the other's blind spot.
+
+    The company is compared as merge-tracker's `companiesMatch` compares it
+    (`_company_identity`) — and on the report-number reading, failing that, as a
+    corporate-form pair, an exact row preferred: the fuzzy tier also folds
+    "Acme Inc." onto a row filed as "Acme" and keeps the ROW'S spelling as it
+    keeps the row's title, while the report link writes through. Read by key
+    alone, that intact evaluation was reported lost and turned the daily red
+    (#272). Not on the role reading, because there it pairs with any older
+    "Acme" row of the same title: on a merge-tracker before career-ops#5862,
+    which archives a refusal, a refused bare-score re-eval of "Acme Inc." read
+    as landed, so recovery never re-queued it — a silent loss. The price is the
+    one fold only the role reading could see, an unscoreable re-eval across a
+    corporate form, which is now reported lost: a false warning, the louder
+    and recoverable failure of the two.
 
     Shared by the loss guard, which reports the answer, and the recovery pass,
     which acts on it — one definition, so the row the guard calls lost is the
     row recovery goes after, never two slightly different sets."""
     if not records:
         return [], []
-    landed, role_by_report = _tracker_identities(career_ops / "data" / "applications.md")
+    landed, by_report = _tracker_identities(career_ops / "data" / "applications.md")
     lost: list[dict] = []
-    retitled: list[tuple[dict, str]] = []
+    found: list[tuple[dict, str, str]] = []
     for add in records:
+        tokens = _company_tokens(add["company"])
+        identity = _company_identity(add["company"], tokens)
         # The two readings, side by side. Either one finding the row means the
         # evaluation is in the tracker.
         # No identity at all (an unreadable headed file): only the report number
         # can find it.
         if (add["company"] or add["role"]) and \
-                _addition_key(add["company"], add["role"]) in landed:
+                (identity, normalize_company(add["role"])) in landed:
             continue
-        key = _report_key(add["company"], add["report"]) if add["report"] else None
-        # `in`, not truthiness of the title: a tracker row with a blank Role cell
-        # (hand-added, or half-migrated) matched here would otherwise be read as
-        # no match at all, and an intact evaluation would get the loud loss
-        # warning — the #152 cry-wolf back again by a different route.
-        if key in role_by_report:
-            retitled.append((add, role_by_report[key]))
-        else:
+        rows = by_report.get(add["report"], ())
+        # Two passes, as merge-tracker's fuzzy tier makes them, so a
+        # corporate-form row earlier in the table never stands in for the exact
+        # one in what the guard prints.
+        row = next(((c, r) for ident, _, c, r in rows if ident == identity), None) or next(
+            ((c, r) for _, toks, c, r in rows if _corporate_form_tokens_match(tokens, toks)), None)
+        if row is None:
             lost.append(add)
-    return lost, retitled
+        else:
+            found.append((add, *row))
+    return lost, found
 
 
 def _recover_refused_additions(career_ops: Path, tracker_dir: Path) -> None:
@@ -3123,16 +3258,23 @@ def _warn_on_lost_additions(before: list[dict], queued: set[str], pending: set[s
     existing row on a heuristic tier, which keeps that row's title, so the key the
     addition carried was not the key it landed under. A guard that fires on intact
     rows camouflages the loss it exists to catch, so an addition found under
-    EITHER identity counts as landed. The substitution gets its own line, because
-    it is real information nothing else surfaces: the fuzzy tier can fold two
-    genuinely distinct reqs (a leveled title and its sibling) into one row, and
-    from then on only one of them is visible to dedup, the handoff and the UI."""
+    EITHER identity counts as landed (`_classify_landing` says how each compares
+    the company). The title substitution gets its own line, because it is real
+    information nothing else surfaces: the fuzzy tier can fold two genuinely
+    distinct reqs (a leveled title and its sibling) into one row, and from then
+    on only one of them is visible to dedup, the handoff and the UI. So does a
+    company spelling the row kept (#272), for the same reason: from then on only
+    the row's spelling is the company everything keys on."""
     kept = queued & pending
     identity = {add["name"]: add for add in before}
     refused = [identity.get(name, {"name": name, "company": "", "role": "", "report": ""})
                for name in sorted(kept)]
-    lost, retitled = _classify_landing(
+    lost, by_report = _classify_landing(
         [add for add in before if add["name"] not in kept], career_ops)
+    retitled = [(add, role) for add, _, role in by_report
+                if normalize_company(role) != normalize_company(add["role"])]
+    respelled = [(add, company) for add, company, _ in by_report
+                 if not _same_employer(company, add["company"])]
 
     if refused:
         # No "re-evaluate": the job is done in the batch state and its URL is in
@@ -3165,6 +3307,16 @@ def _warn_on_lost_additions(before: list[dict], queued: set[str], pending: set[s
         for add, row_role in retitled:
             print(f"[batch]   {add['name']}: {add['company']} — "
                   f'"{add["role"]}" merged into "{row_role}" (report {add["report"]})')
+
+    if respelled:
+        print(f"[batch] note: {len(respelled)} evaluation(s) merged into an existing "
+              "tracker row filed under another corporate form of the company, which "
+              "kept its own spelling — merge-tracker's fuzzy tier pairs those (\"Acme "
+              "Inc.\" with \"Acme\"). Nothing was lost: the report link and score "
+              "wrote through, under the row's spelling:")
+        for add, row_company in respelled:
+            print(f'[batch]   {add["name"]}: "{add["company"]}" merged into the row '
+                  f'filed as "{row_company}" (report {add["report"]})')
     return len(refused) + len(lost)
 
 
@@ -3186,23 +3338,35 @@ def _print_additions(additions: list[dict], merge_output: str) -> None:
                 print(f"[batch]     merge-tracker: {line.strip()}")
 
 
-def _tracker_identities(applications_md: Path) -> tuple[set[str], dict[str, str]]:
-    """The two identities every tracker data row can be found by, in one walk:
-    the set of company::role keys, and {company::report_num: that row's role}.
+# A tracker row as the report-number reading compares it: (its
+# `_company_identity`, the company's tokens, the company cell, the role).
+_ReportRow = tuple[tuple[str, str], list[str], str, str]
 
-    The role title comes back with the report key rather than a bare `True`
-    because it is what makes the retitle line above readable — the operator needs
-    to see which existing row swallowed the addition to judge whether the pairing
-    was right."""
-    keys: set[str] = set()
-    role_by_report: dict[str, str] = {}
+
+def _tracker_identities(
+    applications_md: Path,
+) -> tuple[set[tuple[tuple[str, str], str]], dict[str, list[_ReportRow]]]:
+    """The two identities every tracker data row can be found by, in one walk,
+    each row's company read once: the set of (`_company_identity`, role key),
+    and {report number: [`_ReportRow`]}, rows in tracker order. The report
+    reading is indexed rather than keyed on the company too, because it also
+    compares the tokens pairwise (`_classify_landing`).
+
+    The company and role come back with the report number because they are
+    what makes the guard's notes readable — the operator needs to see which
+    existing row swallowed the addition to judge whether the pairing was
+    right."""
+    landed: set[tuple[tuple[str, str], str]] = set()
+    by_report: dict[str, list[_ReportRow]] = {}
     for row in _tracker_rows(applications_md):
         company, role = row["company"], row["role"]
-        keys.add(_addition_key(company, role))
+        tokens = _company_tokens(company)
+        identity = _company_identity(company, tokens)
+        landed.add((identity, normalize_company(role)))
         num = row_report_num(row.get("report", ""), row.get("notes", ""))
         if num:
-            role_by_report.setdefault(_report_key(company, num), role.strip())
-    return keys, role_by_report
+            by_report.setdefault(num, []).append((identity, tokens, company, role.strip()))
+    return landed, by_report
 
 
 def _hint_missing_node_modules(stderr: str) -> None:
