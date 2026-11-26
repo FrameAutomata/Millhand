@@ -378,8 +378,9 @@ def build_tailor_messages(local: Path, role_context: str) -> tuple[str, str]:
             "cv.md not found in your local career-ops — run setup/onboarding "
             "first, or launch the UI from your career-ops clone."
         )
-    # Redacted read: this string lands in a system prompt below, and
-    # profile.yml carries the wizard's EEO self-ID answers (#165).
+    # Redacted read: this string lands in a system prompt below, and a
+    # profile.yml nothing has scrubbed yet may still carry an older setup's
+    # self-ID answers (#165, #227).
     profile = redact_profile_yml(_read(local / "config" / "profile.yml"))
     rules = _read(local / "modes" / "text.md").strip() or _FALLBACK_RULES
     system = (

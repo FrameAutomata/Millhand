@@ -209,3 +209,21 @@ class TestEvaluateBatchWiring:
 
     def test_retry_abandoned_is_off_by_default(self, quiet_pipeline, monkeypatch):
         assert self._run(quiet_pipeline, monkeypatch)["retry_abandoned"] is False
+
+
+class TestScrubsTheProfileFirst:
+    """main() scrubs profile.yml before any stage (#227; the scrub's own
+    contract is tests/test_batch_common.py::TestScrubEveryCheckout): once, for
+    the CAREER_OPS_PATH checkout, ahead of the first stage."""
+
+    def test_scrubbed_once_before_the_first_stage(self, quiet_pipeline, monkeypatch):
+        cfg, co = quiet_pipeline
+        events = []
+        monkeypatch.setattr(orchestrate, "scrub_profile_yml_files",
+                            lambda career_ops: events.append(("scrub", career_ops)))
+        monkeypatch.setattr(orchestrate.scrape, "run", lambda *a, **k: events.append("scrape"))
+        monkeypatch.setattr(sys, "argv", ["orchestrate.py", "--config", str(cfg),
+                                          "--skip-filter", "--skip-screen", "--skip-bridge",
+                                          "--skip-batch-prep"])
+        assert orchestrate.main() == 0
+        assert events == [("scrub", co.resolve()), "scrape"]

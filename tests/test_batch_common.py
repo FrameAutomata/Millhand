@@ -4,6 +4,9 @@ import csv
 import re
 import json
 import os
+import stat
+import sys
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -62,7 +65,9 @@ from pipeline._batch_common import (   # the #183 mark
     DECISION_SKIP_MARK, _report_marks, is_skip_decision, skip_decided,
 )
 from pipeline import _batch_common
-from tests.conftest import tracker_row
+from tests.conftest import (
+    PROFILE_DISCLOSURES, PROFILE_KEPT, tracker_row, write_leftover_prompt, write_profile_yml,
+)
 
 
 # A stand-in merge-tracker.mjs for a CURRENT checkout — one that reads labelled
@@ -202,17 +207,33 @@ class TestAtomicWriteText:
         assert target.read_text(encoding="utf-8") == "from A\n"     # the last word, whole
         assert [f.name for f in tmp_path.iterdir()] == ["applications.md"]
 
-    def test_a_failed_replace_leaves_the_file_and_no_sibling(self, tmp_path, mocker):
+    @pytest.mark.parametrize("mode", [None, 0o400])
+    def test_a_failed_replace_leaves_the_file_and_no_sibling(self, tmp_path, mocker, mode):
         """A per-writer sibling is no longer overwritten by the next write, so
         one a failed write leaves behind would stay — on Windows that failure
-        is routine, a tracker held open by another program."""
+        is routine, a tracker held open by another program. A read-only `mode`
+        has been applied to the sibling by then, and Windows will not unlink a
+        read-only file."""
         target = tmp_path / "applications.md"
         target.write_text("before\n", encoding="utf-8")
         mocker.patch.object(_batch_common.os, "replace", side_effect=PermissionError("held open"))
         with pytest.raises(PermissionError):
-            atomic_write_text(target, "after\n")
+            atomic_write_text(target, "after\n", mode=mode)
         assert target.read_text(encoding="utf-8") == "before\n"
         assert [f.name for f in tmp_path.iterdir()] == ["applications.md"]
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+    @pytest.mark.parametrize("mode", [0o640, 0o400])
+    def test_mode_is_the_results_permission_bits(self, tmp_path, mode):
+        """The sibling is created under the umask, and the replace hands its
+        mode to the file: a 0600 profile.yml came back 0644. A read-only mode
+        still gets the text written, because it is applied after the write."""
+        target = tmp_path / "profile.yml"
+        target.write_text("before\n", encoding="utf-8")
+        atomic_write_text(target, "after\n", mode=mode)
+        assert stat.S_IMODE(target.stat().st_mode) == mode
+        assert target.read_text(encoding="utf-8") == "after\n"
+        assert [f.name for f in tmp_path.iterdir()] == ["profile.yml"]
 
     def test_a_sibling_caught_mid_write_is_in_no_readers_glob(self, tmp_path, mocker):
         """A forward guard on the name, not a pin of the per-writer fix (the two
@@ -3489,7 +3510,7 @@ class TestBackfillReportUrls:
         assert "into the Notes of 1 tracker row" in capsys.readouterr().out
         self._assert_untouched(co, capsys)
 
-    @pytest.mark.parametrize("sep", [" ", "\x0c"], ids=["U+2028", "form-feed"])
+    @pytest.mark.parametrize("sep", ["\u2028", "\x0c"], ids=["U+2028", "form-feed"])
     def test_a_url_the_readers_would_not_see_is_named_not_written(self, tmp_path, capsys, sep):
         """`data_rows` splits lines as `splitlines()` does and the row editor on
         "\\n" alone, so with such a separator inside Notes the editor appends
@@ -3845,9 +3866,250 @@ class TestProtectedCharacteristicRedaction:
                 "- **Traceability:** built the audit trail\n")
         assert _batch_common.redact_profile_master(bank) == bank
 
-    def test_redaction_is_idempotent(self):
-        once = _batch_common.redact_profile_yml(self.YML)
+    @pytest.mark.parametrize("text", [
+        YML,
+        # Forward guards, these three: the pre-#227 line read passes them too,
+        # trivially, since it dropped every line up to the next top-level key,
+        # gap included. They pin that the gap #227 keeps comes through a second
+        # pass unchanged.
+        "a: 1\nvoluntary_disclosures:\n  g: F\n\n# next\nb: 2\n",
+        "a: 1\nvoluntary_disclosures:\n  g: F\n\n# trailing\n",
+        "a: 1\r\nvoluntary_disclosures:\r\n  g: F\r\n\r\n# next\r\nb: 2\r\n",
+        "\ufeffvoluntary_disclosures:\n  g: F\n\n\nb: 2\n",
+    ])
+    def test_redaction_is_idempotent(self, text):
+        once = _batch_common.redact_profile_yml(text)
+        assert "voluntary_disclosures" not in once      # an identity would pass too
         assert _batch_common.redact_profile_yml(once) == once
+
+    # ── #227: the scrub writes this back to the person's own file ─────────────
+
+    def test_the_gap_after_the_section_belongs_to_the_next_key(self):
+        """A blank line and a heading comment a blank line separates from the
+        section are the NEXT key's: the scrub writes this result back for good,
+        so dropping them deleted the person's own comment permanently."""
+        text = ("candidate:\n  a: 1\n"
+                "voluntary_disclosures:\n  gender: Female\n"
+                "\n# Compensation block\ncompensation:\n  min: 1\n")
+        assert _batch_common.redact_profile_yml(text) == (
+            "candidate:\n  a: 1\n\n# Compensation block\ncompensation:\n  min: 1\n")
+
+    def test_a_comment_against_the_section_goes_with_it(self):
+        """No blank line between: the shape of an answer commented out by hand,
+        which keeping would leak — so the conservative read still holds here.
+        A forward guard: the pre-#227 line read passes it too, having dropped
+        every line up to the next top-level key; it pins that #227's gap rule
+        did not loosen that."""
+        text = ("voluntary_disclosures:\n  gender: Female\n"
+                "# race_ethnicity: Hispanic or Latino\ncv:\n  output_format: html\n")
+        assert _batch_common.redact_profile_yml(text) == "cv:\n  output_format: html\n"
+
+    def test_a_gap_the_section_resumes_after_goes_with_it(self):
+        """Held, not kept: an indented line after the gap means the section went
+        on, and the blank and the comment were inside it. A forward guard, as
+        the test above is: the pre-#227 line read dropped the whole run up to
+        `cv:` as well."""
+        text = ("voluntary_disclosures:\n  gender: Female\n"
+                "\n# more answers\n  veteran_status: I am a protected veteran\n"
+                "cv:\n  output_format: html\n")
+        assert _batch_common.redact_profile_yml(text) == "cv:\n  output_format: html\n"
+
+    @pytest.mark.parametrize("key", ['"voluntary_disclosures"', "'voluntary_disclosures'",
+                                     # A forward guard: the pre-#227 split/strip read it.
+                                     "voluntary_disclosures "])
+    def test_a_quoted_key_is_still_the_section(self, key):
+        text = f"candidate:\n  a: 1\n{key}:\n  gender: Female\ncv:\n  x: 1\n"
+        assert _batch_common.redact_profile_yml(text) == "candidate:\n  a: 1\ncv:\n  x: 1\n"
+
+    def test_a_bom_neither_hides_the_section_nor_is_lost_with_it(self):
+        """An old Notepad save puts U+FEFF before the first key, which is not
+        whitespace to str.strip — the section read as `\\ufeffvoluntary_...`."""
+        text = "\ufeffvoluntary_disclosures:\n  gender: Female\ncandidate:\n  a: 1\n"
+        assert _batch_common.redact_profile_yml(text) == "\ufeffcandidate:\n  a: 1\n"
+
+    @pytest.mark.parametrize("text", [
+        "voluntary_disclosures:\n  gender: Female\ncandidate:\n  a: 1\n",
+        # A document indented as a whole is not read as one, BOM or not (no
+        # writer produces it; before #227 it was read whole too). Read as a
+        # character of the first line, the BOM made that line top-level, and the
+        # scrub wrote back a profile.yml emptied of every key after the section.
+        "  voluntary_disclosures:\n    gender: Female\n  name: x\n",
+    ])
+    def test_a_bom_changes_nothing_but_itself(self, text):
+        """The line read's property, since it is what the scrub writes back. The
+        indented document is a key the line read does not see at all, which
+        the prompt guard and the scrub catch through PyYAML instead
+        (TestPromptGuardFallsBackToPyYAML, TestScrubProfileYmlFile)."""
+        redact = _batch_common._redact_profile_yml_lines
+        assert redact("\ufeff" + text) == "\ufeff" + redact(text)
+
+    # ── #227: what ends the section, and what never comes back ────────────────
+
+    @pytest.mark.parametrize("section", [
+        # A hand-written flow mapping: its closing brace sits at column 0.
+        "voluntary_disclosures: {\n  gender: Female,\n  race_ethnicity: Asian\n}\n",
+        # A compact sequence: YAML lets a mapping's list start at the key's own column.
+        "voluntary_disclosures:\n- gender: Female\n- race_ethnicity: Asian\n",
+        # A quoted scalar continued at column 0, as YAML allows.
+        'voluntary_disclosures:\n  gender: "Female, and the rest\nof the answer here"\n',
+    ])
+    def test_a_column_0_line_that_is_no_key_stays_in_the_section(self, section):
+        """Only a line shaped like a top-level key ends the section. Any column-0
+        line did, so the rest of the answer was written back as a top-level line
+        — on disk, a broken profile.yml (TestScrubProfileYmlFile pins that half)."""
+        text = "candidate:\n  a: 1\n" + section + "cv:\n  x: 1\n"
+        assert _batch_common.redact_profile_yml(text) == "candidate:\n  a: 1\ncv:\n  x: 1\n"
+
+    @pytest.mark.parametrize("key_line", [
+        '"cv": x\n', "'cv': x\n", "!!str cv: x\n", "&anchor cv: x\n", "? cv\n",
+        "cv:\n", "cv:\r\n", "cv : x\n", "-cv: x\n",
+    ])
+    def test_every_top_level_key_shape_ends_it(self, key_line):
+        """A forward guard on the other side of the rule above — before #227 the
+        section ended at any column-0 line, these included: a key the shape
+        rule missed would swallow the rest of the file instead."""
+        text = "voluntary_disclosures:\n  gender: Female\n" + key_line + "  y: 1\n"
+        assert _batch_common._redact_profile_yml_lines(text) == key_line + "  y: 1\n"
+
+    @pytest.mark.parametrize("marker", ["---\n", "...\n", "--- # next\n"])
+    def test_a_document_marker_ends_it(self, marker):
+        """A forward guard, as above: a marker is no key, and without its own
+        alternative in the shape rule the section would run on into the next
+        document."""
+        text = "voluntary_disclosures:\n  gender: Female\n" + marker + "cv: 1\n"
+        assert _batch_common._redact_profile_yml_lines(text) == marker + "cv: 1\n"
+
+    @pytest.mark.parametrize("commented", [
+        "# gender: Female\n",
+        "# race_ethnicity: Hispanic or Latino\n",
+        "#veteran_status: I am a protected veteran\n",
+        "# Disability status: Yes\n",
+        "# RACIAL identity: x\n",
+    ])
+    def test_a_commented_out_answer_is_never_put_back(self, commented):
+        """A comment block a blank line separates from the section is held for
+        the next key, and was put back whole — the commented-out answers in it
+        too. Each protected line goes; the heading comment beside it stays."""
+        text = ("candidate:\n  a: 1\nvoluntary_disclosures:\n  gender: Female\n\n"
+                + commented + "# Compensation block\n" + commented
+                + "compensation:\n  min: 1\n")
+        assert _batch_common.redact_profile_yml(text) == (
+            "candidate:\n  a: 1\n\n# Compensation block\ncompensation:\n  min: 1\n")
+
+    def test_a_neutral_comment_is_still_held(self):
+        """The stems are word-anchored: "Grace period" names no race, and a
+        heading comment that merely sits after the section is the next key's.
+        A forward guard: the pre-#227 line read kept it too."""
+        text = ("voluntary_disclosures:\n  gender: Female\n\n# Grace period, in days\n"
+                "notice:\n  days: 14\n")
+        assert _batch_common.redact_profile_yml(text) == (
+            "\n# Grace period, in days\nnotice:\n  days: 14\n")
+
+    @pytest.mark.parametrize("separator", [
+        "\N{LINE SEPARATOR}", "\N{PARAGRAPH SEPARATOR}", "\N{NEXT LINE}",
+        "\x0b", "\x0c", "\x1c", "\x1d", "\x1e",
+    ])
+    def test_only_a_real_line_ending_splits_a_value(self, separator):
+        """str.splitlines breaks on these too, so the tail of an answer holding
+        one landed at column 0 and was read as a top-level key."""
+        text = ("candidate:\n  a: 1\nvoluntary_disclosures:\n"
+                f"  gender: Female{separator}race_ethnicity: Asian\ncv:\n  x: 1\n")
+        assert _batch_common._redact_profile_yml_lines(text) == "candidate:\n  a: 1\ncv:\n  x: 1\n"
+        # The prompt guard checks with PyYAML, which ends a line at three of these
+        # (NEL, LS, PS): read as written, `race_ethnicity: Asian` was a top-level
+        # key of its mapping, and its fallback handed that to the prompt.
+        out = _batch_common.redact_profile_yml(text)
+        assert "Asian" not in out and "race_ethnicity" not in out
+        assert out.startswith("candidate:\n  a: 1\n")
+
+    @pytest.mark.parametrize("eol", ["\r\n", "\r"])
+    def test_real_line_endings_are_kept(self, eol):
+        """A forward guard on the split: every real ending still splits, and
+        comes back as it was."""
+        text = eol.join(["a: 1", "voluntary_disclosures:", "  gender: Female", "b: 2", ""])
+        assert _batch_common.redact_profile_yml(text) == f"a: 1{eol}b: 2{eol}"
+
+    # ── #227: a commented-out section ─────────────────────────────────────────
+
+    @pytest.mark.parametrize("after", [
+        "\n# Compensation block\ncompensation:\n  min: 1\n",
+        "compensation:\n  min: 1\n# a note on compensation\n",
+    ], ids=["a gap before the next key", "the next key"])
+    @pytest.mark.parametrize("prefix", ["# ", "#", "## "])
+    def test_a_commented_out_section_goes_with_its_answers(self, prefix, after):
+        """An editor's toggle-comment makes the section comments, which
+        career-ops' agents read as plainly as keys. The commented key opens the
+        section as the key does, and the next top-level key ends it; the
+        comments heading the file and the next key's stay."""
+        text = ("# my profile\ncandidate:\n  a: 1\n"
+                + textwrap.indent(PROFILE_DISCLOSURES, prefix) + after)
+        expected = "# my profile\ncandidate:\n  a: 1\n" + after
+        assert _batch_common._redact_profile_yml_lines(text) == expected
+        assert _batch_common.redact_profile_yml(text) == expected
+
+    def test_a_commented_copy_in_the_gap_after_the_section_is_not_put_back(self):
+        """The gap after the section is held for the next key and put back
+        whole, so a commented-out copy of the section in it came back too, its
+        consent toggles naming no protected characteristic. That copy opens a
+        section of its own, as a second key would, and the gap before it goes
+        with it."""
+        text = ("voluntary_disclosures:\n  gender: Female\n\n"
+                "# voluntary_disclosures:\n#   data_processing_consent: true\n"
+                "\n# Compensation block\ncompensation:\n  min: 1\n")
+        assert _batch_common.redact_profile_yml(text) == (
+            "\n# Compensation block\ncompensation:\n  min: 1\n")
+
+    @pytest.mark.parametrize("comment", [
+        "# voluntary disclosures are no longer asked for\n",
+        "# voluntary_disclosures_note: see the form\n",
+    ])
+    def test_a_comment_that_only_mentions_the_section_stays(self, comment):
+        """A forward guard: only the key itself, commented, opens the span."""
+        text = "candidate:\n  a: 1\n" + comment + "# and its neighbour\ncv:\n  x: 1\n"
+        assert _batch_common.redact_profile_yml(text) == text
+
+    def test_the_prompt_read_drops_a_commented_out_section(self, tmp_path):
+        write_profile_yml(tmp_path, PROFILE_KEPT + textwrap.indent(PROFILE_DISCLOSURES, "# ")
+                          + "cv:\n  output_format: html\n")
+        out = _batch_common.profile_yml_for_prompt(tmp_path)
+        for leak in ("Female", "Hispanic", "protected veteran", "disability", "voluntary"):
+            assert leak not in out, leak
+        assert out == PROFILE_KEPT + "cv:\n  output_format: html"      # read_text strips
+
+    @pytest.mark.parametrize("section, gap", [
+        # Home, then `# `, on each line: the comment marks at the answers' indent.
+        ("# voluntary_disclosures:\n  # gender: Female\n  # race_ethnicity: Hispanic or Latino\n", ""),
+        # A toggle-comment leaves a blank line as it is.
+        ("# voluntary_disclosures:\n#   gender: Female\n\n#   race_ethnicity: Hispanic or Latino\n",
+         "\n"),
+        # Only the key line commented: YAML reads the answers as candidate's.
+        ("# voluntary_disclosures:\n  gender: Female\n  race_ethnicity: Hispanic or Latino\n", ""),
+    ], ids=["answers commented at their indent", "a blank line inside", "only the key commented"])
+    def test_every_editor_shape_of_a_commented_section_reaches_no_prompt(
+            self, tmp_path, section, gap):
+        """The span used to end at the first line that was not a column-0
+        comment, which left the answers after it in each of these, in the
+        prompt as on disk (TestScrubProfileYmlFile pins the disk half). It
+        runs to the next top-level key now, as the section's own does."""
+        head, tail = "candidate:\n  full_name: Jane Roe\n", "cv:\n  output_format: html\n"
+        write_profile_yml(tmp_path, head + section + tail)
+        assert _batch_common.redact_profile_yml(head + section + tail) == head + gap + tail
+        out = _batch_common.profile_yml_for_prompt(tmp_path)
+        for leak in ("Female", "Hispanic", "voluntary"):
+            assert leak not in out, leak
+        assert out == (head + gap + tail).strip()
+
+    def test_an_answer_the_commented_section_leaves_reaches_no_prompt(self):
+        """A backstop: a commented-out answer outside the section's span
+        survives the line read, so the line read is refused and the prompt
+        gets PyYAML's reading, which keeps no comment."""
+        yaml = pytest.importorskip("yaml")
+        text = ("candidate:\n  full_name: Jane Roe\n# voluntary_disclosures:\n#   gender: Female\n"
+                "cv:\n  output_format: html\n# race_ethnicity: Hispanic or Latino\n")
+        out = _batch_common.redact_profile_yml(text)
+        for leak in ("Female", "Hispanic", "voluntary"):
+            assert leak not in out, leak
+        assert yaml.safe_load(out) == yaml.safe_load(text)
 
     # ── #216: the label alone was the whole test ──────────────────────────────
 
@@ -4127,6 +4389,99 @@ class TestProtectedCharacteristicRedaction:
             assert f("") == "" and f(None) == ""
 
 
+class TestPromptGuardFallsBackToPyYAML:
+    """`redact_profile_yml` guards every prompt read, and for the files the scrub
+    refuses to rewrite it is the only guard left (#227). Its line read
+    misjudged two kinds of file. In one, a column-0 line shaped like a key inside
+    a quoted scalar or a flow collection ended the section early. In the other,
+    the key is in a form the line read does not recognise. Either way the
+    answers after it reached --evaluate-batch, Add-Job and API tailoring. So
+    when PyYAML refuses the line read, the prompt gets PyYAML's reading of the
+    file minus the section. When that reading could still leak (an alias) or
+    there is none (the file does not parse), the file is cut at the section.
+    """
+
+    HEAD = "candidate:\n  full_name: Jane Roe\n"
+    TAIL = "cv:\n  output_format: html\n"
+    KEPT = {"candidate": {"full_name": "Jane Roe"}, "cv": {"output_format": "html"}}
+    LEAKS = ("Female", "Hispanic", "Asian", "voluntary")
+
+    @pytest.mark.parametrize("text", [
+        # A quoted scalar and a flow mapping, each continued at column 0 by a
+        # line shaped like a key.
+        HEAD + 'voluntary_disclosures:\n  gender: "Female and\nrace: Hispanic or Latino"\n' + TAIL,
+        HEAD + "voluntary_disclosures: {\ngender: Female,\nrace_ethnicity: Asian\n}\n" + TAIL,
+        # The same shape in single quotes, a flow sequence, and a flow mapping
+        # opened on the next line.
+        HEAD + "voluntary_disclosures:\n  gender: 'Female and\nrace: Hispanic or Latino'\n" + TAIL,
+        HEAD + "voluntary_disclosures: [\ngender: Female,\nrace: Asian\n]\n" + TAIL,
+        HEAD + "voluntary_disclosures:\n  {gender: Female,\nrace: Asian}\n" + TAIL,
+        # Keys the line read does not recognise at all.
+        HEAD + "&vd voluntary_disclosures:\n  gender: Female\n  race: Asian\n" + TAIL,
+        HEAD + "!!str voluntary_disclosures:\n  gender: Female\n  race: Asian\n" + TAIL,
+        HEAD + "? voluntary_disclosures\n: {gender: Female, race: Asian}\n" + TAIL,
+        HEAD + '"voluntary\\x5fdisclosures":\n  gender: Female\n' + TAIL,   # a YAML escape
+        "{candidate: {full_name: Jane Roe}, voluntary_disclosures: {gender: Female},"
+        " cv: {output_format: html}}\n",
+        '{\n  "candidate": {"full_name": "Jane Roe"},\n  "voluntary_disclosures": '
+        '{"gender": "Female"},\n  "cv": {"output_format": "html"}\n}\n',
+        "--- {candidate: {full_name: Jane Roe}, voluntary_disclosures: {gender: Female},"
+        " cv: {output_format: html}}\n",
+    ])
+    def test_a_section_the_line_read_misjudges_reaches_no_prompt(self, tmp_path, text):
+        yaml = pytest.importorskip("yaml")
+        write_profile_yml(tmp_path, text)
+        out = _batch_common.profile_yml_for_prompt(tmp_path)
+        for leak in self.LEAKS:
+            assert leak not in out, leak
+        assert yaml.safe_load(out) == self.KEPT          # and nothing else is lost
+
+    def test_the_evaluation_prompt_is_guarded_too(self):
+        """--evaluate-batch and Add-Job pass the text, not the path."""
+        pytest.importorskip("yaml")
+        text = self.HEAD + "voluntary_disclosures: {\ngender: Female,\nrace: Asian\n}\n" + self.TAIL
+        out = _batch_common.build_system_prompt("CV text", text)
+        assert "Female" not in out and "Asian" not in out
+        assert "Jane Roe" in out and "output_format: html" in out
+
+    @pytest.mark.parametrize("text,kept", [
+        # A document marker inside a quoted scalar: PyYAML cannot parse it.
+        (HEAD + 'voluntary_disclosures:\n  gender: "Female and\n--- Asian"\n' + TAIL, HEAD),
+        (HEAD + "voluntary_disclosures:\n  gender: Female\ncompensation: [unclosed\n", HEAD),
+        # An alias carries the section out under another key; a merge key is one.
+        (HEAD + "voluntary_disclosures: &vd\n  gender: Female\nother: *vd\n" + TAIL, HEAD),
+        (HEAD + "voluntary_disclosures: &vd\n  gender: Female\nother:\n  <<: *vd\n  x: 1\n", HEAD),
+        # PyYAML reads the key, the name is nowhere to cut at: nothing is safe.
+        (HEAD + '"voluntary\\x5fdisclosures": &vd\n  gender: Female\nother: *vd\n', ""),
+    ])
+    def test_with_no_mapping_to_trust_the_file_is_cut_at_the_section(self, text, kept):
+        pytest.importorskip("yaml")
+        assert _batch_common.redact_profile_yml(text) == kept
+
+    def test_an_unparseable_file_that_never_names_the_section_is_left_whole(self):
+        """A forward guard: the cut is at the section, so a file that does not
+        parse and never names it is passed through whole."""
+        pytest.importorskip("yaml")
+        text = self.HEAD + "compensation: [unclosed\n"
+        assert _batch_common.redact_profile_yml(text) == text
+
+    def test_without_pyyaml_the_line_read_is_the_answer(self, monkeypatch):
+        """With no parser to check against, the line read is the answer, unchecked."""
+        text = self.HEAD + "voluntary_disclosures: {\ngender: Female,\nrace: Asian\n}\n" + self.TAIL
+        monkeypatch.setitem(sys.modules, "yaml", None)        # import yaml -> ImportError
+        assert _batch_common.redact_profile_yml(text) == _batch_common._redact_profile_yml_lines(text)
+
+    @pytest.mark.parametrize("text", [
+        HEAD + "&vd voluntary_disclosures:\n  gender: Female\n" + TAIL,
+        HEAD + "voluntary_disclosures: &vd\n  gender: Female\nother: *vd\n" + TAIL,
+        HEAD + 'voluntary_disclosures:\n  gender: "Female and\n--- Asian"\n' + TAIL,
+    ])
+    def test_the_fallback_is_idempotent(self, text):
+        pytest.importorskip("yaml")
+        once = _batch_common.redact_profile_yml(text)
+        assert _batch_common.redact_profile_yml(once) == once
+
+
 class TestNoUnredactedProfileReads:
     """No prompt may read profile.yml or PROFILE.md raw (#165).
 
@@ -4191,6 +4546,633 @@ class TestNoUnredactedProfileReads:
         assert 'redact_profile_yml(_read(local / "config" / "profile.yml"))' in skills
         content = (root / "resume_content.py").read_text(encoding="utf-8")
         assert "profile_master_for_prompt(profile_path)" in content
+
+
+class TestScrubProfileYmlFile:
+    """The self-ID section is removed from profile.yml ON DISK (#227; see
+    _batch_common.scrub_profile_yml_file). It is someone's profile: every byte
+    outside the section must survive, so must its permissions and a symlink to
+    it; a rewrite PyYAML cannot confirm is not made, nor one over a file saved
+    since it was read; and a file it cannot read or write is left exactly as it
+    was, without an exception.
+    """
+
+    TAIL = (
+        "compensation:\n"
+        "  target_range: 60-70k   # keep this comment\n"
+        "cv:\n"
+        "  output_format: html\n"
+    )
+    FULL = (PROFILE_KEPT + PROFILE_DISCLOSURES + TAIL).encode("utf-8")
+    SCRUBBED = (PROFILE_KEPT + TAIL).encode("utf-8")
+
+    def _scrub(self, tmp_path):
+        return _batch_common.scrub_profile_yml_file(tmp_path / "career-ops")
+
+    def test_drops_the_section_and_keeps_every_other_byte(self, tmp_path):
+        path = write_profile_yml(tmp_path / "career-ops", self.FULL)
+        assert self._scrub(tmp_path) is True
+        assert path.read_bytes() == self.SCRUBBED
+
+    def test_one_line_on_a_scrub_and_a_second_call_is_a_no_op(self, tmp_path, monkeypatch, capsys):
+        # The repo's own checkout, the one whose line names the cloud copy.
+        monkeypatch.setattr(_batch_common, "REPO_CAREER_OPS", tmp_path / "career-ops")
+        path = write_profile_yml(tmp_path / "career-ops", self.FULL)
+        assert self._scrub(tmp_path) is True
+        lines = capsys.readouterr().out.splitlines()
+        assert len(lines) == 1, lines
+        assert str(path.resolve()) in lines[0]
+        for needed in ("#227", "PROFILE_YML_B64", "Setup wizard"):
+            assert needed in lines[0], needed
+        stamp = 1_000_000_000 * 10**9                 # 2001, so a rewrite now shows
+        os.utime(path, ns=(stamp, stamp))
+        assert self._scrub(tmp_path) is False
+        assert path.stat().st_mtime_ns == stamp       # not rewritten
+        assert path.read_bytes() == self.SCRUBBED
+        assert capsys.readouterr().out == ""
+
+    def test_a_missing_file_is_false_and_creates_nothing(self, tmp_path):
+        assert self._scrub(tmp_path) is False
+        assert not (tmp_path / "career-ops").exists()
+
+    def test_crlf_and_the_files_mode_are_kept(self, tmp_path, monkeypatch):
+        """The bytes check pins the READ side everywhere. The write side it pins
+        only on Windows — elsewhere the default newline translates "\\n" to
+        "\\n", so dropping `newline=""` changes nothing a byte check can see —
+        hence the spy, which holds the write side on every platform, and the
+        file's own mode with it (TestAtomicWriteText pins what `mode` does)."""
+        def crlf(data):
+            return data.replace(b"\n", b"\r\n")
+        calls = []
+        real = _batch_common.atomic_write_text
+
+        def spy(path, content, **kwargs):
+            calls.append(kwargs)
+            return real(path, content, **kwargs)
+        monkeypatch.setattr(_batch_common, "atomic_write_text", spy)
+        path = write_profile_yml(tmp_path / "career-ops", crlf(self.FULL))
+        # Owner-only, so the file's mode is not the umask default a dropped or
+        # hard-coded `mode` falls back to: profile.yml holds a name, phone and
+        # address, and a 0600 file must not come back 0644.
+        path.chmod(0o600)
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert self._scrub(tmp_path) is True
+        assert path.read_bytes() == crlf(self.SCRUBBED)
+        assert calls == [{"newline": "", "mode": mode}]
+        assert stat.S_IMODE(path.stat().st_mode) == mode
+
+    def test_a_symlinked_profile_has_its_target_rewritten(self, tmp_path):
+        """Replacing the link itself left every answer in the file it pointed
+        at, and quietly cut the person's link to their own copy."""
+        real = tmp_path / "dotfiles" / "profile.yml"
+        real.parent.mkdir()
+        real.write_bytes(self.FULL)
+        link = tmp_path / "career-ops" / "config" / "profile.yml"
+        link.parent.mkdir(parents=True)
+        try:
+            link.symlink_to(real)
+        except OSError:
+            pytest.skip("symlinks need a privilege this machine lacks")
+        assert self._scrub(tmp_path) is True
+        assert link.is_symlink()
+        assert real.read_bytes() == self.SCRUBBED
+        assert [p.name for p in link.parent.iterdir()] == ["profile.yml"]
+        # The sibling is written beside the target, so that is where none may stay.
+        assert [p.name for p in real.parent.iterdir()] == ["profile.yml"]
+
+    def test_undecodable_bytes_leave_the_file_untouched(self, tmp_path):
+        data = (PROFILE_KEPT + PROFILE_DISCLOSURES).encode("utf-8") + b"  note: \xff\xfe\n"
+        path = write_profile_yml(tmp_path / "career-ops", data)
+        assert self._scrub(tmp_path) is False
+        assert path.read_bytes() == data
+
+    def test_a_failed_write_is_false_and_leaves_the_file(self, tmp_path, monkeypatch, capsys):
+        """And says so: career-ops reads the section on regardless, and a
+        silent False reads as done — the likeliest cause, now the target is
+        resolved, is a symlink into somewhere read-only."""
+        path = write_profile_yml(tmp_path / "career-ops", self.FULL)
+
+        def refuse(*a, **k):
+            raise PermissionError("read-only")
+        monkeypatch.setattr(_batch_common, "atomic_write_text", refuse)
+        assert self._scrub(tmp_path) is False
+        assert path.read_bytes() == self.FULL
+        lines = capsys.readouterr().out.splitlines()
+        assert len(lines) == 1, lines
+        assert str(path.resolve()) in lines[0] and "by hand" in lines[0]
+
+    # ── #227: the safety net, the race, the encoding, the hint ────────────────
+
+    @pytest.mark.parametrize("section", [
+        "voluntary_disclosures: {\n  gender: Female,\n  race_ethnicity: Asian\n}\n",
+        "voluntary_disclosures:\n- gender: Female\n- race_ethnicity: Asian\n",
+        'voluntary_disclosures:\n  gender: "Female, and the rest\nof the answer here"\n',
+    ])
+    def test_a_hand_edited_section_goes_and_the_file_still_parses(self, tmp_path, section):
+        """Ending the section at any column-0 line wrote a `}`, a `- gender:` or
+        a scalar's tail back into the person's own file — broken, or leaking."""
+        yaml = pytest.importorskip("yaml")
+        path = write_profile_yml(tmp_path / "career-ops", PROFILE_KEPT + section + self.TAIL)
+        assert self._scrub(tmp_path) is True
+        assert path.read_bytes() == self.SCRUBBED
+        assert "voluntary_disclosures" not in yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    @pytest.mark.parametrize("text", [
+        # A quoted scalar whose column-0 continuation looks like a key: the line
+        # read ends the section there and would write `race: x"` back as a key.
+        PROFILE_KEPT + 'voluntary_disclosures:\n  gender: "Female and\nrace: x"\n' + TAIL,
+        # The same with a hand-written flow mapping at column 0.
+        PROFILE_KEPT + "voluntary_disclosures: {\ngender: Female,\nrace: x\n}\n" + TAIL,
+        # A file that does not parse at all: no rewrite of it can be checked.
+        PROFILE_KEPT + PROFILE_DISCLOSURES + "compensation: [unclosed\n",
+        # A separator in an answer, with a key-shaped tail after it: read as
+        # career-ops' js-yaml reads it, `Fe race: x` is no YAML (js-yaml refuses
+        # the file too), so no rewrite of it can be checked.
+        PROFILE_KEPT + "voluntary_disclosures:\n  gender: Fe\N{LINE SEPARATOR}race: x\n" + TAIL,
+    ])
+    def test_a_rewrite_pyyaml_cannot_confirm_is_refused_aloud(self, tmp_path, capsys, text):
+        """The net under the line read: PyYAML must parse both, and the result
+        must be the original minus that key. Anything else leaves the file as it
+        is and tells the person, since career-ops reads the section on."""
+        pytest.importorskip("yaml")
+        path = write_profile_yml(tmp_path / "career-ops", text)
+        assert self._scrub(tmp_path) is False
+        assert path.read_bytes() == text.encode("utf-8")
+        lines = capsys.readouterr().out.splitlines()
+        assert len(lines) == 1, lines
+        assert str(path.resolve()) in lines[0] and "by hand" in lines[0]
+
+    @pytest.mark.parametrize("text", [
+        PROFILE_KEPT + "&vd voluntary_disclosures:\n  gender: Female\n" + TAIL,
+        PROFILE_KEPT + "!!str voluntary_disclosures:\n  gender: Female\n" + TAIL,
+        PROFILE_KEPT + "? voluntary_disclosures\n: {gender: Female}\n" + TAIL,
+        '{"candidate": {"full_name": "Jane Roe"}, "voluntary_disclosures": {"gender": "Female"}}\n',
+        "--- {voluntary_disclosures: {gender: Female}}\n",
+        "  voluntary_disclosures:\n    gender: Female\n  name: x\n",     # indented whole
+        # The same, with a separator in a value elsewhere that PyYAML read as a
+        # line break, so the file did not parse and the key went unseen.
+        PROFILE_KEPT + "  summary: Led intake.\N{LINE SEPARATOR}Trained staff.\n"
+        + "&vd voluntary_disclosures:\n  gender: Female\n" + TAIL,
+    ])
+    def test_a_key_only_pyyaml_reads_is_named_aloud(self, tmp_path, capsys, text):
+        """The line read does not see these keys, so it changed nothing, and the
+        scrub returned before its net could look: no line, while career-ops
+        reads the answers on. Left as it is, but said."""
+        pytest.importorskip("yaml")
+        path = write_profile_yml(tmp_path / "career-ops", text)
+        assert self._scrub(tmp_path) is False
+        assert path.read_bytes() == text.encode("utf-8")
+        lines = capsys.readouterr().out.splitlines()
+        assert len(lines) == 1, lines
+        assert str(path.resolve()) in lines[0] and "by hand" in lines[0]
+        assert "does not recognise" in lines[0]
+
+    def test_a_section_pyyaml_does_not_see_is_left_quietly(self, tmp_path, capsys):
+        """The key line is a quoted scalar's continuation: there is no section,
+        so nothing to tell anyone to remove — the line read was the one wrong."""
+        pytest.importorskip("yaml")
+        text = PROFILE_KEPT + 'note: "first line\nvoluntary_disclosures: none"\n' + self.TAIL
+        path = write_profile_yml(tmp_path / "career-ops", text)
+        assert self._scrub(tmp_path) is False
+        assert path.read_bytes() == text.encode("utf-8")
+        assert capsys.readouterr().out == ""
+
+    @pytest.mark.parametrize("separator", [
+        "\N{LINE SEPARATOR}", "\N{PARAGRAPH SEPARATOR}", "\N{NEXT LINE}"])
+    def test_a_separator_outside_the_section_does_not_stop_the_scrub(
+            self, tmp_path, capsys, separator):
+        """PyYAML (YAML 1.1) ends a line at NEL, LS and PS, where career-ops'
+        js-yaml does not: read as written, the text after one sat at column 0
+        and the file did not parse, so the scrub of a file career-ops reads
+        fine was refused. The net reads them as spaces; the file keeps them."""
+        pytest.importorskip("yaml")
+        summary = f"  summary: Led intake.{separator}Trained staff.\n"
+        path = write_profile_yml(tmp_path / "career-ops",
+                                 PROFILE_KEPT + summary + PROFILE_DISCLOSURES + self.TAIL)
+        assert self._scrub(tmp_path) is True
+        assert path.read_bytes() == (PROFILE_KEPT + summary + self.TAIL).encode("utf-8")
+        line, = capsys.readouterr().out.splitlines()
+        assert "removed" in line
+
+    @pytest.mark.parametrize("text, kept", [
+        (PROFILE_KEPT + textwrap.indent(PROFILE_DISCLOSURES, "# ")
+         + "\n# Compensation, reviewed yearly\n" + TAIL,
+         PROFILE_KEPT + "\n# Compensation, reviewed yearly\n" + TAIL),
+        (PROFILE_KEPT + textwrap.indent(PROFILE_DISCLOSURES, "#") + TAIL, PROFILE_KEPT + TAIL),
+        # The section, and below it the copy someone commented out earlier.
+        (PROFILE_KEPT + PROFILE_DISCLOSURES + "\n" + textwrap.indent(PROFILE_DISCLOSURES, "# ")
+         + "\n# Compensation, reviewed yearly\n" + TAIL,
+         PROFILE_KEPT + "\n# Compensation, reviewed yearly\n" + TAIL),
+        # Home, then `# `, on each line: the comment marks at the answers' indent.
+        (PROFILE_KEPT + "# voluntary_disclosures:\n"
+         + textwrap.indent(textwrap.dedent(PROFILE_DISCLOSURES.split("\n", 1)[1]), "  # ") + TAIL,
+         PROFILE_KEPT + TAIL),
+        # A toggle-comment leaves a blank line inside the section as it is.
+        (PROFILE_KEPT + "# voluntary_disclosures:\n#   gender: Female\n\n"
+         "#   race_ethnicity: Hispanic or Latino\n#   veteran_status: I am a protected veteran\n"
+         + TAIL,
+         PROFILE_KEPT + "\n" + TAIL),
+        # A profile that is nothing else: PyYAML reads no mapping either side.
+        (textwrap.indent(PROFILE_DISCLOSURES, "# "), ""),
+    ], ids=["commented", "commented, no space", "a section and a commented copy",
+            "answers commented at their indent", "a blank line inside", "nothing else"])
+    def test_a_commented_out_section_is_removed_and_said(
+            self, tmp_path, monkeypatch, capsys, text, kept):
+        """career-ops' agents read profile.yml whole, comments and all. PyYAML
+        sees no section in a commented-out one; the rewrite removes comments
+        only, so the parsed file is unchanged, which is what the net checks.
+        The span ran only to the first line that was not a column-0 comment, so
+        an indented one or a blank left the answers after it on disk, under a
+        line saying the section was removed."""
+        monkeypatch.setattr(_batch_common, "REPO_CAREER_OPS", tmp_path / "career-ops")
+        path = write_profile_yml(tmp_path / "career-ops", text)
+        assert self._scrub(tmp_path) is True
+        assert path.read_bytes() == kept.encode("utf-8")
+        line, = capsys.readouterr().out.splitlines()
+        assert str(path.resolve()) in line and "removed" in line and "#227" in line
+
+    def test_a_key_commented_above_answers_that_are_not_is_said_not_rewritten(
+            self, tmp_path, capsys):
+        """Only the key line commented: YAML reads the answers as the key
+        above's (`candidate.gender`), so the rewrite that cuts them changes
+        that key, and the one that does not cut them only took the heading a
+        person would look for. Neither is written; the line names the file."""
+        pytest.importorskip("yaml")
+        text = (PROFILE_KEPT + "# voluntary_disclosures:\n"
+                + PROFILE_DISCLOSURES.split("\n", 1)[1] + self.TAIL)
+        path = write_profile_yml(tmp_path / "career-ops", text)
+        assert self._scrub(tmp_path) is False
+        assert path.read_bytes() == text.encode("utf-8")
+        lines = capsys.readouterr().out.splitlines()
+        assert len(lines) == 1, lines
+        assert str(path.resolve()) in lines[0] and "by hand" in lines[0]
+        assert "commented out" in lines[0]
+
+    def test_a_rewrite_leaving_an_answer_is_said_not_made(self, tmp_path, capsys):
+        """A backstop under the commented span: a commented-out answer outside
+        it survives the line read, and the scrub must not say it removed the
+        section while that answer is still in the file."""
+        pytest.importorskip("yaml")
+        text = (PROFILE_KEPT + textwrap.indent(PROFILE_DISCLOSURES, "# ") + self.TAIL
+                + "# race_ethnicity: Hispanic or Latino\n")
+        path = write_profile_yml(tmp_path / "career-ops", text)
+        assert self._scrub(tmp_path) is False
+        assert path.read_bytes() == text.encode("utf-8")
+        lines = capsys.readouterr().out.splitlines()
+        assert len(lines) == 1, lines
+        assert str(path.resolve()) in lines[0] and "by hand" in lines[0]
+        assert "left an answer" in lines[0]
+
+    @pytest.mark.parametrize("encoding", ["utf-16", "utf-16-le", "utf-16-be", "utf-32"])
+    @pytest.mark.parametrize("body, holds_section", [
+        (PROFILE_KEPT + PROFILE_DISCLOSURES + TAIL, True),
+        (PROFILE_KEPT + textwrap.indent(PROFILE_DISCLOSURES, "# ") + TAIL, True),
+        # ASCII only: with no BOM every byte is valid UTF-8, the NULs included,
+        # and with one the BOM sits right in front of the section.
+        (PROFILE_DISCLOSURES + "candidate:\n  full_name: Jane Roe\n", True),
+        (PROFILE_KEPT + TAIL, False),
+    ], ids=["section", "commented", "section first, ASCII only", "none"])
+    def test_a_utf16_or_utf32_file_holding_the_section_is_named(
+            self, tmp_path, capsys, encoding, body, holds_section):
+        """What Windows PowerShell 5.1's `>` and `Out-File` write by default.
+        Read with the NULs between its characters, it never showed the key, so
+        it was passed over in silence. Still not rewritten — its encoding would
+        be a guess — but said."""
+        data = body.replace("\n", "\r\n").encode(encoding)
+        path = write_profile_yml(tmp_path / "career-ops", data)
+        assert self._scrub(tmp_path) is False
+        assert path.read_bytes() == data
+        lines = capsys.readouterr().out.splitlines()
+        if not holds_section:
+            assert lines == []
+            return
+        assert len(lines) == 1, lines
+        assert str(path.resolve()) in lines[0] and "by hand" in lines[0]
+        assert "UTF-8" in lines[0]
+
+    @pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"])
+    @pytest.mark.parametrize("body", [
+        PROFILE_DISCLOSURES + "candidate:\n  full_name: Jane Roe\n",
+        "candidate:\n  full_name: Jane Roe\n" + PROFILE_DISCLOSURES + "cv:\n  output_format: html\n",
+    ], ids=["section first", "section between"])
+    def test_a_utf16_or_utf32_file_with_no_bom_reaches_no_prompt(self, tmp_path, encoding, body):
+        """ASCII only, with no BOM: every byte is valid UTF-8, so the prompt
+        read decodes it with a NUL between its characters. Neither reading saw
+        the key, so the file went to the prompt whole, answers included, while
+        the scrub names the same file aloud (above). A NUL is no YAML character,
+        and career-ops' js-yaml refuses the file too."""
+        write_profile_yml(tmp_path / "career-ops",
+                          body.replace("\n", "\r\n").encode(encoding))
+        assert _batch_common.profile_yml_for_prompt(tmp_path / "career-ops") == ""
+
+    def test_without_pyyaml_the_line_read_is_written(self, tmp_path, monkeypatch):
+        """A forward guard: without PyYAML the line read is written unchecked,
+        rather than every file being left unscrubbed."""
+        monkeypatch.setitem(sys.modules, "yaml", None)        # import yaml -> ImportError
+        path = write_profile_yml(tmp_path / "career-ops", self.FULL)
+        assert self._scrub(tmp_path) is True
+        assert path.read_bytes() == self.SCRUBBED
+
+    def test_a_file_saved_meanwhile_is_not_overwritten(self, tmp_path, monkeypatch, capsys):
+        """A wizard Save rewrites profile.yml; the scrub read the older file, and
+        replacing the newer one with it would undo the Save. So the bytes are
+        re-read just before the replace."""
+        path = write_profile_yml(tmp_path / "career-ops", self.FULL)
+        newer = (PROFILE_KEPT + "compensation:\n  target_range: 80-90k\n").encode("utf-8")
+        real = _batch_common._redact_profile_yml_lines
+
+        def redact_while_the_wizard_saves(text):
+            path.write_bytes(newer)
+            return real(text)
+        monkeypatch.setattr(_batch_common, "_redact_profile_yml_lines", redact_while_the_wizard_saves)
+        assert self._scrub(tmp_path) is False
+        assert path.read_bytes() == newer
+        lines = capsys.readouterr().out.splitlines()
+        assert len(lines) == 1, lines
+        assert str(path.resolve()) in lines[0] and "next run" in lines[0]
+
+    @pytest.mark.parametrize("section", [PROFILE_DISCLOSURES, "", "&vd " + PROFILE_DISCLOSURES],
+                             ids=["section", "none", "a key only PyYAML reads"])
+    def test_a_non_utf8_file_holding_the_section_is_named(self, tmp_path, capsys, section):
+        """Left as it is — its encoding would be a guess — but not silently,
+        when the section is in it."""
+        holds_section = bool(section)
+        if section.startswith("&"):
+            pytest.importorskip("yaml")
+        body = PROFILE_KEPT + section + self.TAIL
+        data = body.encode("cp1252")                    # "Montréal", one byte: not UTF-8
+        path = write_profile_yml(tmp_path / "career-ops", data)
+        assert self._scrub(tmp_path) is False
+        assert path.read_bytes() == data
+        lines = capsys.readouterr().out.splitlines()
+        if not holds_section:
+            assert lines == []
+            return
+        assert len(lines) == 1, lines
+        assert str(path.resolve()) in lines[0] and "by hand" in lines[0]
+        assert "UTF-8" in lines[0]
+
+    @pytest.mark.parametrize("repo_checkout", [True, False])
+    def test_only_the_repo_checkout_is_told_about_the_cloud_copy(
+            self, tmp_path, monkeypatch, capsys, repo_checkout):
+        """The Setup wizard encodes `<repo>/career-ops/config/profile.yml` into
+        PROFILE_YML_B64, so saving it refreshes the cloud copy of THAT file and
+        of no other CAREER_OPS_PATH checkout."""
+        co = tmp_path / "career-ops"
+        if repo_checkout:
+            monkeypatch.setattr(_batch_common, "REPO_CAREER_OPS", co)
+        write_profile_yml(co, self.FULL)
+        assert self._scrub(tmp_path) is True
+        line, = capsys.readouterr().out.splitlines()
+        assert ("PROFILE_YML_B64" in line) is repo_checkout
+        assert ("Setup wizard" in line) is repo_checkout
+
+    def test_leftover_prompts_are_not_its_business(self, tmp_path):
+        """The sweep is scrub_profile_yml_files' (TestScrubEveryCheckout), so
+        True means exactly "profile.yml was rewritten"."""
+        leftover = write_leftover_prompt(tmp_path / "career-ops" / "batch",
+                                         ".resolved-prompt-1.md")
+        assert self._scrub(tmp_path) is False
+        assert leftover.exists()
+
+
+def _sed_indent(data: bytes) -> bytes:
+    """What batch-runner.sh's `sed 's/^/    /'` makes of `data`: four spaces
+    before every line, a line being whatever ends at a 0x0A byte, whatever the
+    file's encoding."""
+    *lines, tail = data.split(b"\n")
+    return b"".join(b"    " + line + b"\n" for line in lines) + (b"    " + tail if tail else b"")
+
+
+class TestLeftoverResolvedPrompts:
+    """`_remove_leftover_resolved_prompts` deletes the worker prompts an
+    interrupted --batch run left behind (#227): each holds a copy of
+    profile.yml taken before any scrub, in the folder career-ops' agents read.
+    Deleted only when it carries the section, and only while no runner holds
+    batch/batch-runner.pid.
+    """
+
+    HEAD = ("You are a batch worker.\n\n---\n\n"
+            "## Runtime personalization: config/profile.yml\n\n")
+    KEPT = HEAD + textwrap.indent(PROFILE_KEPT, "    ")
+    FULL = HEAD + textwrap.indent(PROFILE_KEPT + PROFILE_DISCLOSURES, "    ")
+
+    @staticmethod
+    def _sweep(tmp_path) -> int:
+        return _batch_common._remove_leftover_resolved_prompts(tmp_path / "career-ops")
+
+    @pytest.fixture
+    def batch(self, tmp_path) -> Path:
+        batch = tmp_path / "career-ops" / "batch"
+        batch.mkdir(parents=True)
+        return batch
+
+    def test_a_leftover_with_the_section_is_removed(self, tmp_path, batch):
+        gone = write_leftover_prompt(batch, ".resolved-prompt-7.md", self.FULL)
+        # Only the runner's leftovers are touched, whatever else holds the key.
+        other = write_leftover_prompt(batch, "batch-prompt.md", self.FULL)
+        assert self._sweep(tmp_path) == 1
+        assert not gone.exists()
+        assert other.exists()
+
+    @pytest.mark.parametrize("key_line", [
+        "voluntary_disclosures:\n",               # pasted at column 0
+        '    "voluntary_disclosures":\n',         # quoted, as YAML allows
+        "    \ufeffvoluntary_disclosures:\n",     # sed indents ahead of a BOM
+        "\tvoluntary_disclosures :\n",
+    ])
+    def test_the_key_line_matches_at_any_indentation(self, tmp_path, batch, key_line):
+        gone = write_leftover_prompt(batch, ".resolved-prompt-1.md",
+                                     self.KEPT + key_line + "      gender: Female\n")
+        assert self._sweep(tmp_path) == 1
+        assert not gone.exists()
+
+    @pytest.mark.parametrize("eol", ["\n", "\r\n"])
+    @pytest.mark.parametrize("key, is_key", [
+        ("voluntary_disclosures", True),
+        ('"voluntary_disclosures"', True),
+        ("'voluntary_disclosures'", True),
+        ("voluntary_disclosures  ", True),
+        ("voluntary_disclosures_note", False),
+        ("my_voluntary_disclosures", False),
+    ])
+    def test_one_key_rule_for_the_file_and_the_paste(self, tmp_path, batch, key, is_key, eol):
+        """The sweep reads the key line by the scrub's own line read's pattern,
+        so a leftover goes exactly when the scrub would drop its section."""
+        profile = f"candidate:{eol}  a: 1{eol}{key}:{eol}  gender: Female{eol}"
+        leftover = write_leftover_prompt(batch, ".resolved-prompt-1.md",
+                                         textwrap.indent(profile, "    "))
+        self._sweep(tmp_path)
+        assert ("gender" not in _batch_common._redact_profile_yml_lines(profile)) is is_key
+        assert leftover.exists() is not is_key
+
+    def test_kept_while_a_runner_holds_the_lock(self, tmp_path, batch, monkeypatch, capsys):
+        """A live runner's prompt is its worker's system prompt — and with the
+        lock held, nothing is read at all."""
+        (batch / "batch-runner.pid").write_text("4242\n", encoding="utf-8")
+        kept = write_leftover_prompt(batch, ".resolved-prompt-7.md", self.FULL)
+        read = []
+        real = Path.read_bytes
+        monkeypatch.setattr(Path, "read_bytes", lambda self: read.append(self) or real(self))
+        assert self._sweep(tmp_path) == 0
+        assert kept.exists()
+        assert read == []
+        assert capsys.readouterr().out == ""
+
+    def test_the_lock_is_rechecked_before_every_unlink(self, tmp_path, batch, monkeypatch):
+        first = write_leftover_prompt(batch, ".resolved-prompt-1.md", self.FULL)
+        second = write_leftover_prompt(batch, ".resolved-prompt-2.md", self.FULL)
+        real = Path.unlink
+
+        def unlink_then_a_runner_starts(self, *a, **k):
+            real(self, *a, **k)
+            (batch / "batch-runner.pid").write_text("4242\n", encoding="utf-8")
+        monkeypatch.setattr(Path, "unlink", unlink_then_a_runner_starts)
+        assert self._sweep(tmp_path) == 1
+        assert not first.exists()
+        assert second.exists()
+
+    @pytest.mark.parametrize("prefix", ["# ", "#"])
+    def test_a_pasted_commented_out_section_is_removed(self, tmp_path, batch, prefix):
+        """A commented-out section is the section to an agent reading the
+        prompt, and the scrub drops it from the file (TestScrubProfileYmlFile)."""
+        profile = PROFILE_KEPT + textwrap.indent(PROFILE_DISCLOSURES, prefix)
+        gone = write_leftover_prompt(batch, ".resolved-prompt-1.md",
+                                     self.HEAD + textwrap.indent(profile, "    "))
+        assert not (batch / "batch-runner.pid").exists()
+        assert self._sweep(tmp_path) == 1
+        assert not gone.exists()
+
+    @pytest.mark.parametrize("encoding", ["utf-16", "utf-16-le", "utf-16-be", "utf-32"])
+    @pytest.mark.parametrize("profile", [
+        PROFILE_KEPT + PROFILE_DISCLOSURES,
+        PROFILE_DISCLOSURES + "candidate:\n  full_name: Jane Roe\n",   # the BOM, then the key
+    ], ids=["section", "section first"])
+    def test_a_utf16_or_utf32_paste_is_removed(self, tmp_path, batch, encoding, profile):
+        """batch-runner.sh pastes the profile's bytes as they are, sed's four
+        spaces before each line, into a UTF-8 prompt: read with the NULs in, a
+        UTF-16 or UTF-32 profile never showed the key."""
+        def paste(text):
+            return self.HEAD.encode("utf-8") + _sed_indent(
+                text.replace("\n", "\r\n").encode(encoding))
+        gone = write_leftover_prompt(batch, ".resolved-prompt-1.md", paste(profile))
+        kept = write_leftover_prompt(batch, ".resolved-prompt-2.md", paste(PROFILE_KEPT))
+        assert self._sweep(tmp_path) == 1
+        assert not gone.exists()
+        assert kept.exists()
+
+    @pytest.mark.parametrize("text", [
+        KEPT,
+        # The word in prose is not the key: it starts no line.
+        KEPT + "Never fill a voluntary_disclosures: section.\n",
+        KEPT + "    voluntary_disclosures_note: none\n",
+        # Nor in a comment, unless the comment is the key.
+        KEPT + "    # voluntary disclosures are no longer asked for\n",
+        KEPT + "    # voluntary_disclosures_note: none\n",
+    ])
+    def test_a_leftover_without_the_section_is_kept(self, tmp_path, batch, text):
+        kept = write_leftover_prompt(batch, ".resolved-prompt-7.md", text)
+        assert self._sweep(tmp_path) == 0
+        assert kept.read_text(encoding="utf-8") == text
+
+    def test_unreadable_and_undecodable_leftovers_do_not_raise(self, tmp_path, batch, monkeypatch):
+        """One file that cannot be read, or unlinked, must not stop the rest."""
+        undecodable = write_leftover_prompt(batch, ".resolved-prompt-1.md", b"\xff\xfe\x00 no key here\n")
+        bad_bytes = write_leftover_prompt(batch, ".resolved-prompt-2.md",
+                                          b"\xff\xfe\n" + self.FULL.encode("utf-8"))
+        unreadable = write_leftover_prompt(batch, ".resolved-prompt-3.md", self.FULL)
+        stuck = write_leftover_prompt(batch, ".resolved-prompt-4.md", self.FULL)
+        (batch / ".resolved-prompt-5.md").mkdir()     # not a file at all
+        gone = write_leftover_prompt(batch, ".resolved-prompt-6.md", self.FULL)
+        real_read, real_unlink = Path.read_bytes, Path.unlink
+
+        def read_bytes(self):
+            if self.name == unreadable.name:
+                raise PermissionError("denied")
+            return real_read(self)
+
+        def unlink(self, *a, **k):
+            if self.name == stuck.name:
+                raise OSError("busy")
+            return real_unlink(self, *a, **k)
+        monkeypatch.setattr(Path, "read_bytes", read_bytes)
+        monkeypatch.setattr(Path, "unlink", unlink)
+        assert self._sweep(tmp_path) == 2
+        assert undecodable.exists() and unreadable.exists() and stuck.exists()
+        assert (batch / ".resolved-prompt-5.md").is_dir()
+        assert not bad_bytes.exists()      # the section is still readable round them
+        assert not gone.exists()
+
+    def test_one_line_only_when_something_was_removed(self, tmp_path, batch, capsys):
+        write_leftover_prompt(batch, ".resolved-prompt-1.md", self.FULL)
+        write_leftover_prompt(batch, ".resolved-prompt-2.md", self.FULL)
+        write_leftover_prompt(batch, ".resolved-prompt-3.md", self.KEPT)
+        assert self._sweep(tmp_path) == 2
+        lines = capsys.readouterr().out.splitlines()
+        assert len(lines) == 1, lines
+        assert "removed 2 " in lines[0]
+        for needed in ("#227", str(batch), "voluntary_disclosures"):
+            assert needed in lines[0], needed
+        assert self._sweep(tmp_path) == 0           # the clean one is all that is left
+        assert capsys.readouterr().out == ""
+
+    def test_nothing_is_created_when_batch_is_absent(self, tmp_path, capsys):
+        co = tmp_path / "career-ops"
+        (co / "config").mkdir(parents=True)
+        assert self._sweep(tmp_path) == 0
+        assert sorted(p.name for p in co.iterdir()) == ["config"]
+        assert capsys.readouterr().out == ""
+
+
+class TestScrubEveryCheckout:
+    """`scrub_profile_yml_files` sweeps the leftover worker prompts and scrubs
+    profile.yml in CAREER_OPS_PATH's checkout AND `<repo>/career-ops` (#227):
+    run.sh/run.ps1 always start the runner in the repo's own, and a CLI skill's
+    `cd career-ops` is run from the repo root, whatever CAREER_OPS_PATH names.
+    One directory under two spellings is one scrub. `REPO_CAREER_OPS` is
+    conftest's tmp checkout unless a test points it at the first one."""
+
+    def test_both_checkouts_are_swept_and_scrubbed(self, tmp_path, capsys):
+        data_root, repo = tmp_path / "data-root", _batch_common.REPO_CAREER_OPS
+        elsewhere, ours = write_profile_yml(data_root), write_profile_yml(repo)
+        leftovers = [write_leftover_prompt(co / "batch", ".resolved-prompt-1.md")
+                     for co in (data_root, repo)]
+        assert _batch_common.scrub_profile_yml_files(data_root) == 2
+        assert elsewhere.read_text(encoding="utf-8") == PROFILE_KEPT
+        assert ours.read_text(encoding="utf-8") == PROFILE_KEPT
+        assert not any(p.exists() for p in leftovers)
+        out = capsys.readouterr().out
+        assert len(out.splitlines()) == 4, out       # per checkout: a sweep, a profile
+        assert str(elsewhere.resolve()) in out and str(ours.resolve()) in out
+
+    @pytest.mark.parametrize("spelling", [
+        lambda co: co,
+        lambda co: co.parent / "elsewhere" / ".." / co.name,
+    ])
+    def test_one_checkout_is_scrubbed_once(self, tmp_path, monkeypatch, capsys, spelling):
+        """Under the caller's spelling, not the resolved one: the sweep's line
+        names the folder as CAREER_OPS_PATH gave it."""
+        co = tmp_path / "career-ops"
+        (tmp_path / "elsewhere").mkdir()
+        monkeypatch.setattr(_batch_common, "REPO_CAREER_OPS", co)
+        path = write_profile_yml(co)
+        leftover = write_leftover_prompt(co / "batch", ".resolved-prompt-1.md")
+        calls = []
+        real = _batch_common.scrub_profile_yml_file
+        monkeypatch.setattr(_batch_common, "scrub_profile_yml_file",
+                            lambda c: calls.append(c) or real(c))
+        assert _batch_common.scrub_profile_yml_files(spelling(co)) == 1
+        assert calls == [spelling(co)]
+        assert path.read_text(encoding="utf-8") == PROFILE_KEPT
+        assert not leftover.exists()
+        sweep, scrub = capsys.readouterr().out.splitlines()
+        assert f"from {spelling(co) / 'batch'}:" in sweep
+        assert str(path.resolve()) in scrub
+
+    def test_a_bad_checkout_costs_only_itself(self):
+        path = write_profile_yml(_batch_common.REPO_CAREER_OPS)
+        assert _batch_common.scrub_profile_yml_files(None) == 1
+        assert path.read_text(encoding="utf-8") == PROFILE_KEPT
 
 
 class TestGeographyRuleInThePrompt:

@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import textwrap
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -144,6 +145,49 @@ def evaluate_without_a_provider(monkeypatch) -> None:
         return True, meta["id"], None, False   # (success, id, error, countable)
 
     monkeypatch.setattr(batch_evaluate, "_process_one", process)
+
+
+# A profile.yml written before #227: what the scrub keeps, and the self-ID
+# section it removes. Invented values, non-ASCII on purpose.
+PROFILE_KEPT = (
+    "# career-ops profile — edited by hand\n"
+    "candidate:\n"
+    "  full_name: Jane Roe\n"
+    "  location: Montréal, QC\n"
+)
+PROFILE_DISCLOSURES = (
+    "voluntary_disclosures:\n"
+    "  gender: Female\n"
+    "  race_ethnicity: Hispanic or Latino\n"
+    "  veteran_status: I am a protected veteran\n"
+    "  disability_status: Yes, I have a disability\n"
+    "  data_processing_consent: true\n"
+    "  save_answers: false\n"
+    "  share_answers: false\n"
+)
+
+
+def write_profile_yml(co: Path, text: str | bytes = PROFILE_KEPT + PROFILE_DISCLOSURES) -> Path:
+    """`co`/config/profile.yml holding exactly `text` — written as bytes (a str
+    as UTF-8), so no platform newline translation gets between a test and the
+    bytes it asserts on."""
+    path = Path(co) / "config" / "profile.yml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(text.encode("utf-8") if isinstance(text, str) else text)
+    return path
+
+
+def write_leftover_prompt(batch: Path, name: str, text: str | bytes | None = None) -> Path:
+    """`batch`/`name`, a worker prompt an interrupted --batch run left behind.
+    By default it holds profile.yml pasted as batch-runner.sh pastes it:
+    under its heading, every line indented four spaces."""
+    if text is None:
+        text = ("## Runtime personalization: config/profile.yml\n\n"
+                + textwrap.indent(PROFILE_KEPT + PROFILE_DISCLOSURES, "    "))
+    path = Path(batch) / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(text.encode("utf-8") if isinstance(text, str) else text)
+    return path
 
 
 # Synthetic resume used by filter tests. Includes a Skills section so
@@ -349,6 +393,39 @@ def _isolate_state_sync(monkeypatch, tmp_path):
     monkeypatch.setattr(state_sync, "UI_CACHE", tmp_path / ".ui-cache" / "latest")
     monkeypatch.setattr(state_sync, "PUSHED_OVERRIDES_FILE",
                         tmp_path / ".ui-cache" / "pushed-overrides.json")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_repo_career_ops(monkeypatch, tmp_path):
+    """Point the #227 scrub's fixed checkout at tmp, for EVERY test.
+    orchestrate.main() and the UI's two CLI-skill routes scrub `<repo>/career-ops`
+    besides CAREER_OPS_PATH's checkout — rewriting its profile.yml, deleting its
+    leftover --batch worker prompts — and neither the orchestrate tests nor the
+    UI client fixtures (which reload server.py) redirect a repo root, so a test
+    reaching one unpatched would edit the developer's real career-ops/. On the
+    module that owns the path, as with state_sync above. Nothing creates this
+    directory: the scrub finds nothing there unless a test puts it there."""
+    from pipeline import _batch_common
+    monkeypatch.setattr(_batch_common, "REPO_CAREER_OPS",
+                        tmp_path / "_repo-root" / "career-ops")
+
+
+@pytest.fixture(autouse=True)
+def _keep_sidecar_rewrites_in_tmp(monkeypatch, tmp_path_factory):
+    """onboard.load_sidecar rewrites a wizard sidecar that still holds #227's
+    retired fields, and the UI's onboard-status route reads the one under
+    server.ROOT — which the UI client fixtures leave at the real repo — so a
+    status test run on a developer's own checkout would rewrite their
+    `.ui-cache/onboarding.json`. In a test, only a sidecar under pytest's temp
+    root is rewritten."""
+    from pipeline.app import onboard
+    base = tmp_path_factory.getbasetemp().resolve()
+    real = onboard._drop_retired_fields
+
+    def under_tmp_only(sidecar, *args):
+        if base in Path(sidecar).resolve().parents:
+            real(sidecar, *args)
+    monkeypatch.setattr(onboard, "_drop_retired_fields", under_tmp_only)
 
 
 @pytest.fixture(autouse=True)

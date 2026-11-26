@@ -12,10 +12,12 @@ import base64
 import json
 import os
 import re
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
 
+from pipeline._batch_common import atomic_write_text
 from pipeline.batch_evaluate import _PROVIDER_KEYS
 from pipeline.daily_digest import SECRET_VARS as _DIGEST_SECRET_VARS
 # Borrowed from handoff, which reads the same career-ops/config/profile.yml for
@@ -89,6 +91,19 @@ SIDECAR_KEEPABLE_DIGEST_FIELDS = frozenset({
 # keep-list above is listed.
 SECRET_FORM_FIELDS = frozenset({"api_key", "digest_discord_webhook", "digest_smtp_pass"})
 
+# Form fields the wizard no longer has (#227): the four self-identification
+# answers and the three site-consent toggles that sat beside them. Dropped from
+# the sidecar with the secrets, because a browser tab opened before the upgrade
+# still submits them, and the sidecar is the one place they would survive the
+# Save that removes them from profile.yml — and dropped again when it is READ
+# (load_sidecar), since one written before the upgrade still holds them, which
+# is also when such a sidecar is rewritten without them.
+RETIRED_FORM_FIELDS = frozenset({
+    "eeo_gender", "eeo_race", "eeo_veteran", "eeo_disability",
+    "data_processing_consent", "save_answers", "share_answers",
+})
+_SIDECAR_DROPPED_FIELDS = SECRET_FORM_FIELDS | RETIRED_FORM_FIELDS
+
 # Generated file -> secret name. The first four are required by the workflow;
 # PROFILE_MD_B64 is optional but always generated, so we include it.
 # ARTICLE_DIGEST_B64 is optional AND only produced when the (best-effort,
@@ -133,13 +148,13 @@ _SCRIPT = Path(__file__).resolve().parent.parent.parent / "setup-profile.mjs"
 
 def save_sidecar(root: Path, payload: dict) -> None:
     """Persist the last-submitted onboarding form (minus every field in
-    SECRET_FORM_FIELDS) so the wizard can prefill on its next visit. Never
-    raises — sidecar persistence is a UX nicety; failures shouldn't fail the
-    onboarding submission."""
+    SECRET_FORM_FIELDS and RETIRED_FORM_FIELDS) so the wizard can prefill on its
+    next visit. Never raises — sidecar persistence is a UX nicety; failures
+    shouldn't fail the onboarding submission."""
     sidecar = root / _SIDECAR_NAME
     try:
         sidecar.parent.mkdir(parents=True, exist_ok=True)
-        snapshot = {k: v for k, v in payload.items() if k not in SECRET_FORM_FIELDS}
+        snapshot = {k: v for k, v in payload.items() if k not in _SIDECAR_DROPPED_FIELDS}
         sidecar.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
     except OSError:
         pass
@@ -147,14 +162,43 @@ def save_sidecar(root: Path, payload: dict) -> None:
 
 def load_sidecar(root: Path) -> dict | None:
     """Return the saved onboarding payload, or None if there isn't one yet
-    or the file is unreadable. Read-only — the wizard uses it for prefill."""
+    or the file is unreadable. The wizard uses it for prefill.
+
+    RETIRED_FORM_FIELDS are dropped from it, and a sidecar saved before #227
+    that still holds any is rewritten without them (`_drop_retired_fields`),
+    since otherwise the answers stay on disk until the next Save."""
     sidecar = root / _SIDECAR_NAME
     if not sidecar.exists():
         return None
     try:
-        return json.loads(sidecar.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        raw = sidecar.read_bytes()
+        saved = json.loads(raw.decode("utf-8"))
+    except (ValueError, OSError):       # bad JSON, bad UTF-8, unreadable
         return None
+    if not isinstance(saved, dict):
+        return None
+    kept = {k: v for k, v in saved.items() if k not in RETIRED_FORM_FIELDS}
+    if len(kept) != len(saved):
+        _drop_retired_fields(sidecar, raw, kept)
+    return kept
+
+
+def _drop_retired_fields(sidecar: Path, raw: bytes, kept: dict) -> None:
+    """Rewrite `sidecar`, read as `raw`, as `kept` (#227): atomically, in
+    save_sidecar's format and with the file's own permission bits, and only if
+    nothing has written it since it was read — a Save landing in between wrote
+    no retired field, and the older text must not replace it. Resolved first,
+    as `scrub_profile_yml_file` is: replacing a symlinked sidecar's link left
+    the answers in the file it pointed at. Never raises: a sidecar left as it
+    was is the next read's to retry."""
+    try:
+        target = sidecar.resolve()
+        mode = stat.S_IMODE(target.stat().st_mode)
+        if target.read_bytes() != raw:
+            return
+        atomic_write_text(target, json.dumps(kept, indent=2), mode=mode)
+    except Exception:
+        pass
 
 
 # ── what this copy is actually configured with ─────────────────────────────
@@ -202,7 +246,7 @@ def _put(out: dict, key: str, value) -> None:
         out[key] = text
 
 
-# form field -> profile.yml key, per section. A table rather than 22 near-identical
+# form field -> profile.yml key, per section. A table rather than 20 near-identical
 # _put lines so this can be read in one screen against build_onboarding_json above,
 # which is the same mapping in the other direction. Only the pairs whose value is
 # free text live here; target_roles and the booleans need their own handling below.
@@ -218,9 +262,6 @@ _PROFILE_TEXT_FIELDS = {
                            "work_permit_type": "work_permit_type",
                            "work_auth_regions": "legally_authorized_to_work_in",
                            "eligible_countries": "eligible_countries"},
-    "voluntary_disclosures": {"eeo_gender": "gender", "eeo_race": "race_ethnicity",
-                              "eeo_veteran": "veteran_status",
-                              "eeo_disability": "disability_status"},
     # The Narrative step's two prose answers now reach profile.yml (#161), so
     # they read back like every other field; the rest of that step (deal-
     # breakers, flexibility, portfolio) is rendered only into _profile.md and
@@ -231,9 +272,6 @@ _PROFILE_TEXT_FIELDS = {
 # form field -> (section, profile.yml key) for the yes/no answers.
 _PROFILE_BOOL_FIELDS = {
     "requires_sponsorship": ("work_authorization", "requires_sponsorship"),
-    "data_processing_consent": ("voluntary_disclosures", "data_processing_consent"),
-    "save_answers": ("voluntary_disclosures", "save_answers"),
-    "share_answers": ("voluntary_disclosures", "share_answers"),
 }
 
 
@@ -260,8 +298,8 @@ def derive_from_profile(profile: dict) -> dict:
 
     # Booleans, where BOTH values are answers — so they're keyed on the key being
     # present rather than on the value being non-blank, and serialized the way the
-    # form does ("yes"/"no" selects and consent checkboxes). Read through handoff's
-    # _as_bool, which already owns what a yes/no in THIS file means: a quoted
+    # form does (a "yes"/"no" select). Read through handoff's _as_bool, which
+    # already owns what a yes/no in THIS file means: a quoted
     # `requires_sponsorship: "false"` is a truthy Python string, so plain
     # truthiness would prefill "yes" and the next Save would write that inversion
     # back. A value it can't read at all is left to the sidecar rather than guessed.
@@ -600,17 +638,6 @@ def build_onboarding_json(form: dict, resume_text: str) -> dict:
             "requiresSponsorship": str(form.get("requires_sponsorship") or "").lower() == "yes",
             "workPermitType": form.get("work_permit_type") or "",
             "eligibleCountries": _split_csv(form.get("eligible_countries")),
-            # Voluntary EEO self-identification — blank = decline on every form.
-            "eeoGender": form.get("eeo_gender") or "",
-            "eeoRace": form.get("eeo_race") or "",
-            "eeoVeteran": form.get("eeo_veteran") or "",
-            "eeoDisability": form.get("eeo_disability") or "",
-            # Voluntary self-ID (EEO) consent prefs — platform-agnostic. The
-            # data-processing consent some forms require to submit defaults agree;
-            # saving/sharing answers default off.
-            "eeoConsent": str(form.get("data_processing_consent", "yes")).strip().lower() != "no",
-            "eeoSaveAnswers": str(form.get("save_answers", "")).strip().lower() == "yes",
-            "eeoShareAnswers": str(form.get("share_answers", "")).strip().lower() == "yes",
         },
         "criteria": {
             "targetRoles": _split_csv(form.get("target_roles")),

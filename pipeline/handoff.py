@@ -1758,9 +1758,10 @@ def _profile_standing_answers(profile: dict) -> list[str]:
         # authoritative candidate profile for evaluation (resolve_profile_md ->
         # eval_system_prompt) — so a value seeded here reaches the model that
         # SCORES the candidate, which is the one place a protected
-        # characteristic must never appear. profile.yml still holds whatever the
-        # wizard was told (the person's own record); _batch_common redacts it out
-        # of every prompt, and the agent is told what to do at the form instead.
+        # characteristic must never appear. Setup no longer writes any into
+        # profile.yml either, and the scrub removes a section an older setup
+        # wrote (#227; see _batch_common.scrub_profile_yml_file). The agent is
+        # told what to do at the form instead.
         "- **Self-identification (gender, race/ethnicity, veteran, disability):** "
         "decline or choose \u201cprefer not to answer\u201d wherever the form offers it. "
         "These are not recorded in this file on purpose. If a form REQUIRES a value, "

@@ -46,6 +46,7 @@ from pipeline._batch_common import (
     max_report_num,
     max_tracker_num,
     read_text,
+    scrub_profile_yml_files,
     tail_text,
     write_job_result,
     run_merge_tracker,
@@ -885,6 +886,26 @@ def _find_role(num: str) -> dict | None:
     return None
 
 
+def _skill_role(num: str) -> tuple[str, str, Path | None]:
+    """(company, title, report file) of triaged role `num` for a skill, or a
+    404. The report resolves to an absolute path from the *active* data dir —
+    it may live in a Refresh artifact cache, not under career-ops/reports/."""
+    role = _find_role(num)
+    if role is None:
+        raise HTTPException(status_code=404, detail=f"No triaged role #{num}.")
+    report_file = data.find_report_file(_career_ops() / "reports", role.get("report_num", ""))
+    return role.get("company") or "company", role.get("role") or "role", report_file
+
+
+def _cli_skill_command(skill: str, company: str, title: str, report_file: Path | None) -> str:
+    """The hand-off command both CLI routes return, built server-side. Every CLI
+    skill runs under career-ops' skill router, which tells the agent to read
+    profile.yml whole, so the file is scrubbed first (#227; see
+    _batch_common.scrub_profile_yml_file)."""
+    scrub_profile_yml_files(_career_ops_local())
+    return skills.skill_command(skill, report_file, company, title)
+
+
 @app.get("/api/capabilities")
 def capabilities() -> JSONResponse:
     """Report which skill execution paths are available (agent CLI / API key),
@@ -910,14 +931,7 @@ def run_skill(req: SkillRequest) -> JSONResponse:
     spec = skills.SKILLS.get(req.skill)
     if spec is None:
         raise HTTPException(status_code=404, detail=f"Unknown skill {req.skill!r}.")
-    role = _find_role(req.num)
-    if role is None:
-        raise HTTPException(status_code=404, detail=f"No triaged role #{req.num}.")
-    company = role.get("company") or "company"
-    title = role.get("role") or "role"
-    # Resolve the report to an absolute path from the *active* data dir — it may
-    # live in a Refresh artifact cache, not under career-ops/reports/.
-    report_file = data.find_report_file(_career_ops() / "reports", role.get("report_num", ""))
+    company, title, report_file = _skill_role(req.num)
 
     if req.path == "cli":
         if not skills.cli_available():
@@ -929,7 +943,7 @@ def run_skill(req: SkillRequest) -> JSONResponse:
             )
         return JSONResponse({
             "ok": True, "path": "cli",
-            "command": skills.skill_command(req.skill, report_file, company, title),
+            "command": _cli_skill_command(req.skill, company, title, report_file),
             "cwd": "career-ops",
             # Through skill_prereqs, not spec["prereqs"]: the Playwright-MCP
             # note is expanded for the CLI resolved on THIS request.
@@ -995,13 +1009,7 @@ def launch_skill(req: SkillLaunchRequest) -> JSONResponse:
             detail=f"No agent CLI found (looked for '{skills.cli_name()}'). "
                    "Install one or set BATCH_CLI.",
         )
-    role = _find_role(req.num)
-    if role is None:
-        raise HTTPException(status_code=404, detail=f"No triaged role #{req.num}.")
-    company = role.get("company") or "company"
-    title = role.get("role") or "role"
-    report_file = data.find_report_file(_career_ops() / "reports", role.get("report_num", ""))
-    command = skills.skill_command(req.skill, report_file, company, title)
+    command = _cli_skill_command(req.skill, *_skill_role(req.num))
     # Launch from the repo root so the `cd career-ops` at the start of the
     # command resolves consistently regardless of where the UI was launched.
     try:

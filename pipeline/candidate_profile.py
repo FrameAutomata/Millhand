@@ -2,9 +2,10 @@
 
 Loads the contact fields of `career-ops/config/profile.yml` into a small typed
 struct for resume tailoring and cover letters (the only remaining consumers).
-profile.yml itself stays rich — onboarding writes the full work-auth/EEO/
+profile.yml itself stays rich — onboarding writes the full work-auth/
 compensation model there for career-ops and the user's browser agent to read
-directly; this loader deliberately mirrors only what pipeline code consumes."""
+directly (no self-identification answers: #227); this loader deliberately
+mirrors only what pipeline code consumes."""
 
 from __future__ import annotations
 

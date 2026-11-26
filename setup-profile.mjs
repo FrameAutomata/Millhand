@@ -527,18 +527,6 @@ async function promptForInfo(parsed, autoMode) {
     }
   }
 
-  // Voluntary EEO / self-identification — captured once so the auto-apply engine
-  // answers demographic questions deterministically. Every field is optional;
-  // blank means "prefer not to say" (the default behavior on every form).
-  if (!autoMode && info.eeoGender === undefined) {
-    console.log('\n📋 Voluntary self-identification (optional — press enter to decline any)');
-    console.log('   Used to auto-answer EEO questions. Blank = "prefer not to say".');
-    info.eeoGender = await prompt('Gender (e.g. "Male", "Female", "Non-binary"): ');
-    info.eeoRace = await prompt('Race / ethnicity (e.g. "Asian", "Hispanic or Latino", "White"): ');
-    info.eeoVeteran = await prompt('Veteran status (e.g. "I am not a protected veteran"): ');
-    info.eeoDisability = await prompt('Disability status (e.g. "No, I do not have a disability"): ');
-  }
-
   return info;
 }
 
@@ -1262,18 +1250,8 @@ function generateProfile(info, criteria, narrative) {
       eligible_countries: eligibleCountries,
       eligible_for_remote: info.eligibleForRemote !== false,
     },
-    voluntary_disclosures: {
-      gender: info.eeoGender || '',
-      race_ethnicity: info.eeoRace || '',
-      veteran_status: info.eeoVeteran || '',
-      disability_status: info.eeoDisability || '',
-      // Voluntary self-ID (EEO) consent prefs — platform-agnostic. The data-
-      // processing consent some apply forms require to submit defaults agree;
-      // saving/sharing answers default off.
-      data_processing_consent: info.eeoConsent !== false,
-      save_answers: info.eeoSaveAnswers === true,
-      share_answers: info.eeoShareAnswers === true,
-    },
+    // No self-identification section: career-ops' agents read this file whole
+    // (#227; see _batch_common.scrub_profile_yml_file).
     cv: {
       output_format: 'html',
     },

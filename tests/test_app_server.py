@@ -14,6 +14,8 @@ from pipeline import agent_cli, state_sync
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
+from tests.test_app_onboard import RETIRED_FORM_VALUES  # noqa: E402
+
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
@@ -851,7 +853,8 @@ def test_onboard_load_config_has_resume_honours_resume_path(
 
 def test_onboard_load_config_returns_saved_payload(client, tmp_path, mocker, monkeypatch):
     # After a successful onboard, the sidecar is written and load returns it
-    # so the wizard can prefill. has_resume reflects the persisted PDF —
+    # so the wizard can prefill — minus the self-ID fields a sidecar saved
+    # before #227 still carries. has_resume reflects the persisted PDF —
     # RESUME_PATH is cleared because it outranks the probe and a developer's own
     # .env would otherwise decide the answer.
     from pipeline.app import server
@@ -860,7 +863,8 @@ def test_onboard_load_config_returns_saved_payload(client, tmp_path, mocker, mon
     mocker.patch.object(server, "ROOT", tmp_path)
     (tmp_path / ".ui-cache").mkdir()
     (tmp_path / ".ui-cache" / "onboarding.json").write_text(
-        _json.dumps({"name": "Jane", "results_wanted": 5, "sites": ["indeed"]}),
+        _json.dumps({"name": "Jane", "results_wanted": 5, "sites": ["indeed"],
+                     **RETIRED_FORM_VALUES}),
         encoding="utf-8",
     )
     (tmp_path / "resumes").mkdir()
@@ -1720,3 +1724,29 @@ class TestAddJobIncompleteEvaluation:
                                                         "evaluation (26-char reason withheld)"}
         assert written() == (["001-acme.md"], [])
         assert merges == []
+
+
+class TestCliSkillsScrubTheProfile:
+    """Both routes that hand out a CLI-skill command scrub profile.yml first
+    (#227; the scrub's own contract is tests/test_batch_common.py::
+    TestScrubEveryCheckout): once, before the command is built, for the
+    CAREER_OPS_PATH checkout."""
+
+    @pytest.mark.parametrize("route", ["run", "launch"])
+    def test_each_route_scrubs_before_building_the_command(self, client, tmp_path,
+                                                           monkeypatch, route):
+        from pipeline.app import server
+        events = []
+        monkeypatch.setattr(server, "scrub_profile_yml_files",
+                            lambda co: events.append(("scrub", co)))
+        monkeypatch.setattr(server.skills, "skill_command",
+                            lambda *a, **k: events.append("command") or "true")
+        monkeypatch.setattr(server.skills, "cli_available", lambda: True)
+        monkeypatch.setattr(server.skills, "terminal_available", lambda: True)
+        monkeypatch.setattr(server.skills, "launch_in_terminal", lambda command, cwd: {})
+        if route == "run":
+            r = client.post("/api/skills/run", json={"skill": "apply", "num": "1", "path": "cli"})
+        else:
+            r = client.post("/api/skills/launch", json={"skill": "apply", "num": "1"})
+        assert r.status_code == 200, r.text
+        assert events == [("scrub", tmp_path / "career-ops"), "command"]
