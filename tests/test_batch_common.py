@@ -1673,6 +1673,81 @@ class TestHeadedAdditionDetection:
         assert row["num"] == _tracker_row().split("\t")[0]
 
 
+class TestCorporateFormMatch:
+    """`companies_match_ignoring_corporate_form` is a port of career-ops'
+    `companiesMatchIgnoringCorporateForm`, which merge-tracker's fuzzy tier
+    folds on (#272). These cases follow the rules upstream documents for it;
+    the contract tests hold the port to the checkout's function itself, over a
+    generated set."""
+
+    @pytest.mark.parametrize("a,b", [
+        ("Acme Inc.", "Acme"),
+        ("Acme", "Acme Inc."),                       # either side may be the longer
+        ("Acme L.L.C.", "Acme"),                     # a dotted initialism, collapsed
+        ("Acme G.m.b.H. Holdings", "Acme"),          # …and only the single-letter run
+        ("Acme Holdings Inc.", "Acme"),              # a tail of several forms
+        ("Acme Group", "Acme"),                      # a generic descriptor
+        ("Abc Inc", "Abc"),                          # a stem of exactly MIN_STEM_CHARS
+        ("ACME Technologies, Inc.", "acme"),
+        ("Acme Holdings", "Acme Holdings Inc."),     # the stem may hold a form word
+        ("Société Générale S.A.", "Société Générale"),
+        ("Яндекс LLC", "Яндекс"),                    # any script's letters are a token
+        ("İstanbul Tekstil AS", "Istanbul Tekstil"),  # the dotted capital's dot dropped
+        ("Ａｃｍｅ Inc", "Acme"),                    # NFKC
+        # Two code points, four UTF-16 code units: upstream's floor counts the
+        # latter, so this stem clears it there and must clear it here.
+        ("\U00020000\U00020000 Inc", "\U00020000\U00020000"),
+    ])
+    def test_the_same_employer_under_another_form(self, a, b):
+        assert _batch_common.companies_match_ignoring_corporate_form(a, b) is True
+
+    @pytest.mark.parametrize("a,b", [
+        ("Meta", "Metaphor"),                        # a character prefix is not a token one
+        ("Acme Robotics", "Acme"),                   # a tail that is not a corporate form
+        ("Acme X Y", "Acme"),                        # a single-letter run that spells none
+        ("Acme Inc Robotics", "Acme"),
+        ("Inc Acme", "Acme"),                        # the stem must lead
+        ("Ab Inc", "Ab"),                            # a stem under MIN_STEM_CHARS
+        ("Acme Inc", "Acme Inc"),                    # equal length: the exact key's business
+        ("Acme Inc", "Acme Corp"),                   # …or a disagreement
+        ("Acme Solutions", "Acme Technologies"),     # what a stripped key would fold
+        ("Acme Inc.", "Acme Holdings Inc."),         # …and neither is the other's prefix
+        ("?", "Acme Inc"),                           # an empty stem: the blind employer
+        ("", "Inc"),
+        ("Яндекс ООО", "Яндекс"),                    # a Cyrillic form is not in the vocabulary
+        ("アクメ株式会社", "アクメ"),                  # no spaces, one token each
+    ])
+    def test_anything_else_is_another_employer(self, a, b):
+        assert _batch_common.companies_match_ignoring_corporate_form(a, b) is False
+
+
+class TestSameEmployer:
+    """`_same_employer` is merge-tracker's `companiesMatch`, the exact half the
+    loss guard compares every company by: the script-preserving key, and an
+    empty one only between literally equal cells. The contract tests hold it to
+    the checkout's own function."""
+
+    @pytest.mark.parametrize("a,b", [
+        ("Acme Corp", "ACME CORP."),
+        ("Acme Corp", "AcmeCorp"),                   # a key, not tokens
+        ("Яндекс", "ЯНДЕКС"),
+        ("?", "?"),
+        (" ? ", "?"),                                # trimmed
+        ("", ""),
+    ])
+    def test_the_same_company(self, a, b):
+        assert _batch_common._same_employer(a, b) is True
+
+    @pytest.mark.parametrize("a,b", [
+        ("?", ""),
+        ("?", "—"),
+        ("Яндекс", "アクメ"),                         # "" == "" by `normalize_company`
+        ("Acme", "Acme Inc."),                       # the corporate-form half's business
+    ])
+    def test_another_company(self, a, b):
+        assert _batch_common._same_employer(a, b) is False
+
+
 class TestLostAdditionGuard:
     """`run_merge_tracker`'s loss guard asks the filesystem "did this evaluation
     reach applications.md", because merge-tracker exits 0 on a row it refused —
@@ -1705,8 +1780,8 @@ class TestLostAdditionGuard:
         return career_ops, tracker_dir
 
     @staticmethod
-    def _row(company, role, report="229", score="4.7/5"):
-        return (f"| 10 | 2026-09-01 | {company} | {role} | {score} | Evaluated | ❌ "
+    def _row(company, role, report="229", score="4.7/5", num=10):
+        return (f"| {num} | 2026-09-01 | {company} | {role} | {score} | Evaluated | ❌ "
                 f"| [{report}](../reports/{report}-x-2026-09-01.md) | note |\n")
 
     def _run(self, career_ops, tracker_dir, capsys, merge_output="", archive=True):
@@ -1723,31 +1798,105 @@ class TestLostAdditionGuard:
                                             career_ops, merge_output)
         return capsys.readouterr().out, unapplied
 
-    def test_retitled_row_is_not_reported_lost(self, tmp_path, capsys):
+    @pytest.mark.parametrize("row_company,add_company", [
+        ("UT Southwestern Medical Center", "UT Southwestern Medical Center"),
+        ("Acme", "Acme Holdings Inc."),      # #272: the company re-spelled as well
+    ])
+    def test_retitled_row_is_not_reported_lost(self, tmp_path, capsys, row_company, add_company):
         """The #152 case: merged into an existing row on a fuzzy tier, which
-        keeps the row's own title. Report and company survive; the key doesn't."""
+        keeps the row's own title. Report and company survive; the key doesn't.
+        That tier also folds a corporate-form pair and keeps the row's spelling
+        (#272), which the report-number reading accepts, and says so."""
         career_ops, tracker_dir = self._setup(
-            tmp_path, self._row("UT Southwestern Medical Center", "INSURANCE SPECIALIST II"))
-        self._addition(tracker_dir, "123.tsv", "UT Southwestern Medical Center",
-                       "INSURANCE SPECIALIST I")
-        out, _ = self._run(career_ops, tracker_dir, capsys)
-        assert "WARNING" not in out
-        assert "123.tsv" in out
-        assert "INSURANCE SPECIALIST I" in out and "INSURANCE SPECIALIST II" in out
+            tmp_path, self._row(row_company, "INSURANCE SPECIALIST II"))
+        self._addition(tracker_dir, "123.tsv", add_company, "INSURANCE SPECIALIST I")
+        out, unapplied = self._run(career_ops, tracker_dir, capsys)
+        assert unapplied == 0 and "WARNING" not in out
+        assert (f'123.tsv: {add_company} — "INSURANCE SPECIALIST I" merged into '
+                '"INSURANCE SPECIALIST II" (report 229)') in out
+        respelled = (f'123.tsv: "{add_company}" merged into the row filed as '
+                     f'"{row_company}" (report 229)')
+        assert (respelled in out) is (row_company != add_company)
+
+    def test_a_corporate_form_fold_is_landed_and_names_both_spellings(self, tmp_path, capsys):
+        """The #272 case itself: "Acme Inc." folded onto a row filed as "Acme"
+        under the addition's own title, the report link written through. Only
+        the report-number reading finds it, and the note names both spellings
+        — the title did not change, so there is no retitle line."""
+        career_ops, tracker_dir = self._setup(tmp_path, self._row("Acme", "Platform Engineer"))
+        self._addition(tracker_dir, "7.tsv", "Acme Inc.", "Platform Engineer")
+        out, unapplied = self._run(career_ops, tracker_dir, capsys)
+        assert unapplied == 0 and "WARNING" not in out
+        assert '7.tsv: "Acme Inc." merged into the row filed as "Acme" (report 229)' in out
+        assert "kept its own role title" not in out
+
+    def test_the_report_reading_names_the_exact_row_before_a_corporate_form_one(
+            self, tmp_path, capsys):
+        """Two rows carry the report number, a corporate-form one first. The
+        fuzzy tier tries the exact company before a corporate form (#3665), so
+        the exact row is the one it folded into and the one the guard names —
+        a single scan takes the earlier row and prints a re-spelling, and a
+        title, that never happened."""
+        career_ops, tracker_dir = self._setup(
+            tmp_path, self._row("Acme Holdings", "INSURANCE SPECIALIST III", num=9)
+            + self._row("Acme", "INSURANCE SPECIALIST II"))
+        self._addition(tracker_dir, "123.tsv", "Acme", "INSURANCE SPECIALIST I")
+        out, unapplied = self._run(career_ops, tracker_dir, capsys)
+        assert unapplied == 0 and "WARNING" not in out
+        assert ('123.tsv: Acme — "INSURANCE SPECIALIST I" merged into '
+                '"INSURANCE SPECIALIST II" (report 229)') in out
+        assert "merged into the row filed as" not in out
 
     def test_landed_under_its_own_identity_is_silent(self, tmp_path, capsys):
         career_ops, tracker_dir = self._setup(tmp_path, self._row("Acme Corp", "Platform Engineer"))
         self._addition(tracker_dir, "7.tsv", "Acme Corp", "Platform Engineer")
         assert self._run(career_ops, tracker_dir, capsys) == ("", 0)
 
-    def test_unscoreable_reeval_keeps_the_rows_old_report_and_stays_silent(self, tmp_path, capsys):
+    @pytest.mark.parametrize("row_company,add_company,lost", [
+        ("Acme Corp", "Acme Corp", False),
+        ("Acme", "Acme L.L.C.", True),
+    ], ids=["same-spelling", "corporate-form"])
+    def test_unscoreable_reeval_keeps_the_rows_old_report(
+            self, tmp_path, capsys, row_company, add_company, lost):
         """merge-tracker deliberately keeps the row's score, report and PDF when a
         re-eval produces no score. The new report number never lands, so only the
-        company::role reading can see this one — which is why both are kept."""
+        company::role reading can see this one — which is why both are kept.
+
+        Across a corporate form it is reported lost, deliberately: that reading
+        matches the company exactly, because widened it also pairs a refused
+        bare-score re-eval with an older row of the same title, and recovery
+        then never re-queues the refusal — a silent loss, where this is a false
+        warning (`TestRecoverRefusedAdditions`, `_classify_landing`)."""
         career_ops, tracker_dir = self._setup(
-            tmp_path, self._row("Acme Corp", "Platform Engineer", report="200", score="4.0/5"))
-        self._addition(tracker_dir, "7.tsv", "Acme Corp", "Platform Engineer", report="229")
-        assert self._run(career_ops, tracker_dir, capsys) == ("", 0)
+            tmp_path, self._row(row_company, "Platform Engineer", report="200", score="4.0/5"))
+        self._addition(tracker_dir, "7.tsv", add_company, "Platform Engineer", report="229")
+        out, unapplied = self._run(career_ops, tracker_dir, capsys)
+        if lost:
+            assert unapplied == 1 and "WARNING: 1 evaluation(s)" in out
+        else:
+            assert (out, unapplied) == ("", 0)
+
+    def test_a_company_that_is_not_a_corporate_form_pair_is_still_lost(self, tmp_path, capsys):
+        """The fold is the only widening: the same role AND the same report
+        number under another employer is still a loss."""
+        career_ops, tracker_dir = self._setup(tmp_path, self._row("Acme", "Platform Engineer"))
+        self._addition(tracker_dir, "7.tsv", "Acme Robotics", "Platform Engineer")
+        out, unapplied = self._run(career_ops, tracker_dir, capsys)
+        assert unapplied == 1 and "WARNING: 1 evaluation(s)" in out
+
+    @pytest.mark.parametrize("row_company,add_company", [
+        ("?", "—"),                          # two blind employers, spelled differently
+        ("アクメ株式会社", "グロベックス合同会社"),   # two names with no ASCII letter
+    ])
+    def test_companies_with_no_ascii_key_are_not_one_employer(
+            self, tmp_path, capsys, row_company, add_company):
+        """`normalize_company` keys both of each pair to "", which made them one
+        employer here while merge-tracker's `companiesMatch` keeps them apart:
+        its key keeps every script, and an empty one matches only the same cell."""
+        career_ops, tracker_dir = self._setup(tmp_path, self._row(row_company, "Platform Engineer"))
+        self._addition(tracker_dir, "7.tsv", add_company, "Platform Engineer")
+        out, unapplied = self._run(career_ops, tracker_dir, capsys)
+        assert unapplied == 1 and "WARNING: 1 evaluation(s)" in out
 
     def test_genuinely_lost_addition_still_warns(self, tmp_path, capsys):
         """Neither identity in the tracker, and the TSV is gone from the queue —
@@ -3033,6 +3182,21 @@ class TestRecoverRefusedAdditions:
         co, additions = self._tree(tmp_path, {"7.tsv": _tracker_row(score="4.2")}, landed)
         _recover_refused_additions(co, additions)
         assert not (additions / "7.tsv").exists()
+
+    def test_a_refusal_beside_a_corporate_form_row_of_its_title_comes_back(self, tmp_path, capsys):
+        """A refused bare-score re-eval of "Initech Inc." beside an older row
+        filed as "Initech" under the same title, on a merge-tracker that
+        archives refusals. Matching the company::role reading across corporate
+        forms read that as landed, so it never came back: the reading matches
+        the company exactly, and the corporate-form pair is the report-number
+        reading's alone (#272, `_classify_landing`)."""
+        older = ("| 10 | 2026-08-01 | Initech | SRE | 4.0/5 | Evaluated | ❌ "
+                 "| [001](../reports/001-x.md) | note |\n")
+        refused = _tracker_row(score="4.2").replace("Initech", "Initech Inc.")
+        co, additions = self._tree(tmp_path, {"7.tsv": refused}, older)
+        _recover_refused_additions(co, additions)
+        assert (additions / "7.tsv").read_text(encoding="utf-8").split("\t")[5] == "4.2/5"
+        assert "recovered 1 evaluation" in capsys.readouterr().out
 
     def test_a_row_refused_for_a_reason_we_cannot_fix_is_not_retried(self, tmp_path, capsys):
         """A readable score means the refusal was something else — a report

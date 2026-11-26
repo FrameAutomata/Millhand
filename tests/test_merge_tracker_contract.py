@@ -1,9 +1,10 @@
 """Contract test against the installed career-ops `merge-tracker.mjs`.
 
-`_report_key` in [pipeline/_batch_common.py] is a claim about ONE line of that
-script: on its guessed match tiers — entry number, fuzzy company+role — a merge
-updates the existing row but keeps THAT ROW'S role title, while writing the
-addition's report link and score through.
+The loss guard's company + report number reading (`_classify_landing` in
+[pipeline/_batch_common.py]) is a claim about ONE line of that script: on its
+guessed match tiers — entry number, fuzzy company+role — a merge updates the
+existing row but keeps THAT ROW'S role title, while writing the addition's
+report link and score through.
 
     role: (reportNumMatched || dupReason === 'url') ? addition.role : duplicate.role
 
@@ -43,6 +44,7 @@ pin cannot move until this module passes on the candidate:
 
 import contextlib
 import io
+import json
 import os
 import re
 import shutil
@@ -53,9 +55,11 @@ import pytest
 
 from pipeline._batch_common import (
     ADDITION_COLUMNS, ADDITION_LABEL_LINE, ADDITION_LABELS, APPLICATIONS_HEADER,
-    _REFUSES_HEADERLESS_MARKER, _REQUIRED_IDXS, _liveness_closed_rows, _pending_additions,
-    _reopen_reposted, _sanitize_pending_additions, _warn_on_lost_additions,
-    DECISION_SKIP_MARK, by_hand_mark, closed_by_recheck, jd_cache_path, labelled_addition,
+    GENERIC_DESCRIPTORS, LEGAL_SUFFIXES, MIN_STEM_CHARS,
+    _REFUSES_HEADERLESS_MARKER, _REQUIRED_IDXS, _company_tokens, _liveness_closed_rows,
+    _pending_additions, _reopen_reposted, _same_employer, _sanitize_pending_additions,
+    _warn_on_lost_additions, DECISION_SKIP_MARK, by_hand_mark, closed_by_recheck,
+    companies_match_ignoring_corporate_form, jd_cache_path, labelled_addition,
     liveness_closed_mark, queued_additions, reads_labelled_additions, report_header_url,
     run_merge_tracker, sanitize_addition,
 )
@@ -81,8 +85,8 @@ def _notes(req, jk):
     return (f"req {req} — " if req else "") + f"https://indeed.com/viewjob?jk={jk} — APPLY"
 
 
-def _tracker(role, report, req=None):
-    return HEADER + (f"| 10 | 2026-08-01 | UT Southwestern Medical Center | {role} "
+def _tracker(role, report, req=None, company="UT Southwestern Medical Center"):
+    return HEADER + (f"| 10 | 2026-08-01 | {company} | {role} "
                      f"| 4.0/5 | Evaluated | ❌ | [{report}](../reports/{report}-ut.md) "
                      f"| {_notes(req, 'old')} |\n")
 
@@ -94,8 +98,8 @@ def _labelled(row):
     return text
 
 
-def _addition(role, report, req=None):
-    return _labelled("11\t2026-09-01\tUT Southwestern Medical Center\t" + role +
+def _addition(role, report, req=None, company="UT Southwestern Medical Center"):
+    return _labelled(f"11\t2026-09-01\t{company}\t" + role +
                      f"\tEvaluated\t4.7/5\tnull\t[{report}](reports/{report}-ut.md)\t"
                      f"{_notes(req, 'new')}")
 
@@ -254,10 +258,10 @@ def merged(tmp_path_factory):
 
 class TestFuzzyMergeKeepsTheRowsTitle:
     def test_role_title_is_the_existing_rows_not_the_additions(self, merged):
-        """The reading `_report_key` exists for. If this fails, upstream has
-        changed which tier may rewrite a title — re-read merge-tracker's
-        `reportNumMatched || dupReason === 'url'` ternary before touching the
-        guard, and do not relax the test."""
+        """The reading the guard's company + report number half exists for.
+        If this fails, upstream has changed which tier may rewrite a title —
+        re-read merge-tracker's `reportNumMatched || dupReason === 'url'`
+        ternary before touching the guard, and do not relax the test."""
         assert f"| {BASE} |" in merged.tracker
         assert VARIANT not in merged.tracker
 
@@ -407,6 +411,156 @@ class TestReqIdOverridesTheFuzzyTitleMatch:
         sides, and the row it just added is one of them."""
         added = [l for l in distinct_reqs.tracker.splitlines() if f"| {VARIANT} |" in l]
         assert added and "req 5002" in added[0]
+
+
+# ── A corporate-form fold is a landing (#272) ───────────────────────────────
+#
+# merge-tracker's fuzzy tier folds an addition for "Acme Inc." onto a row filed
+# as "Acme" (`companiesMatchIgnoringCorporateForm`, career-ops#3665) and keeps
+# the row's spelling, so the loss guard compares companies with ports of that
+# function and of the exact `companiesMatch` its every tier uses. A port is a
+# copy, and a copy of a rule upstream can change on a `git pull` is exactly what
+# this module exists to hold: so the checkout's own vocabulary and its own
+# answers, read with node, are compared with ours. `companiesMatch` is not
+# exported, so its source is read out of merge-tracker.mjs and run there.
+_CORPORATE_FORM_PROBE = """
+import { readFileSync } from 'fs';
+import { pathToFileURL } from 'url';
+const m = await import(pathToFileURL(process.argv[1]).href);
+const { pairs, companiesMatchSource } = JSON.parse(readFileSync(0, 'utf8'));
+const companiesMatch = new Function(
+  'normalizeCompany', `${companiesMatchSource}\nreturn companiesMatch;`)(m.normalizeCompany);
+process.stdout.write(JSON.stringify({
+  legal: m.LEGAL_SUFFIXES, generic: m.GENERIC_DESCRIPTORS, minStem: m.MIN_STEM_CHARS,
+  keys: pairs.map(([a, b]) => [m.normalizeCompany(a), m.normalizeCompany(b)]),
+  exact: pairs.map(([a, b]) => companiesMatch(a, b)),
+  matches: pairs.map(([a, b]) => m.companiesMatchIgnoringCorporateForm(a, b)),
+}));
+"""
+
+# Stems and tails whose combinations reach every rule: the prefix, the tail
+# vocabulary in plain, dotted and mixed spellings, the stem floor (counted in
+# UTF-16 units — the astral pair), the empty stem and the empty key, other
+# scripts, NFKC, the Turkish dotted capital and a final sigma. Every code point
+# is one both runtimes' Unicode versions assign (see `_company_tokens`), so a
+# disagreement here is the port's, never a version skew.
+_CF_STEMS = ["Acme", "ACME", "acme", "Abc", "Ab", "A", "Meta", "Metaphor", "Acme Robotics",
+             "Société Générale", "Яндекс", "アクメ", "İstanbul Tekstil", "Istanbul Tekstil",
+             "ΑΘΗΝΑΣ", "Ａｃｍｅ", "\U00020000", "\U00020000\U00020000", "AT&T", "3M", "X Y",
+             "Acme (US)", "Initech-Labs", "?", "", "—", " ? ", "Holdings", "Inc"]
+_CF_TAILS = ["", " Inc.", ", Inc.", " INC", " L.L.C.", " S.A.", " G.m.b.H.", " GmbH Holdings",
+             " Holdings Inc.", " Group", " Canada", " Robotics", " X Y", " ООО",
+             " Inc Robotics", " & Co.", " (Holdings)", " Pty Ltd", " A.Ş.", " 株式会社"]
+
+
+def _corporate_form_pairs():
+    words = LEGAL_SUFFIXES + GENERIC_DESCRIPTORS
+    tails = _CF_TAILS + [f" {w}" for w in words] + [" " + ".".join(w.upper()) + "." for w in words]
+    pairs = [p for stem in _CF_STEMS for tail in tails
+             for p in ((stem + tail, stem), (stem, stem + tail))]
+    pairs += [(stem + a, stem + b) for stem in _CF_STEMS for a in _CF_TAILS for b in _CF_TAILS]
+    pairs += [(a + tail, b) for a in _CF_STEMS for b in _CF_STEMS if a != b
+              for tail in ("", " Inc.", " L.L.C.")]
+    return pairs
+
+
+def _companies_match_source() -> str:
+    """merge-tracker.mjs's own `companiesMatch(a, b)`, verbatim."""
+    m = re.search(r"^([ \t]*)function companiesMatch\(a, b\) \{\n.*?^\1\}$", _SOURCE,
+                  re.MULTILINE | re.DOTALL)
+    assert m, ("merge-tracker.mjs no longer defines companiesMatch(a, b) — re-read how its "
+               "tiers compare a company before touching `_same_employer`")
+    return m.group(0)
+
+
+@pytest.fixture(scope="module")
+def upstream_corporate_form():
+    """(the pairs, what the checkout exports and answers for them)."""
+    pairs = _corporate_form_pairs()
+    r = subprocess.run(
+        ["node", "--input-type=module", "-e", _CORPORATE_FORM_PROBE,
+         str(career_ops_dir() / "tracker-utils.mjs")],
+        cwd=str(career_ops_dir()), capture_output=True, text=True, encoding="utf-8",
+        input=json.dumps({"pairs": pairs, "companiesMatchSource": _companies_match_source()}),
+        timeout=60)
+    assert r.returncode == 0, r.stderr
+    return pairs, json.loads(r.stdout)
+
+
+def test_the_corporate_form_vocabulary_is_the_checkouts(upstream_corporate_form):
+    """In order, so a diff against tracker-utils.mjs reads line for line."""
+    _, upstream = upstream_corporate_form
+    assert (list(LEGAL_SUFFIXES), list(GENERIC_DESCRIPTORS), MIN_STEM_CHARS) == (
+        upstream["legal"], upstream["generic"], upstream["minStem"])
+
+
+def _disagreements(pairs, ours, theirs):
+    return [(a, b, t) for (a, b), o, t in zip(pairs, ours, theirs, strict=True) if o != t]
+
+
+def test_the_company_key_is_the_checkouts(upstream_corporate_form):
+    pairs, upstream = upstream_corporate_form
+    ours = [["".join(_company_tokens(a)), "".join(_company_tokens(b))] for a, b in pairs]
+    disagree = _disagreements(pairs, ours, upstream["keys"])
+    assert not disagree, f"{len(disagree)} key(s) differ, e.g. {disagree[:5]}"
+
+
+def test_the_exact_half_answers_as_the_checkout_does(upstream_corporate_form):
+    """Not vacuous: the set holds equal keys, different ones, and empty keys
+    on both sides of the literal-equality rule."""
+    pairs, upstream = upstream_corporate_form
+    empty = [hit for (a, b), (ka, kb), hit in zip(pairs, upstream["keys"], upstream["exact"])
+             if ka == kb == ""]
+    assert 100 < sum(upstream["exact"]) < len(pairs) - 100
+    assert any(empty) and not all(empty)
+    disagree = _disagreements(pairs, [_same_employer(a, b) for a, b in pairs], upstream["exact"])
+    assert not disagree, f"{len(disagree)} pair(s) answered differently, e.g. {disagree[:5]}"
+
+
+def test_the_port_answers_as_the_checkout_does(upstream_corporate_form):
+    """The first assertion keeps the comparison from being vacuous: a pair
+    set that only ever matched, or never did, would agree with a port that
+    always gave the one answer."""
+    pairs, upstream = upstream_corporate_form
+    assert 1000 < sum(upstream["matches"]) < len(pairs) - 1000
+    ours = [companies_match_ignoring_corporate_form(a, b) for a, b in pairs]
+    disagree = _disagreements(pairs, ours, upstream["matches"])
+    assert not disagree, f"{len(disagree)} pair(s) answered differently, e.g. {disagree[:5]}"
+
+
+@pytest.fixture(scope="module", params=[BASE, VARIANT], ids=["same-title", "re-worded"])
+def folded_by_corporate_form(request, tmp_path_factory):
+    """A tracker row filed as "Acme", and an evaluation of it for "Acme Inc."
+    under the param's title, through `run_merge_tracker` against the real
+    script. Returns (that title, the outcome)."""
+    career_ops, _, state = _stage(
+        tmp_path_factory.mktemp("form"), _tracker(BASE, 200, company="Acme"),
+        {"123.tsv": _addition(request.param, 229, company="Acme Inc.")})
+    ok, printed = _run_merge_tracker_for_real(career_ops, state)
+    return request.param, SimpleNamespace(
+        ok=ok, printed=printed, row=tracker_row(_tracker_after(career_ops), "10"))
+
+
+class TestACorporateFormFoldIsALanding:
+    """Under either title the row keeps its own spelling and takes the report,
+    so the company + report number reading finds it — the one reading that
+    accepts a corporate-form pair (`_classify_landing`)."""
+
+    def test_the_row_takes_the_report_and_keeps_its_spelling(self, folded_by_corporate_form):
+        """The premise, off the real script. If upstream starts writing the
+        addition's spelling through, both readings find the row by key, and
+        this failing is the notification that the port may no longer be
+        needed here."""
+        _, f = folded_by_corporate_form
+        assert (f.row["company"], f.row["role"], f.row["report_num"], f.row["score"]) == (
+            "Acme", BASE, "229", "4.7/5")
+
+    def test_the_merge_is_clean_and_names_both_spellings(self, folded_by_corporate_form):
+        role, f = folded_by_corporate_form
+        assert f.ok is True, f.printed
+        assert "WARNING" not in f.printed
+        assert '123.tsv: "Acme Inc." merged into the row filed as "Acme" (report 229)' in f.printed
+        assert (f'"{role}" merged into "{BASE}"' in f.printed) == (role != BASE)
 
 
 # A row shaped the way an agent CLI wrote one on the `--batch` path before
