@@ -26,9 +26,10 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from pipeline.app import data, gh, local_run, onboard, reset, self_update, skills
@@ -66,6 +67,7 @@ from pipeline.sites import (
     unreadable_options,
 )
 from pipeline.stdio import line_buffer_stdout
+from pipeline.tailoring_guidance import read_guidance
 from pipeline import handoff, recheck, state_sync
 # Push and Refresh run in pipeline/state_sync.py, which owns the scratch dir,
 # the pushed-overrides overlay and the workflow names; their routes here are
@@ -901,9 +903,11 @@ def _cli_skill_command(skill: str, company: str, title: str, report_file: Path |
     """The hand-off command both CLI routes return, built server-side. Every CLI
     skill runs under career-ops' skill router, which tells the agent to read
     profile.yml whole, so the file is scrubbed first (#227; see
-    _batch_common.scrub_profile_yml_file)."""
-    scrub_profile_yml_files(_career_ops_local())
-    return skills.skill_command(skill, report_file, company, title)
+    _batch_common.scrub_profile_yml_file). The local checkout rides along so a
+    tailoring skill can name the candidate's tailoring preferences file."""
+    career_ops = _career_ops_local()
+    scrub_profile_yml_files(career_ops)
+    return skills.skill_command(skill, report_file, company, title, career_ops)
 
 
 @app.get("/api/capabilities")
@@ -1149,19 +1153,78 @@ def onboard_load_config() -> JSONResponse:
 
 @app.post("/api/onboard/parse-resume")
 async def onboard_parse_resume(resume: UploadFile = File(...)) -> JSONResponse:
-    """Extract contact details from an uploaded resume (PDF / DOCX / ODT) to
+    """Extract contact details from an uploaded resume (Markdown / PDF / DOCX / ODT) to
     autofill the onboarding 'About' step. Pure local parse — no gh calls,
     nothing written."""
     data = await resume.read()
     if not data:
         raise HTTPException(status_code=400, detail="resume file is empty")
+    text = _extract_or_400(onboard.extract_resume_text, data, resume.filename or "",
+                           what="resume")
+    return JSONResponse(onboard.parse_resume_info(text))
+
+
+def _extract_or_400(extract, *args, what: str):
+    """`extract(*args)`, its failures as the 400 the wizard shows. A ValueError
+    (an unsupported format, text that is not UTF-8) already says what to do;
+    anything else is one of the per-format libraries' own errors."""
     try:
-        text = onboard.extract_resume_text(data, resume.filename or "")
-    except ValueError as e:  # unsupported format
+        return extract(*args)
+    except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"could not read resume: {e}")
-    return JSONResponse(onboard.parse_resume_info(text))
+        raise HTTPException(status_code=400, detail=f"could not read {what}: {e}")
+
+
+def _no_text_found(what: str) -> HTTPException:
+    return HTTPException(status_code=400,
+                         detail=f"No text found in {what} (is it a scanned image or empty?).")
+
+
+@app.post("/api/onboard/extract-text")
+async def onboard_extract_text(request: Request, filename: str = "") -> JSONResponse:
+    """The text of a document (Markdown, .txt, DOCX, ODT, PDF), capped, for the
+    wizard's tailoring-guidance "Import from file": the client FILLS the
+    textarea with it, so the person reviews and edits exactly what becomes
+    trusted prompt text before Save. Nothing is stored here — the text goes
+    back in the response, and the one temp file a PDF/DOCX/ODT extraction needs
+    is removed before it returns.
+
+    The body is the file itself and `filename` names its format, rather than a
+    multipart form: a form part is spooled to disk whole before this function
+    runs, where a raw body can be refused at the byte cap as it arrives. Like
+    every onboard route it is behind the cross-origin guard, and refused for a
+    LAN peer by default (`_LAN_MUTABLE` does not name it)."""
+    from pipeline.resume_text import SUPPORTED_SUFFIXES
+
+    suffix = Path(filename).suffix.lower()
+    if suffix not in SUPPORTED_SUFFIXES:     # before a byte of the body is read
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file format {suffix or '(none)'!r}. "
+                   f"Use one of: {', '.join(SUPPORTED_SUFFIXES)}.")
+    limit = onboard.GUIDANCE_IMPORT_MAX_BYTES
+    too_big = HTTPException(
+        status_code=413,
+        detail=f"That file is over {limit // (1024 * 1024)} MB — import a smaller "
+               "document, or paste the guidance in.")
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        raise too_big
+    body = bytearray()
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > limit:
+            raise too_big
+    if not body:
+        raise HTTPException(status_code=400, detail="That file is empty.")
+    # Off the event loop: a long PDF is seconds of pdfplumber, and the UI is one
+    # worker, so every other request would wait for it.
+    result = await run_in_threadpool(_extract_or_400, onboard.import_guidance_text,
+                                     bytes(body), filename, what=filename)
+    if not result["text"]:
+        raise _no_text_found("that file")
+    return JSONResponse(result)
 
 
 # The registry owns the vocabulary (and its default); this is a view of it, so
@@ -1556,9 +1619,14 @@ async def onboard_submit(
     resume) and write them as GitHub secrets. Refuses to write to a public repo.
 
     Resume + API key are optional on re-submit. If no new resume is uploaded
-    and resumes/resume.pdf already exists locally, we reuse it (the user is
-    just tweaking config). Same for the API key: a blank value keeps whatever
-    is already in GitHub Secrets, avoiding a forced re-paste every edit."""
+    and one already exists locally, we reuse it (the user is just tweaking
+    config). Same for the API key: a blank value keeps whatever is already in
+    GitHub Secrets, avoiding a forced re-paste every edit.
+
+    A Markdown résumé is kept as resumes/resume.md, seeds cv.md as written, and
+    is rendered to the PDF application forms are given
+    (resume_markdown.ensure_base_pdf). A render that fails does not fail the
+    Save; the response's `warnings` says so."""
     try:
         payload = json.loads(form)
     except json.JSONDecodeError:
@@ -1584,40 +1652,46 @@ async def onboard_submit(
                     "so your job search stays off the public Actions tab."),
         )
 
+    from pipeline import resume_markdown
+    from pipeline import resume_text as _rt
+
+    resume_env = os.environ.get("RESUME_PATH", "")
     resumes_dir = ROOT / "resumes"
     txt_path = resumes_dir / "resume.txt"
 
-    # Resume: prefer a freshly-uploaded file (PDF/DOCX/ODT); fall back to the
-    # persisted text from a prior submit. UploadFile is always non-None when the
-    # multipart field exists, so check size rather than identity.
+    # Resume: prefer a freshly-uploaded file (Markdown/PDF/DOCX/ODT); fall back
+    # to the persisted text from a prior submit. UploadFile is always non-None
+    # when the multipart field exists, so check size rather than identity.
     resume_bytes = await resume.read() if resume is not None else b""
+    stored: Path | None = None
     if resume_bytes:
         filename = (resume.filename or "").strip()
-        suffix = Path(filename).suffix.lower()
-        try:
-            resume_text = onboard.extract_resume_text(resume_bytes, filename)
-        except ValueError as e:  # unsupported format
-            raise HTTPException(status_code=400, detail=str(e))
-        except Exception as e:  # libraries raise various errors on bad files
-            raise HTTPException(status_code=400, detail=f"could not read resume: {e}")
+        resume_text = _extract_or_400(onboard.extract_resume_text, resume_bytes, filename,
+                                      what="resume")
         if not resume_text.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="No text found in the resume (is it a scanned image or empty?).",
-            )
+            raise _no_text_found("the resume")
         resumes_dir.mkdir(parents=True, exist_ok=True)
-        # Persist under the real extension (resume.pdf / resume.docx / resume.odt)
-        # so a DOCX import doubles as the resume-tailoring source
-        # (resume_tailor.source_docx() defaults to resumes/resume.docx).
-        # Retire sibling formats first: the filter's probe is pdf-first, so a
-        # stale resume.pdf left beside a fresh resume.docx would keep winning
-        # keyword scoring forever (split-brain resume — review bug). The latest
-        # upload is THE resume.
-        from pipeline.resume_text import IMPORT_SUFFIXES
-        for other in IMPORT_SUFFIXES:
+        # Persist under the real extension (resume.pdf / resume.docx /
+        # resume.odt / resume.md — .markdown is kept as .md, the one name the
+        # probe looks for). Retire sibling formats first: the probe takes the
+        # first match, so a stale resume.pdf left beside a fresh resume.docx
+        # would keep winning keyword scoring forever (split-brain resume —
+        # review bug). The latest upload is THE resume. A Markdown upload leads
+        # the probe whatever is beside it, so it retires only the other Markdown
+        # spelling: a PDF or DOCX beside it is an export, the upload a failed
+        # render falls back to — what that warning tells the person to make.
+        suffix = Path(filename).suffix.lower()
+        if suffix in _rt.MARKDOWN_SUFFIXES:
+            suffix = ".md"
+        rivals = _rt.MARKDOWN_SUFFIXES if suffix == ".md" else _rt.IMPORT_SUFFIXES
+        for other in rivals:
             if other != suffix:
                 (resumes_dir / f"resume{other}").unlink(missing_ok=True)
-        (resumes_dir / f"resume{suffix}").write_bytes(resume_bytes)
+        stored = resumes_dir / f"resume{suffix}"
+        # Re-picking the file already on disk leaves it, and its mtime, alone,
+        # so a current render of it is not redone.
+        if not (stored.is_file() and stored.read_bytes() == resume_bytes):
+            stored.write_bytes(resume_bytes)
         txt_path.write_text(resume_text, encoding="utf-8")
     elif txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
@@ -1629,33 +1703,43 @@ async def onboard_submit(
         # so it has to exist by collect_secret_blobs either way. This is the
         # submit-side half of the step-0 gate fix — without it, edit mode would
         # let a CLI-configured copy reach Submit and then 400 (#145).
-        from pipeline import resume_text as _rt
-
-        existing = _rt.resolve_resume_path(os.environ.get("RESUME_PATH", ""), ROOT)
+        existing = _rt.resolve_resume_path(resume_env, ROOT)
         if not existing.exists():
             raise HTTPException(
                 status_code=400,
-                detail=("No resume on file — upload a PDF, DOCX, or ODT on the first "
-                        "onboarding step before submitting."),
+                detail=("No resume on file — upload a Markdown, PDF, DOCX, or ODT "
+                        "résumé on the first onboarding step before submitting."),
             )
-        try:
-            resume_text = _rt.extract_resume_text(existing)
-        except ValueError as e:  # unsupported format
-            raise HTTPException(status_code=400, detail=str(e))
-        except Exception as e:
-            raise HTTPException(
-                status_code=400, detail=f"could not read {existing.name}: {e}")
+        resume_text = _extract_or_400(_rt.extract_resume_text, existing, what=existing.name)
         if not resume_text.strip():
-            raise HTTPException(
-                status_code=400,
-                detail=f"No text found in {existing.name} (is it a scanned image or empty?).",
-            )
+            raise _no_text_found(existing.name)
         resumes_dir.mkdir(parents=True, exist_ok=True)
         txt_path.write_text(resume_text, encoding="utf-8")
 
+    # A Markdown résumé — just uploaded, or already on file — seeds cv.md as
+    # written; otherwise every edit-mode Save would rebuild cv.md from plain
+    # text and lose the structure the first Save kept.
+    in_effect = _rt.resolve_resume_path(resume_env, ROOT)
+    resume_markdown_text = onboard.markdown_resume(stored or in_effect)
+    warnings: list[str] = []
+    if stored is not None and in_effect != stored.resolve():
+        # The split #278 is about, made visible rather than silent: the filter
+        # scores, and the browser agent uploads, what RESUME_PATH names.
+        warnings.append(f"RESUME_PATH in .env names {in_effect}, so that file — not the "
+                        "one you just uploaded — is what the pipeline scores and the "
+                        "browser agent uploads. Clear RESUME_PATH to use the upload.")
+    # The PDF for the résumé in effect, the one upload_resume_path offers. Off
+    # the event loop: LibreOffice takes seconds, and can wait on the render lock
+    # a handoff build in this process holds.
+    if warning := await run_in_threadpool(resume_markdown.ensure_base_pdf, ROOT, in_effect):
+        warnings.append(warning)
+
     # Generate artifacts via the shared node generator, then collect base64.
     try:
-        onboard.run_generation(ROOT, onboard.build_onboarding_json(payload, resume_text))
+        onboard.run_generation(
+            ROOT, onboard.build_onboarding_json(
+                payload, resume_text, resume_markdown_text,
+                keep_guidance_file=read_guidance(_career_ops_local()) is None))
         # Best-effort proof-points corpus, written before we snapshot files into
         # secrets so it rides along to the cloud. Never blocks onboarding.
         _maybe_generate_article_digest(payload, resume_text, provider, api_key)
@@ -1721,7 +1805,8 @@ async def onboard_submit(
     # visit can prefill instead of forcing a full re-fill.
     onboard.save_sidecar(ROOT, payload)
 
-    return JSONResponse({"ok": True, "repo": gh.current_repo(), "secrets_written": written})
+    return JSONResponse({"ok": True, "repo": gh.current_repo(), "secrets_written": written,
+                         "warnings": warnings})
 
 
 def _fetch_jd(url: str, timeout: int = 20) -> str:
@@ -2003,7 +2088,8 @@ def _run_handoff_build(job_id: str, board: str, limit: int | None, tailor: bool)
         # One session per site: hand back a paste-ready kickoff prompt for each
         # non-empty per-site work-order run() just wrote (session_summaries owns
         # the filename→session mapping; a site emptied this run is skipped).
-        sessions = handoff.session_summaries(handoff.default_out_dir())
+        sessions = handoff.session_summaries(handoff.default_out_dir(),
+                                             career_ops=_career_ops_local())
         _finish_handoff(job_id, status="done", result={
             "sessions": sessions,
             "total_fresh": sum(s["fresh"] for s in sessions),
@@ -2083,12 +2169,24 @@ def handoff_role_prompt(num: str) -> JSONResponse:
     report = data.find_report_file(career_ops / "reports", row.get("report_num", ""))
     # profile defaults to the handoff dir's living PROFILE.md (the fact bank +
     # standing answers the agent tailors from) — not the raw onboarding YAML.
+    resume = find_existing(career_ops, company)
+    if resume is None:
+        # The prompt then names the copy's default upload: bring a Markdown
+        # résumé's PDF up to date first, as a handoff build does (a plain def
+        # route, so this runs in the threadpool, not on the event loop) — but
+        # not again, per click, for content that has already failed to render.
+        from pipeline import resume_markdown
+        from pipeline.resume_text import resolve_resume_path
+        if warning := resume_markdown.ensure_base_pdf(
+                ROOT, resolve_resume_path(os.environ.get("RESUME_PATH", ""), ROOT), retry=False):
+            print(f"[handoff] {warning}")
     prompt = handoff.role_prompt(
         company, row.get("role", ""), url,
         area=str(row.get("area") or "").strip(),
         report=report,
-        resume=find_existing(career_ops, company),
+        resume=resume,
         easy_apply=row.get("easy_apply"),   # so submit-easy-apply's first line/fallback fit THIS row
+        career_ops=career_ops,
     )
     return JSONResponse({"company": company, "role": row.get("role", ""), "prompt": prompt})
 

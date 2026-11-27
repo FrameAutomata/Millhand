@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from pipeline import handoff
+from pipeline.resume_text import RENDERED_RESUME_PDF, RENDERED_SOURCE_MARK, render_mark
 from pipeline.app import data as app_data
 
 
@@ -1581,6 +1582,82 @@ class TestProfileReferencedInPrompts:
     def test_role_prompt_names_the_profile(self):
         p = handoff.role_prompt("Acme", "SWE", "https://www.linkedin.com/jobs/view/1")
         assert handoff.HANDOFF_PROFILE in p
+
+
+class TestDefaultResumeInPrompts:
+    """Both prompts name the file to upload for a role with no tailored copy —
+    "apply with your default resume" left the agent to guess, and on a
+    Markdown-only copy the only résumé on disk is one no form accepts, so the
+    upload is the PDF rendered from it (resume_text.RENDERED_RESUME_PDF)."""
+
+    def _markdown_copy(self, tmp_path, monkeypatch, *, rendered=True):
+        monkeypatch.delenv("RESUME_PATH", raising=False)
+        monkeypatch.setattr(handoff, "ROOT", tmp_path)
+        (tmp_path / "resumes").mkdir()
+        (tmp_path / "resumes" / "resume.md").write_text("# Jane\n", encoding="utf-8")
+        pdf = tmp_path / RENDERED_RESUME_PDF
+        if rendered:
+            pdf.parent.mkdir()
+            pdf.write_bytes(b"%PDF")
+            md = tmp_path / "resumes" / "resume.md"   # its bytes: write_text is \r\n on Windows
+            (tmp_path / RENDERED_SOURCE_MARK).write_text(render_mark(md, md.read_bytes()),
+                                                        encoding="utf-8")
+        return pdf.resolve()
+
+    def test_a_markdown_copy_uploads_the_rendered_pdf(self, tmp_path, monkeypatch):
+        pdf = self._markdown_copy(tmp_path, monkeypatch)
+        role = handoff.role_prompt("Acme", "SWE", "https://www.linkedin.com/jobs/view/1")
+        assert f"upload the candidate's default résumé, {pdf}" in role
+        assert "resume.md" not in role and "resumes/resume.docx" not in role
+        wo = handoff.work_order_paths(tmp_path, "linkedin")[0]
+        assert str(pdf) in handoff.kickoff_prompt(wo, board="linkedin")
+
+    def test_no_upload_file_is_said_rather_than_guessed(self, tmp_path, monkeypatch):
+        self._markdown_copy(tmp_path, monkeypatch, rendered=False)
+        role = handoff.role_prompt("Acme", "SWE", "https://www.linkedin.com/jobs/view/1")
+        assert "no résumé file on disk to upload" in role
+
+    def test_every_run_brings_the_upload_pdf_up_to_date(self, tmp_path, monkeypatch, capsys):
+        """A hand-edited resume.md must not leave the agent a stale PDF: the
+        run re-renders before the kickoff prompts that name it are written,
+        and says so when it cannot."""
+        from pipeline import resume_markdown
+        self._markdown_copy(tmp_path, monkeypatch, rendered=False)
+        calls = []
+        monkeypatch.setattr(resume_markdown, "ensure_base_pdf",
+                            lambda root, source: calls.append((root, source))
+                            or "LibreOffice was not found")
+        handoff.run(queue_path=tmp_path / "none.jsonl", out_dir=tmp_path / "out",
+                    career_ops=tmp_path / "career-ops")
+        assert calls == [(tmp_path, (tmp_path / "resumes" / "resume.md").resolve())]
+        assert "[handoff] LibreOffice was not found" in capsys.readouterr().out
+
+    def test_the_candidates_tailoring_preferences_are_named_when_written(self, tmp_path, monkeypatch):
+        """The agent tailors the rows with no pre-tailored copy itself, so it is
+        pointed at the same preferences file the build-from-profile tailor reads."""
+        self._markdown_copy(tmp_path, monkeypatch)
+        co = tmp_path / "career-ops"
+        wo = handoff.work_order_paths(tmp_path, "linkedin")[0]
+        url = "https://www.linkedin.com/jobs/view/1"
+        assert "tailoring preferences" not in handoff.kickoff_prompt(wo, board="linkedin",
+                                                                     career_ops=co)
+        guidance = co / "config" / "tailoring.md"
+        guidance.parent.mkdir(parents=True)
+        guidance.write_text("  \n", encoding="utf-8")          # blank: nothing to follow
+        assert "tailoring preferences" not in handoff.role_prompt("Acme", "SWE", url, career_ops=co)
+        guidance.write_text("Lead with outcomes.\n", encoding="utf-8")
+        for prompt in (handoff.kickoff_prompt(wo, board="linkedin", career_ops=co),
+                       handoff.role_prompt("Acme", "SWE", url, career_ops=co)):
+            assert f"tailoring preferences in {guidance.resolve()}" in prompt
+        # The UI passes its own tree; without one, CAREER_OPS_PATH as before.
+        monkeypatch.setenv("CAREER_OPS_PATH", str(co))
+        assert "tailoring preferences in" in handoff.role_prompt("Acme", "SWE", url)
+
+    def test_a_tailored_copy_still_wins(self, tmp_path, monkeypatch):
+        self._markdown_copy(tmp_path, monkeypatch)
+        role = handoff.role_prompt("Acme", "SWE", "https://www.linkedin.com/jobs/view/1",
+                                   resume=tmp_path / "Acme - resume.pdf")
+        assert "Tailored resume:" in role and "default résumé" not in role
 
 
 class TestRunPerSiteSessions:

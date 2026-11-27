@@ -279,6 +279,63 @@ def test_api_writes_file_and_downloads(client, mocker, monkeypatch):
     assert "FastAPI" in dl.text
 
 
+class TestTailoringGuidanceReachesTheSkills:
+    """The wizard's tailoring guidance lives in career-ops/config/tailoring.md
+    and reaches every tailoring skill on purpose — the API prompt in a section
+    of its own, the CLI hand-off by naming the file — rather than only when
+    it happened to sit in a pasted profile.yml."""
+
+    def _career_ops(self, tmp_path):
+        return tmp_path / "career-ops"
+
+    def test_api_prompt_carries_the_guidance_file_in_its_own_section(self, client, tmp_path):
+        from pipeline.app import skills
+        co = self._career_ops(tmp_path)
+        (co / "config" / "tailoring.md").write_text("Lead with the API work.", encoding="utf-8")
+        system, _ = skills.build_tailor_messages(co, "# Acme — Eng")
+        assert "TAILORING PREFERENCES (trusted" in system
+        assert "Lead with the API work." in system
+
+    def test_an_older_copys_profile_yml_guidance_is_given_once(self, client, tmp_path):
+        """A copy set up before the file: the guidance comes from profile.yml's
+        key, in the explicit section, and is not pasted a second time inside
+        the profile."""
+        from pipeline.app import skills
+        co = self._career_ops(tmp_path)
+        (co / "config" / "profile.yml").write_text(
+            'name: "Jane Dev"\ntailoring:\n  instructions: Keep it to one page.\n', encoding="utf-8")
+        system, _ = skills.build_tailor_messages(co, "# Acme — Eng")
+        assert system.count("Keep it to one page.") == 1
+        assert "TAILORING PREFERENCES (trusted" in system
+        assert 'name: "Jane Dev"' in system          # the rest of the profile still rides
+
+    def test_no_section_without_guidance(self, client, tmp_path):
+        from pipeline.app import skills
+        system, _ = skills.build_tailor_messages(self._career_ops(tmp_path), "# Acme — Eng")
+        assert "TAILORING PREFERENCES" not in system
+
+    @pytest.mark.parametrize("skill", ["tailor-resume", "tailor-resume-pdf"])
+    def test_cli_hand_off_names_the_guidance_file(self, client, mocker, tmp_path, skill):
+        mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/x")
+        guidance = self._career_ops(tmp_path) / "config" / "tailoring.md"
+        guidance.write_text("Lead with the API work.", encoding="utf-8")
+        r = client.post("/api/skills/run", json={"skill": skill, "num": "1", "path": "cli"})
+        assert r.status_code == 200, r.text
+        assert guidance.resolve().as_posix() in r.json()["command"]
+
+    def test_cli_hand_off_names_no_file_that_is_not_there_or_not_a_tailor(self, client, mocker, tmp_path):
+        mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/x")
+        r = client.post("/api/skills/run", json={"skill": "tailor-resume", "num": "1", "path": "cli"})
+        assert "tailoring.md" not in r.json()["command"]
+        guidance = self._career_ops(tmp_path) / "config" / "tailoring.md"
+        guidance.write_text("  \n", encoding="utf-8")       # emptied: nothing to follow
+        r = client.post("/api/skills/run", json={"skill": "tailor-resume", "num": "1", "path": "cli"})
+        assert "tailoring.md" not in r.json()["command"]
+        guidance.write_text("x", encoding="utf-8")
+        r = client.post("/api/skills/run", json={"skill": "interview-prep", "num": "1", "path": "cli"})
+        assert "tailoring.md" not in r.json()["command"]
+
+
 def test_api_rejected_for_cli_only_skill(client, monkeypatch):
     # interview-prep is CLI-only; asking for the API path must 400 with guidance,
     # even when a key is configured.

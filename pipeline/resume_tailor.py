@@ -48,9 +48,8 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-import yaml
-
 from pipeline._batch_common import parse_json_loose, read_report, read_text
+from pipeline.tailoring_guidance import guidance_section, tailoring_guidance
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -343,21 +342,6 @@ _PROSE_FEEDBACK = (
 )
 
 
-def _tailoring_instructions(career_ops: Path) -> str:
-    """The candidate's free-text tailoring guidance from setup
-    (profile.yml -> tailoring.instructions): trusted preferences the tailor prompt
-    applies within its hard rules. Empty when unset/missing/unparseable so no
-    preferences block is added (and a bad profile.yml never breaks tailoring)."""
-    path = Path(career_ops) / "config" / "profile.yml"
-    if not path.exists():
-        return ""
-    try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        return ""
-    return str((data.get("tailoring") or {}).get("instructions") or "").strip()
-
-
 def build_prompt(slots: list[Slot], full_resume_text: str, job,
                  report_text: str, jd_text: str = "",
                  feedback: str = "", custom_instructions: str = "") -> tuple[str, str]:
@@ -399,11 +383,7 @@ def build_prompt(slots: list[Slot], full_resume_text: str, job,
         "cannot make the relevance clear, AND the rewrite keeps every concrete detail and "
         "metric. Never trade a specific, quantified line for a vaguer 'tailored' one.\n"
         + (f"- {feedback}\n" if feedback else "")
-        + (("CANDIDATE TAILORING PREFERENCES (the candidate's own guidance for "
-            "emphasis, tone, and format — apply it WITHIN the hard rules above; it is "
-            "never license to fabricate, inflate seniority, or claim work the resume "
-            "does not show):\n" + custom_instructions.strip() + "\n")
-           if custom_instructions.strip() else "")
+        + (guidance_section(custom_instructions) + "\n" if custom_instructions.strip() else "")
         + 'Reply with ONLY a JSON object: {"slot_id": "replacement text", ...}'
     )
     payload = [{"id": s.id, "kind": s.kind, **({"label": s.label.strip()} if s.label else {}),
@@ -718,7 +698,7 @@ def generate_for_job(career_ops: Path, job, *, caller=None,
                               company=getattr(job, "company", ""),
                               num_text=getattr(job, "report_num", ""))
     jd_text = jd_text_for_job(career_ops, report_base, job)
-    instructions = _tailoring_instructions(career_ops)   # candidate's own setup guidance
+    instructions = tailoring_guidance(career_ops)   # candidate's own setup guidance
 
     if caller is None:
         caller = _resolve_caller(provider, model)

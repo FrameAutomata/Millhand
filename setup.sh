@@ -103,6 +103,17 @@ echo "==> Registering the Playwright MCP server with every installed agent CLI (
 ( cd "$root" && "$root/.venv/bin/python" -m pipeline.agent_cli --register-mcp-all-installed ) \
   || echo "    Playwright MCP registration skipped" >&2
 
+# Rendered resumes: python-docx comes from requirements.txt, and turning a DOCX
+# into a PDF needs LibreOffice — for --handoff-tailor's one-page résumés and for
+# the upload PDF rendered from a Markdown resume. The Nix dev
+# shell supplies it; on macOS it is usually an app bundle, not on PATH (the
+# bundle path is one resume_tailor.find_soffice also looks in).
+if ! command -v soffice >/dev/null 2>&1 \
+   && [ ! -x /Applications/LibreOffice.app/Contents/MacOS/soffice ]; then
+  echo "    Note: LibreOffice not found — --handoff-tailor cannot build per-job resumes,"
+  echo "    and a Markdown resume gets no upload PDF. Install LibreOffice to enable both."
+fi
+
 echo "==> Copying example configs"
 [ -f "$root/.env" ] || cp "$root/.env.example" "$root/.env"
 [ -f "$root/config/search.yml" ] || cp "$root/config/search.example.yml" "$root/config/search.yml"

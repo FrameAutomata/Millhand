@@ -410,6 +410,48 @@ def _isolate_repo_career_ops(monkeypatch, tmp_path):
                         tmp_path / "_repo-root" / "career-ops")
 
 
+@pytest.fixture
+def fake_soffice(monkeypatch):
+    """LibreOffice as a stand-in for the résumé renders: call it (with
+    available=False for a machine without one) and it returns the list of
+    DOCX paths `resume_tailor.render_pdf` was given, writing <stem>.pdf into
+    the out_dir as soffice does."""
+    from pipeline import resume_tailor
+
+    def install(available=True):
+        calls = []
+
+        def render(docx, out_dir):
+            calls.append(Path(docx))
+            pdf = Path(out_dir) / (Path(docx).stem + ".pdf")
+            pdf.write_bytes(b"%PDF-1.4 rendered")
+            return pdf
+        monkeypatch.setattr(resume_tailor, "find_soffice",
+                            (lambda: "/usr/bin/soffice") if available else (lambda: None))
+        monkeypatch.setattr(resume_tailor, "render_pdf", render)
+        return calls
+    return install
+
+
+@pytest.fixture(autouse=True)
+def _keep_resume_renders_in_tmp(monkeypatch, tmp_path_factory):
+    """Every handoff run brings a Markdown résumé's upload PDF up to date
+    (resume_markdown.ensure_base_pdf), against handoff.ROOT — which most
+    handoff tests leave at the real repo — so a run test on a developer's own
+    copy with a resumes/resume.md would start LibreOffice and write into their
+    resumes/rendered/. In a test, only a PDF under pytest's temp root is
+    rendered; anything else reads as a render that failed."""
+    from pipeline import resume_markdown
+    base = tmp_path_factory.getbasetemp().resolve()
+    real = resume_markdown.render_base_pdf
+
+    def under_tmp_only(md, pdf_out):
+        if base in Path(pdf_out).resolve().parents:
+            return real(md, pdf_out)
+        return None, "not rendered outside the test's temp directory"
+    monkeypatch.setattr(resume_markdown, "render_base_pdf", under_tmp_only)
+
+
 @pytest.fixture(autouse=True)
 def _keep_sidecar_rewrites_in_tmp(monkeypatch, tmp_path_factory):
     """onboard.load_sidecar rewrites a wizard sidecar that still holds #227's

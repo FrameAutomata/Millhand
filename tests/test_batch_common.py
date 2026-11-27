@@ -1294,6 +1294,31 @@ class TestBuildSystemPrompt:
         assert "MYCV_XYZ" in result
 
 
+class TestDropTailoringSection:
+    """An older copy's `tailoring:` section, dropped from prompts and never
+    from the file (see _batch_common.drop_tailoring_section)."""
+
+    def test_drops_the_section_up_to_the_next_top_level_key(self):
+        text = ("candidate:\n  full_name: Jane\n"
+                "tailoring:\n  instructions: |-\n    Lead.\n\n    Short.\n"
+                "# a comment under it\n"
+                "compensation:\n  target_range: 60k\n")
+        assert _batch_common.drop_tailoring_section(text) == (
+            "candidate:\n  full_name: Jane\ncompensation:\n  target_range: 60k\n")
+
+    @pytest.mark.parametrize("text", [
+        "a: 1\ntailoring: {instructions: x}\nb: 2\n",
+        "a: 1\n'tailoring':\n  instructions: x\nb: 2\n",
+    ])
+    def test_flow_and_quoted_keys(self, text):
+        assert _batch_common.drop_tailoring_section(text) == "a: 1\nb: 2\n"
+
+    def test_leaves_everything_else_alone(self):
+        text = "candidate:\n  tailoring: nested is not the section\nb: 2\n"
+        assert _batch_common.drop_tailoring_section(text) == text
+        assert _batch_common.drop_tailoring_section("") == ""
+
+
 class TestEvalSystemPrompt:
     """eval_system_prompt(career_ops) — the single candidate-profile resolution
     point shared by the batch (`--evaluate-batch`) and UI add-job eval paths, so
@@ -1346,6 +1371,23 @@ class TestEvalSystemPrompt:
                      "- Youth programs (secondary)\n"):
             assert line in prompt
         assert "staff/principal" not in prompt
+
+    def test_tailoring_guidance_never_reaches_an_evaluation(self, tmp_path, monkeypatch):
+        """Résumé-tailoring preferences do nothing in an evaluation and cost it
+        tokens. An older copy still carries them in profile.yml until a wizard
+        Save moves them to config/tailoring.md, so the seed path drops the
+        section itself; the file it moves to is never read here at all."""
+        co = self._career_ops(tmp_path, (
+            "candidate:\n  full_name: Jane\n"
+            "tailoring:\n  instructions: |-\n    TAILOR_GUIDANCE_XYZ\n    second line\n"
+            "compensation:\n  target_range: 60-70k\n"))
+        (co / "config" / "tailoring.md").write_text("TAILOR_FILE_XYZ", encoding="utf-8")
+        monkeypatch.setenv("HANDOFF_OUT_DIR", str(tmp_path / "nowhere"))
+        prompt = eval_system_prompt(co)
+        assert "TAILOR_GUIDANCE_XYZ" not in prompt and "TAILOR_FILE_XYZ" not in prompt
+        assert "full_name: Jane" in prompt and "target_range: 60-70k" in prompt
+        out = _batch_common.profile_yml_for_prompt(co)
+        assert "TAILOR_GUIDANCE_XYZ" not in out and "target_range: 60-70k" in out
 
     @pytest.mark.parametrize("profile_yml", [
         "target_roles: [unclosed\n",
@@ -4684,6 +4726,9 @@ class TestNoUnredactedProfileReads:
         'profile_yml = read_text(career_ops / "config" / "profile.yml")':
             "eval_system_prompt; build_system_prompt redacts both inputs, and "
             "only target_roles' names and fit are parsed out of it",
+        'profile = _load_yaml_or_empty(Path(career_ops) / "config" / "profile.yml")':
+            "tailoring_guidance's fallback for an older copy: only the one "
+            "tailoring.instructions string leaves the function",
     }
 
     def test_every_raw_read_is_redacted_or_declared(self):
@@ -4707,7 +4752,7 @@ class TestNoUnredactedProfileReads:
         scan above cannot tell them apart."""
         root = Path(__file__).resolve().parent.parent / "pipeline"
         skills = (root / "app" / "skills.py").read_text(encoding="utf-8")
-        assert 'redact_profile_yml(_read(local / "config" / "profile.yml"))' in skills
+        assert 'profile_yml_text_for_prompt(_read(local / "config" / "profile.yml"))' in skills
         content = (root / "resume_content.py").read_text(encoding="utf-8")
         assert "profile_master_for_prompt(profile_path)" in content
 

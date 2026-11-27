@@ -52,6 +52,7 @@ from pipeline._batch_common import (
     env_int, normalize_company as _squeeze, read_text,
 )
 from pipeline.app import data as _data
+from pipeline.resume_text import upload_resume_path
 from pipeline.work_location import OUT_OF_AREA_TAG, commutable_area
 from pipeline.tracker_layout import SEPARATOR_RE, split_row
 from pipeline.stdio import line_buffer_stdout
@@ -2023,11 +2024,44 @@ def _writeback_contract(work_order: Path) -> str:
     )
 
 
-def kickoff_prompt(work_order: Path, board: str = "", *, policy: str | None = None) -> str:
+def _default_resume_line(default_resume: Path | None = None) -> str:
+    """What the agent uploads when a row has no tailored résumé — `default_resume`,
+    else this copy's (`resume_text.upload_resume_path`, which sends a Markdown
+    résumé to the PDF rendered from it rather than to a .md no form accepts).
+    Named by path: "apply with your default resume" left the agent to guess
+    which file that was."""
+    default_resume = default_resume or upload_resume_path(os.environ.get("RESUME_PATH", ""), ROOT)
+    if default_resume:
+        return (f"upload the candidate's default résumé, {Path(default_resume).resolve()}, "
+                "or tailor one against the candidate profile")
+    return ("there is no résumé file on disk to upload — tailor one against the "
+            "candidate profile, or use the résumé already saved on the job site")
+
+
+def _tailoring_preferences_line(career_ops=None) -> str:
+    """" Follow … <path> …" when the candidate has written résumé-tailoring
+    preferences (career-ops/config/tailoring.md), else "". The browser agent is
+    a tailor too, for every row it tailors itself, so it reads the same file the
+    build-from-profile tailor does; named by path rather than pasted, since the
+    candidate may edit it between sessions."""
+    from pipeline.tailoring_guidance import written_guidance_path
+
+    path = written_guidance_path(_career_ops_dir(career_ops))
+    if path is None:
+        return ""
+    return (f" Whenever you tailor a résumé, follow the candidate's own tailoring "
+            f"preferences in {path}, within the candidate profile — they "
+            "never license claiming anything it does not show.")
+
+
+def kickoff_prompt(work_order: Path, board: str = "", *, policy: str | None = None,
+                   default_resume: Path | None = None, career_ops=None) -> str:
     """The paste-ready batch prompt for a browser agent working ONE site's
     session — names that session's work-order file (+ its .md sibling), states
-    the submit policy, and gives the writeback contract; deliberately names no
-    specific agent (this template ships to users of any of them)."""
+    the submit policy, names the résumé to upload when a row has no tailored
+    one (`default_resume`, this copy's when None — `_default_resume_line`), and
+    gives the writeback contract; deliberately names no specific agent (this
+    template ships to users of any of them)."""
     # RESOLVED, not just Path()-normalized: every path below derives from this
     # one, and a relative work-order re-resolves against the AGENT's cwd. With
     # several copies of this repo on one machine that is a silent, plausible
@@ -2043,7 +2077,8 @@ def kickoff_prompt(work_order: Path, board: str = "", *, policy: str | None = No
         f"Work the {site}job-application work-order at:\n"
         f"  {work_order}\n"
         f"  (human-readable copy: {work_order.with_suffix('.md')})\n\n"
-        f"Qualify and tailor every role against the candidate profile at {profile}.\n\n"
+        f"Qualify and tailor every role against the candidate profile at {profile}."
+        f"{_tailoring_preferences_line(career_ops)}\n\n"
         f"{policy_line(policy)}\n\n"
         f"Rows already carrying status \"{READY_STATUS}\" are forms filled on a previous "
         "session and waiting on the candidate — leave them for the candidate unless the "
@@ -2053,11 +2088,13 @@ def kickoff_prompt(work_order: Path, board: str = "", *, policy: str | None = No
         "(resume_base names a base; a non-empty resume_pdf is pre-tailored), "
         "fill the application through the browser, and submit or stop per the "
         "policy above (easy_apply marks a board-hosted one-click application).\n\n"
+        f"For a row whose resume_pdf is empty, "
+        f"{_default_resume_line(default_resume)}.\n\n"
         + _writeback_contract(work_order)
     )
 
 
-def session_summaries(out_dir) -> list[dict]:
+def session_summaries(out_dir, *, career_ops=None) -> list[dict]:
     """Enumerate the per-site sessions written to out_dir: one dict per
     next-roles-<site>.jsonl that still has work in it, carrying its board, human
     label, file path, `fresh` (rows with an empty status) and `ready` (rows
@@ -2079,7 +2116,7 @@ def session_summaries(out_dir) -> list[dict]:
             "work_order": str(wo),
             "fresh": fresh,
             "ready": ready,
-            "kickoff": kickoff_prompt(wo, board=board),
+            "kickoff": kickoff_prompt(wo, board=board, career_ops=career_ops),
         })
     return out
 
@@ -2136,9 +2173,11 @@ def role_prompt(company: str, role: str, url: str, *,
                 report: Path | None = None,
                 profile: Path | None = None,
                 resume: Path | None = None,
+                default_resume: Path | None = None,
                 policy: str | None = None,
                 easy_apply: bool | None = None,
-                area: str = "") -> str:
+                area: str = "",
+                career_ops=None) -> str:
     """The paste-ready prompt for handing ONE role to a browser agent. The
     caller (the UI route) gathers the facts/paths; this module renders them so
     the writeback contract and the appended-row schema — which must mirror the
@@ -2146,6 +2185,9 @@ def role_prompt(company: str, role: str, url: str, *,
     the fallback row's status follow the submit policy AND, under
     submit-easy-apply, the row's `easy_apply` flag (None = unknown): the
     fallback says `applied` only for a role the agent is told to submit.
+
+    `default_resume` is the file to upload when `resume` (a tailored copy) is
+    None, this copy's when not given — as in the kickoff prompt.
 
     `area` is the #180 out-of-area label when the role needs a body somewhere the
     candidate has not said they can work. It is stated here because this is the
@@ -2182,12 +2224,13 @@ def role_prompt(company: str, role: str, url: str, *,
         )
     if report:
         lines.append(f"Evaluation report: {report}")
-    lines.append(f"Candidate profile (qualify + tailor against it): {profile}")
+    lines.append(f"Candidate profile (qualify + tailor against it): {profile}"
+                 f"{_tailoring_preferences_line(career_ops)}")
     if resume:
         lines.append(f"Tailored resume: {resume}")
     else:
-        lines.append("Resume: no tailored copy cached — tailor one from "
-                     "resumes/resume.docx, or apply with your default resume.")
+        lines.append("Resume: no tailored copy cached — "
+                     f"{_default_resume_line(default_resume)}.")
     fallback_row = json.dumps({
         "company": company, "role": role, "url": url, "status": fallback_status,
     })
@@ -2229,6 +2272,12 @@ def run(
         # Best-effort: a misconfigured/unwritable HANDOFF_OUT_DIR must not crash a
         # no-queue run (a real work-order write below surfaces the failure loudly).
         print(f"[handoff] could not prepare {out_dir} ({e})")
+    # A Markdown résumé's upload PDF, re-rendered if resume.md changed since —
+    # the kickoff prompt below names it as the file to attach.
+    from pipeline.resume_markdown import ensure_base_pdf
+    from pipeline.resume_text import resolve_resume_path
+    if warning := ensure_base_pdf(ROOT, resolve_resume_path(os.environ.get("RESUME_PATH", ""), ROOT)):
+        print(f"[handoff] {warning}")
     co = _career_ops_dir(career_ops)
     if job_log is None:
         env_log = (os.environ.get("HANDOFF_JOB_LOG") or "").strip()
@@ -2425,8 +2474,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--limit", type=int, default=None,
                     help="Cap EACH site's session to the top N roles (per-site, not a global total)")
     ap.add_argument("--tailor", action="store_true",
-                    help="Pre-tailor a candidate-named resume per row (reuses the "
-                         "resume-tailoring stage; needs resumes/resume.docx) so the "
+                    help="Pre-tailor a candidate-named resume per row — built from "
+                         "the handoff PROFILE.md and your tailoring preferences "
+                         "(needs an LLM key, python-docx and LibreOffice) — so the "
                          "work-order ships ready-to-upload files")
     ap.add_argument("--tailor-min-score", type=float, default=None,
                     help="Only pre-tailor rows scoring >= this "

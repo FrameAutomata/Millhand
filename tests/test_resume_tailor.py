@@ -64,7 +64,7 @@ def _job(company="Acme", score=4.5, report="", role="Backend Engineer"):
 class TestCustomTailoringInstructions:
     """Free-text candidate guidance from setup is appended to the tailoring SYSTEM
     prompt as trusted preferences — applied within the existing hard rules, so it
-    can't license fabrication. Loaded from profile.yml; absent -> no block."""
+    can't license fabrication. Absent -> no block."""
 
     def _slots(self):
         return [rt.Slot(id="s1", kind="summary", para_index=0, text="Software engineer.")]
@@ -79,14 +79,12 @@ class TestCustomTailoringInstructions:
         system, _ = rt.build_prompt(self._slots(), "r", _job(), "", "")
         assert "preference" not in system.lower()
 
-    def test_loads_instructions_from_profile_yml(self, tmp_path):
-        (tmp_path / "config").mkdir()
-        (tmp_path / "config" / "profile.yml").write_text(
-            "tailoring:\n  instructions: Keep bullets to one line.\n", encoding="utf-8")
-        assert rt._tailoring_instructions(tmp_path) == "Keep bullets to one line."
-
-    def test_missing_instructions_is_empty(self, tmp_path):
-        assert rt._tailoring_instructions(tmp_path) == ""
+    def test_reads_the_guidance_every_tailor_shares(self):
+        """Its rules (tailoring.md first, an older copy's profile.yml key as the
+        fallback) are pinned in tests/test_tailoring_guidance.py; what matters
+        here is that this tailor reads through that reader, not its own."""
+        from pipeline import tailoring_guidance
+        assert rt.tailoring_guidance is tailoring_guidance.tailoring_guidance
 
 
 # ── classification ───────────────────────────────────────────────────────────

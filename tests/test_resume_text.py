@@ -1,11 +1,12 @@
 """Tests for pipeline.resume_text — format-dispatching resume extraction.
 
-The module is the single source of truth for turning a resume file (PDF / DOCX /
-ODT / TXT) into plain text, used by both the keyword-scoring filter and the UI
-onboarding upload. These tests pin the DOCX/ODT/TXT branches, the dispatch
-contract, and the PDF run-together retry.
+The module is the single source of truth for turning a resume file (Markdown /
+PDF / DOCX / ODT / TXT) into plain text, used by both the keyword-scoring filter
+and the UI onboarding upload. These tests pin the Markdown/DOCX/ODT/TXT branches,
+the dispatch contract, the probe order, and the PDF run-together retry.
 """
 
+import re
 import sys
 import types
 from pathlib import Path
@@ -266,3 +267,169 @@ class TestResolveResumePath:
         """Derived, not restated — adding a format can't leave the probe behind."""
         assert resume_text.PROBE_NAMES == tuple(
             f"resume{s}" for s in resume_text.IMPORT_SUFFIXES)
+
+
+_MD_RESUME = """# Jane Q. Example
+
+jane@example.com · [LinkedIn](https://linkedin.com/in/janeq) · <https://janeq.example>
+
+## Summary
+**Patient access** specialist with *five years* of intake_coordination work.
+
+## Experience
+### Intake Lead — Example Health (2021–2024)
+- Cut wait times **32%** by redesigning check-in
+1. Trained 14 staff on `Epic`
+> Recognised for \\*zero\\* registration errors
+
+---
+| Skill | Level |
+|---|---|
+| Epic | Strong |
+"""
+
+
+class TestMarkdownResume:
+    """A Markdown résumé is read as plain text for scoring, resumes/resume.txt
+    and the contact parser: the syntax goes, the words — and a link's URL,
+    which is where a Markdown résumé keeps its LinkedIn — stay."""
+
+    def test_syntax_is_dropped_and_the_words_kept(self, tmp_path):
+        f = tmp_path / "resume.md"
+        f.write_text(_MD_RESUME, encoding="utf-8")
+        text = resume_text.extract_resume_text(f)
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        assert lines[0] == "Jane Q. Example"            # the contact parser keys off line 1
+        assert "Patient access specialist with five years of intake_coordination work." in text
+        assert "Cut wait times 32% by redesigning check-in" in text
+        assert "Trained 14 staff on Epic" in text
+        assert "Recognised for *zero* registration errors" in text   # an escape is literal
+        assert "Epic · Strong" in text
+        for syntax in ("#", "**", "](", "|", "---", "> "):
+            assert syntax not in text, syntax
+
+    def test_a_link_keeps_the_url_its_text_does_not_show(self, tmp_path):
+        f = tmp_path / "resume.md"
+        f.write_text(_MD_RESUME, encoding="utf-8")
+        text = resume_text.extract_resume_text(f)
+        assert "LinkedIn (linkedin.com/in/janeq)" in text
+        assert "janeq.example" in text and "<https" not in text
+
+    def test_the_contact_parser_finds_what_the_markdown_says(self, tmp_path):
+        pytest.importorskip("fastapi")      # onboard lives with the UI
+        from pipeline.app import onboard
+        f = tmp_path / "resume.md"
+        f.write_text(_MD_RESUME, encoding="utf-8")
+        info = onboard.parse_resume_info(resume_text.extract_resume_text(f))
+        assert info["name"] == "Jane Q. Example"
+        assert info["email"] == "jane@example.com"
+        assert info["linkedin"] == "linkedin.com/in/janeq"
+
+    def test_markdown_suffix_and_bom_and_bytes(self, tmp_path):
+        f = tmp_path / "cv.markdown"
+        f.write_bytes("\ufeff# Jane\n- Python".encode("utf-8"))
+        assert resume_text.extract_resume_text(f) == "Jane\nPython"
+        assert resume_text.extract_resume_bytes(b"# Jane\n**Go**", "x.md") == "Jane\nGo"
+
+    def test_non_utf8_markdown_says_what_to_do(self, tmp_path):
+        f = tmp_path / "resume.md"
+        f.write_bytes("# Jos\xe9".encode("cp1252"))
+        with pytest.raises(ValueError, match="UTF-8"):
+            resume_text.extract_resume_text(f)
+
+
+def _resumes(tmp_path, *names):
+    d = tmp_path / "resumes"
+    d.mkdir()
+    for n in names:
+        (d / n).write_bytes(b"x")
+    return d
+
+
+class TestMarkdownProbeOrder:
+    """resume.md is the file a person who keeps one edits, so with an export
+    beside it the Markdown is what is scored. A copy with no Markdown file
+    probes exactly as it always did."""
+
+    def test_markdown_wins_over_an_export_beside_it(self, tmp_path):
+        d = _resumes(tmp_path, "resume.md", "resume.pdf", "resume.docx")
+        assert resume_text.resolve_resume_path("", tmp_path) == d / "resume.md"
+
+    def test_a_copy_without_markdown_is_unchanged(self, tmp_path):
+        d = _resumes(tmp_path, "resume.pdf", "resume.docx", "resume.odt")
+        assert resume_text.resolve_resume_path("", tmp_path) == d / "resume.pdf"
+        (d / "resume.pdf").unlink()
+        assert resume_text.resolve_resume_path("", tmp_path) == d / "resume.docx"
+
+    def test_the_rendered_pdf_is_never_probed(self, tmp_path):
+        """It is derived, so it lives where the probe does not look."""
+        pdf = tmp_path / resume_text.RENDERED_RESUME_PDF
+        pdf.parent.mkdir(parents=True)
+        pdf.write_bytes(b"%PDF")
+        assert not resume_text.resolve_resume_path("", tmp_path).exists()
+
+    def test_setup_profile_probes_the_same_files_in_the_same_order(self):
+        """setup-profile.mjs's interactive path finds the résumé with its own
+        list, a hand-copy of PROBE_NAMES that Node cannot import. Its resumes/
+        entries must be exactly that tuple, in order, or the CLI setup and the
+        filter score different files when several are on disk."""
+        mjs = (Path(__file__).resolve().parent.parent / "setup-profile.mjs").read_text(encoding="utf-8")
+        block = mjs[mjs.index("const defaultLocations = ["):]
+        block = block[:block.index("];")]
+        probed = tuple(re.findall(r"path\.join\(ROOT, 'resumes', '([^']+)'\)", block))
+        assert probed == resume_text.PROBE_NAMES
+
+
+def test_setup_profile_reads_the_same_suffixes_as_markdown():
+    """setup-profile.mjs decides "seed cv.md as written" with its own regex, a
+    hand-copy of MARKDOWN_SUFFIXES."""
+    mjs = (Path(__file__).resolve().parent.parent / "setup-profile.mjs").read_text(encoding="utf-8")
+    alternatives = re.search(r"function isMarkdownResume[^{]*\{\s*return /\\\.\(([^)]*)\)\$/i", mjs).group(1)
+    assert {f".{a}" for a in alternatives.split("|")} == set(resume_text.MARKDOWN_SUFFIXES)
+
+
+class TestUploadResumePath:
+    """Which file an application form is given when no tailored copy exists.
+    A Markdown résumé is the source of truth but no form takes it, so its
+    upload file is the PDF rendered from it, else an export beside it."""
+
+    @pytest.mark.parametrize("on_disk, expected", [
+        (("resume.docx",), "resume.docx"),                 # uploadable: itself
+        (("resume.md", "resume.docx"), "resume.docx"),     # an export beside it
+        (("resume.md",), None),                            # nothing a form takes
+        ((), None),
+    ])
+    def test_which_file_is_uploaded(self, tmp_path, on_disk, expected):
+        d = _resumes(tmp_path, *on_disk)
+        want = (d / expected).resolve() if expected else None
+        assert resume_text.upload_resume_path("", tmp_path) == want
+
+    def test_a_current_render_is_preferred_to_an_export(self, tmp_path):
+        d = _resumes(tmp_path, "resume.md", "resume.pdf")
+        pdf = tmp_path / resume_text.RENDERED_RESUME_PDF
+        pdf.parent.mkdir()
+        pdf.write_bytes(b"%PDF")
+        mark = tmp_path / resume_text.RENDERED_SOURCE_MARK
+        assert resume_text.upload_resume_path("", tmp_path) == (d / "resume.pdf").resolve()
+        mark.write_text(resume_text.render_mark(d / "resume.md", b"x"), encoding="utf-8")
+        assert resume_text.upload_resume_path("", tmp_path) == pdf.resolve()
+
+
+class TestExtractDocumentBytes:
+    """The tailoring-guidance import: plain text comes back as written (a model
+    and a person both read Markdown well), the rest via the résumé extractors."""
+
+    def test_markdown_and_text_come_back_as_written(self):
+        md = "# Preferences\n- **Lead** with outcomes\n"
+        assert resume_text.extract_document_bytes(md.encode(), "g.md") == md
+        assert resume_text.extract_document_bytes(b"\xef\xbb\xbfplain", "g.txt") == "plain"
+
+    def test_docx_goes_through_the_resume_extractor(self, tmp_path):
+        f = _make_docx(tmp_path / "g.docx", ["Keep bullets to one line."])
+        assert "Keep bullets to one line." in resume_text.extract_document_bytes(f.read_bytes(), "g.docx")
+
+    def test_unsupported_and_undecodable_raise_valueerror(self):
+        with pytest.raises(ValueError, match="Unsupported"):
+            resume_text.extract_document_bytes(b"x", "g.rtf")
+        with pytest.raises(ValueError, match="UTF-8"):
+            resume_text.extract_document_bytes("caf\xe9".encode("cp1252"), "g.txt")
