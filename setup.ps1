@@ -78,12 +78,13 @@ try { & "$root\.venv\Scripts\python.exe" -m pipeline.agent_cli --register-mcp-al
 catch { Write-Host "    Playwright MCP registration skipped: $($_.Exception.Message)" -ForegroundColor Yellow }
 Pop-Location
 
-# Tailored resumes (--apply): python-docx comes from requirements.txt; the
-# one-page verification additionally uses LibreOffice when present.
+# Rendered resumes: python-docx comes from requirements.txt, and turning a DOCX
+# into a PDF needs LibreOffice — for --handoff-tailor's one-page résumés and for
+# the upload PDF rendered from a Markdown resume.
 if (-not (Test-Path "C:\Program Files\LibreOffice\program\soffice.exe") -and
     -not (Get-Command soffice -ErrorAction SilentlyContinue)) {
-    Write-Host "    Note: LibreOffice not found - tailored resumes will upload as .docx" -ForegroundColor Yellow
-    Write-Host "    without one-page verification. Install LibreOffice to enable it." -ForegroundColor Yellow
+    Write-Host "    Note: LibreOffice not found - --handoff-tailor cannot build per-job resumes," -ForegroundColor Yellow
+    Write-Host "    and a Markdown resume gets no upload PDF. Install LibreOffice to enable both." -ForegroundColor Yellow
 }
 
 Write-Host "==> Copying example configs"

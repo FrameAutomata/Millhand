@@ -1769,3 +1769,184 @@ class TestCliSkillsScrubTheProfile:
             r = client.post("/api/skills/launch", json={"skill": "apply", "num": "1"})
         assert r.status_code == 200, r.text
         assert events == [("scrub", tmp_path / "career-ops"), "command"]
+
+
+# ── Markdown résumés and the tailoring-guidance import ────────────────────────
+
+from pipeline.resume_text import RENDERED_RESUME_PDF  # noqa: E402
+
+_MD_RESUME = b"# Jane Q. Example\n\njane@example.com\n\n## Experience\n- Cut waits **32%**\n"
+
+
+@pytest.fixture
+def md_wizard(client, tmp_path, mocker, monkeypatch):
+    """The wizard's submit with gh stubbed and ROOT on a tmp dir, the real
+    extractors, and the generator's payload captured."""
+    from pipeline.app import server
+    monkeypatch.delenv("RESUME_PATH", raising=False)
+    root = tmp_path / "root"
+    root.mkdir()
+    mocker.patch.object(server, "ROOT", root)
+    mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
+    mocker.patch.object(server.gh, "current_repo", return_value="me/private")
+    mocker.patch.object(server.gh, "set_secret")
+    mocker.patch.object(server.gh, "set_variable")
+    mocker.patch.object(server.onboard, "collect_secret_blobs", return_value={})
+    gen = mocker.patch.object(server.onboard, "run_generation", return_value={"ok": True})
+    return {"client": client, "root": root, "gen": gen}
+
+
+def _post_md(c, name="Jane_Resume.md", data=_MD_RESUME):
+    import json as _json
+    return c.post("/api/onboard", files={"resume": (name, data, "text/markdown")},
+                  data={"form": _json.dumps({"name": "Jane"})})
+
+
+class TestOnboardMarkdownResume:
+    """A Markdown résumé is kept as written (resumes/resume.md), read as text
+    for scoring (resume.txt), seeds cv.md as itself, and gets a base PDF
+    rendered for application uploads into a folder of its own."""
+
+    def test_a_docx_upload_still_retires_the_markdown(self, md_wizard, monkeypatch):
+        """Any other upload must, or resume.md would keep leading the probe."""
+        from pipeline.app import server
+        monkeypatch.setattr(server.onboard, "extract_resume_text", lambda data, name: "docx text")
+        resumes = md_wizard["root"] / "resumes"
+        resumes.mkdir()
+        (resumes / "resume.md").write_bytes(_MD_RESUME)
+        r = md_wizard["client"].post("/api/onboard", files={"resume": ("cv.docx", b"PK", "application/octet-stream")},
+                                     data={"form": '{"name": "Jane"}'})
+        assert r.status_code == 200, r.text
+        assert not (resumes / "resume.md").exists() and (resumes / "resume.docx").exists()
+
+    def test_a_resume_path_elsewhere_is_said(self, md_wizard, fake_soffice, monkeypatch, tmp_path):
+        """RESUME_PATH outranks the upload (#278): say so rather than let the
+        person believe the upload is what gets scored and sent."""
+        fake_soffice()
+        other = tmp_path / "elsewhere.docx"
+        other.write_bytes(b"PK")
+        monkeypatch.setenv("RESUME_PATH", str(other))
+        r = _post_md(md_wizard["client"])
+        assert r.status_code == 200, r.text
+        assert any("RESUME_PATH in .env names" in w for w in r.json()["warnings"])
+
+    def test_writes_resume_md_txt_and_a_rendered_pdf(self, md_wizard, fake_soffice):
+        fake_soffice()
+        resumes = md_wizard["root"] / "resumes"
+        resumes.mkdir()
+        (resumes / "resume.docx").write_bytes(b"PK an older resume")
+        (resumes / "resume.pdf").write_bytes(b"%PDF an older resume")
+        r = _post_md(md_wizard["client"])
+        assert r.status_code == 200, r.text
+        assert r.json()["warnings"] == []
+        assert (resumes / "resume.md").read_bytes() == _MD_RESUME
+        assert (resumes / "resume.txt").read_text(encoding="utf-8").startswith("Jane Q. Example\n")
+        assert (md_wizard["root"] / RENDERED_RESUME_PDF).read_bytes() == b"%PDF-1.4 rendered"
+        # Markdown leads the probe, so the files beside it stay, as exports: the
+        # upload a failed render falls back to.
+        assert sorted(p.name for p in resumes.iterdir()) == [
+            "rendered", "resume.docx", "resume.md", "resume.pdf", "resume.txt"]
+        payload = md_wizard["gen"].call_args[0][1]
+        assert payload["resumeMarkdown"] == _MD_RESUME.decode()
+        assert "**" not in payload["resumeText"]
+
+    def test_no_libreoffice_still_saves_and_says_so(self, md_wizard, fake_soffice):
+        fake_soffice(available=False)
+        r = _post_md(md_wizard["client"])
+        assert r.status_code == 200, r.text
+        (warning,) = r.json()["warnings"]
+        assert "No upload PDF could be rendered" in warning and "LibreOffice" in warning
+        assert (md_wizard["root"] / "resumes" / "resume.md").exists()
+        assert not (md_wizard["root"] / RENDERED_RESUME_PDF).exists()
+
+    def test_a_dot_markdown_upload_is_kept_as_resume_md(self, md_wizard, fake_soffice):
+        fake_soffice()
+        assert _post_md(md_wizard["client"], name="cv.markdown").status_code == 200
+        resumes = md_wizard["root"] / "resumes"
+        assert (resumes / "resume.md").exists() and not (resumes / "resume.markdown").exists()
+
+    def test_non_utf8_markdown_is_a_clear_400(self, md_wizard, fake_soffice):
+        fake_soffice()
+        r = _post_md(md_wizard["client"], data="# Jos\xe9".encode("cp1252"))
+        assert r.status_code == 400 and "UTF-8" in r.json()["detail"]
+
+    def test_re_picking_the_same_file_is_not_re_rendered(self, md_wizard, fake_soffice):
+        calls = fake_soffice()
+        assert _post_md(md_wizard["client"]).status_code == 200
+        assert _post_md(md_wizard["client"]).status_code == 200
+        assert len(calls) == 1
+
+    def test_an_edit_mode_save_keeps_seeding_cv_md_from_the_markdown(self, md_wizard, fake_soffice):
+        """No upload: the Markdown on file still seeds cv.md, or every later
+        Save would rebuild cv.md from plain text — and a missing PDF is
+        rendered."""
+        import json as _json
+        fake_soffice()
+        resumes = md_wizard["root"] / "resumes"
+        resumes.mkdir()
+        (resumes / "resume.md").write_bytes(_MD_RESUME)
+        (resumes / "resume.txt").write_text("Jane Q. Example", encoding="utf-8")
+        r = md_wizard["client"].post("/api/onboard", data={"form": _json.dumps({"name": "Jane"})})
+        assert r.status_code == 200, r.text
+        assert md_wizard["gen"].call_args[0][1]["resumeMarkdown"] == _MD_RESUME.decode()
+        assert (md_wizard["root"] / RENDERED_RESUME_PDF).exists()
+
+    def test_a_pdf_upload_carries_no_markdown(self, md_wizard, monkeypatch):
+        from pipeline.app import server
+        monkeypatch.setattr(server.onboard, "extract_resume_text", lambda data, name: "pdf text")
+        r = _onboard_post(md_wizard["client"], {"name": "Jane"})
+        assert r.status_code == 200, r.text
+        assert "resumeMarkdown" not in md_wizard["gen"].call_args[0][1]
+        assert r.json()["warnings"] == []
+
+
+class TestExtractTextEndpoint:
+    """POST /api/onboard/extract-text — the tailoring-guidance import. The text
+    comes back for the wizard to put in the box; nothing is written."""
+
+    def _post(self, c, data, filename):
+        return c.post(f"/api/onboard/extract-text?filename={filename}", content=data)
+
+    def test_markdown_comes_back_as_written(self, client):
+        r = self._post(client, b"# Prefs\n- **Lead** with outcomes\n", "prefs.md")
+        assert r.status_code == 200, r.text
+        assert r.json() == {"text": "# Prefs\n- **Lead** with outcomes", "truncated": False,
+                            "chars": 32, "limit": 8000}
+
+    def test_unsupported_empty_and_textless_are_400(self, client):
+        assert self._post(client, b"x", "g.rtf").status_code == 400
+        assert self._post(client, b"", "g.md").status_code == 400
+        assert self._post(client, b"  \n ", "g.txt").status_code == 400
+
+    def test_an_unsupported_format_is_refused_before_the_body_is_read(self, client, monkeypatch):
+        from pipeline.app import server
+        monkeypatch.setattr(server.onboard, "GUIDANCE_IMPORT_MAX_BYTES", 64)
+        r = self._post(client, b"x" * 65, "g.rtf")
+        assert r.status_code == 400 and "Unsupported" in r.json()["detail"]
+
+    def test_oversized_is_413_before_extraction(self, client, monkeypatch):
+        from pipeline.app import server
+        monkeypatch.setattr(server.onboard, "GUIDANCE_IMPORT_MAX_BYTES", 64)
+        monkeypatch.setattr(server.onboard, "import_guidance_text",
+                            lambda *a: pytest.fail("an oversized upload must not be extracted"))
+        assert self._post(client, b"x" * 65, "g.txt").status_code == 413
+
+    def test_nothing_is_written(self, client, tmp_path, monkeypatch):
+        from pipeline.app import server
+        root = tmp_path / "root"
+        root.mkdir()
+        monkeypatch.setattr(server, "ROOT", root)
+        before = sorted(p for p in tmp_path.rglob("*"))
+        assert self._post(client, b"Lead with outcomes.", "g.txt").status_code == 200
+        assert sorted(p for p in tmp_path.rglob("*")) == before
+        assert not (tmp_path / "career-ops" / "config" / "tailoring.md").exists()
+
+    def test_a_cross_origin_post_is_refused(self, client):
+        r = client.post("/api/onboard/extract-text?filename=g.txt", content=b"x",
+                        headers={"Origin": "https://evil.example"})
+        assert r.status_code == 403
+
+    def test_a_lan_peer_is_refused(self, lan):
+        r = lan.peer(LAN_PEER).post("/api/onboard/extract-text?filename=g.txt", content=b"x")
+        assert r.status_code == 403
+        assert "loopback-only" in r.json()["detail"]

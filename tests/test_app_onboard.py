@@ -289,6 +289,63 @@ class TestNodeRoundTrip:
             assert key in derived, f"{key} was written but derive_form doesn't read it back"
             assert derived[key] == sent, f"{key} did not survive the round trip"
 
+    def test_tailoring_guidance_gets_its_own_file_not_a_profile_yml_key(self, tmp_path, monkeypatch):
+        """The guidance used to ride inside profile.yml — pasted into every
+        evaluation prompt, where it does nothing — while the tailor the
+        work-order uses never read it. The generator writes it to
+        career-ops/config/tailoring.md now, and an evaluation of the generated
+        copy never sees it."""
+        from pipeline._batch_common import eval_system_prompt
+        work = _node_workdir(tmp_path)
+        form = {"name": "Jane Dev", "tailoring_instructions": "TAILOR_XYZ lead with impact."}
+        onboard.run_generation(work, onboard.build_onboarding_json(form, "Jane Dev\nSKILLS\nPython"))
+        co = work / "career-ops"
+        assert (co / "config" / "tailoring.md").read_text(encoding="utf-8") == "TAILOR_XYZ lead with impact.\n"
+        profile = yaml.safe_load((co / "config" / "profile.yml").read_text(encoding="utf-8"))
+        assert "tailoring" not in profile
+        monkeypatch.setenv("HANDOFF_OUT_DIR", str(tmp_path / "no-handoff"))
+        assert "TAILOR_XYZ" not in eval_system_prompt(co)
+
+    def test_blank_guidance_removes_the_file_and_an_absent_field_keeps_it(self, tmp_path):
+        work = _node_workdir(tmp_path)
+        guidance = work / "career-ops" / "config" / "tailoring.md"
+        guidance.write_text("Stale guidance.", encoding="utf-8")
+        # A caller that never asked about tailoring leaves the file alone...
+        payload = onboard.build_onboarding_json({"name": "Jane"}, "Jane\nSKILLS\nx")
+        del payload["info"]["tailoringInstructions"]
+        onboard.run_generation(work, payload)
+        assert guidance.read_text(encoding="utf-8") == "Stale guidance."
+        # ...while the wizard, which always sends the field, clears it.
+        onboard.run_generation(work, onboard.build_onboarding_json(
+            {"name": "Jane", "tailoring_instructions": "  "}, "Jane\nSKILLS\nx"))
+        assert not guidance.exists()
+
+    def test_a_run_not_told_the_guidance_carries_an_older_copys_key_across(self, tmp_path):
+        """The interview never asks, and the profile.yml it writes no longer has
+        the key — so an older copy's guidance moves to the file rather than
+        vanishing with the rewrite."""
+        work = _node_workdir(tmp_path)
+        co = work / "career-ops"
+        (co / "config" / "profile.yml").write_text(
+            "tailoring:\n  instructions: Keep it to one page.\n", encoding="utf-8")
+        payload = onboard.build_onboarding_json({"name": "Jane"}, "Jane\nSKILLS\nx")
+        del payload["info"]["tailoringInstructions"]
+        onboard.run_generation(work, payload)
+        assert (co / "config" / "tailoring.md").read_text(encoding="utf-8") == "Keep it to one page.\n"
+        assert "tailoring" not in yaml.safe_load((co / "config" / "profile.yml").read_text(encoding="utf-8"))
+
+    def test_a_markdown_resume_seeds_cv_md_as_written(self, tmp_path):
+        """cv.md is a Markdown CV already: rebuilding one from section-matched
+        plain text drops what the matcher does not know (here a Volunteering
+        section and every bullet's bold)."""
+        work = _node_workdir(tmp_path)
+        md = ("# Jane Dev\n\njane@example.com\n\n## Experience\n- **Cut** waits 32%\n\n"
+              "## Volunteering\n- Food bank, 2019–2024\n")
+        payload = onboard.build_onboarding_json({"name": "Jane Dev"}, "Jane Dev\nExperience\nCut waits 32%",
+                                                resume_markdown=md)
+        onboard.run_generation(work, payload)
+        assert (work / "career-ops" / "cv.md").read_text(encoding="utf-8") == md
+
     def test_generated_profile_has_no_self_id_section(self, tmp_path):
         """The real generator writes no self-ID section, whatever it is sent
         (#227) — a stale tab's form fields AND the camelCase keys an older
@@ -692,7 +749,9 @@ class TestDeriveFromProfile:
         assert derived["website"] == "janedev.dev"
         assert derived["street"] == "1 Main St"
         assert derived["postal_code"] == "75201"
-        assert derived["tailoring_instructions"] == "Lead with impact."
+        # Not from profile.yml any more: the guidance has its own file, read
+        # back by derive_form (TestTailoringGuidanceReadBack).
+        assert "tailoring_instructions" not in derived
 
     def test_blank_file_values_are_omitted(self, derived):
         # A blank in the file is a field the setup route never filled, not an
@@ -933,6 +992,117 @@ searches:
 filter:
   remote_requires_mention: false
 """)) == []
+
+
+class TestTailoringGuidanceReadBack:
+    """The wizard's tailoring box reads back what the tailors follow: the
+    guidance file, else an older copy's profile.yml key."""
+
+    def _write(self, tmp_path, guidance=None):
+        co = tmp_path / "career-ops"
+        (co / "config").mkdir(parents=True)
+        (co / "config" / "profile.yml").write_text(PROFILE_YML, encoding="utf-8")
+        if guidance is not None:
+            (co / "config" / "tailoring.md").write_text(guidance, encoding="utf-8")
+        return co
+
+    def test_reads_the_guidance_file(self, tmp_path):
+        co = self._write(tmp_path, guidance="# Prefs\n- Lead with outcomes.\n")
+        assert onboard.derive_form(tmp_path, co)["tailoring_instructions"] == (
+            "# Prefs\n- Lead with outcomes.")
+
+    def test_an_older_copy_reads_its_profile_yml_key(self, tmp_path):
+        """So the next Save carries it into the file instead of dropping it."""
+        assert onboard.derive_form(tmp_path, self._write(tmp_path))["tailoring_instructions"] == (
+            "Lead with impact.")
+
+    @pytest.mark.parametrize("guidance", ["  \n", None])     # emptied, or deleted by hand
+    def test_what_the_tailors_follow_outranks_the_last_saves_text(self, tmp_path, guidance):
+        """The tailors follow nothing here, so the box must show nothing: the
+        sidecar's older text would otherwise fill it and the next Save would
+        write it back."""
+        co = self._write(tmp_path, guidance=guidance)
+        (co / "config" / "profile.yml").write_text("candidate:\n  full_name: Jane\n", encoding="utf-8")
+        onboard.save_sidecar(tmp_path, {"tailoring_instructions": "Lead with outcomes."})
+        assert onboard.prefill_form(tmp_path, co)["tailoring_instructions"] == ""
+
+    def test_an_unreadable_file_is_neither_shown_blank_nor_deleted(self, tmp_path):
+        """Read as blank, the box would be empty and Save would remove the file."""
+        co = self._write(tmp_path)
+        (co / "config" / "tailoring.md").write_bytes("Use \u201csmart\u201d quotes".encode("cp1252"))
+        onboard.save_sidecar(tmp_path, {"tailoring_instructions": "Lead with outcomes."})
+        assert onboard.prefill_form(tmp_path, co)["tailoring_instructions"] == "Lead with outcomes."
+        kept = onboard.build_onboarding_json({}, "x", keep_guidance_file=True)["info"]
+        assert "tailoringInstructions" not in kept            # the generator leaves the file alone
+        typed = onboard.build_onboarding_json({"tailoring_instructions": "New."}, "x",
+                                              keep_guidance_file=True)["info"]
+        assert typed["tailoringInstructions"] == "New."       # something typed is still an answer
+
+    def test_the_field_is_a_real_form_field(self, html):
+        assert 'name="tailoring_instructions"' in html
+
+
+class TestBuildOnboardingJsonMarkdown:
+    def test_markdown_rides_beside_the_text_only_when_given(self):
+        base = onboard.build_onboarding_json({"name": "Jane"}, "Jane")
+        assert "resumeMarkdown" not in base
+        md = onboard.build_onboarding_json({"name": "Jane"}, "Jane", resume_markdown="# Jane\n")
+        assert md["resumeMarkdown"] == "# Jane\n" and md["resumeText"] == "Jane"
+
+    def test_the_guidance_field_is_always_sent(self):
+        """Blank is an answer the wizard gives (the box is always on screen), and
+        the generator removes the file for it."""
+        assert onboard.build_onboarding_json({}, "x")["info"]["tailoringInstructions"] == ""
+
+
+class TestImportGuidanceText:
+    def test_short_text_comes_back_whole(self):
+        out = onboard.import_guidance_text(b"# Prefs\r\n- Lead with outcomes.\r\n", "g.md")
+        assert out == {"text": "# Prefs\n- Lead with outcomes.", "truncated": False,
+                       "chars": 29, "limit": onboard.GUIDANCE_IMPORT_MAX_CHARS}
+
+    def test_long_text_is_cut_at_a_word_and_says_so(self):
+        words = ("emphasise outcomes " * 1000).encode()
+        out = onboard.import_guidance_text(words, "g.txt")
+        assert out["truncated"] is True and out["chars"] > onboard.GUIDANCE_IMPORT_MAX_CHARS
+        assert len(out["text"]) <= onboard.GUIDANCE_IMPORT_MAX_CHARS
+        assert out["text"].split()[-1] in ("emphasise", "outcomes")   # never mid-word
+
+
+class TestMarkdownResume:
+    """What cv.md is seeded from: the résumé as written, only for Markdown."""
+
+    def test_markdown_as_written_and_nothing_else(self, tmp_path):
+        md = tmp_path / "resume.md"
+        md.write_bytes("\ufeff# Jane\n- **Go**\n".encode("utf-8"))
+        assert onboard.markdown_resume(md) == "# Jane\n- **Go**\n"
+        (tmp_path / "resume.pdf").write_bytes(b"%PDF")
+        assert onboard.markdown_resume(tmp_path / "resume.pdf") == ""
+        assert onboard.markdown_resume(tmp_path / "missing.md") == ""
+
+    def test_undecodable_markdown_is_said_and_read_as_none(self, tmp_path, capsys):
+        md = tmp_path / "resume.md"
+        md.write_bytes("# Jos\xe9".encode("cp1252"))
+        assert onboard.markdown_resume(md) == ""
+        assert "could not re-read resume.md" in capsys.readouterr().out
+
+
+class TestOnboardHtmlFileFormats:
+    """The wizard's two file inputs each mirror a constant in
+    pipeline/resume_text.py — the résumé input IMPORT_SUFFIXES, the guidance
+    import SUPPORTED_SUFFIXES. A format added there and not here is one the
+    server accepts and the file picker hides."""
+
+    @pytest.mark.parametrize("input_id, constant", [
+        ("resume", "IMPORT_SUFFIXES"),
+        ("tailoring-import", "SUPPORTED_SUFFIXES"),
+    ])
+    def test_each_input_accepts_exactly_its_formats(self, html, input_id, constant):
+        from pipeline import resume_text
+        tag = re.search(rf'<input id="{input_id}"[^>]*>', html, re.S).group(0)
+        accept = re.search(r'accept="([^"]*)"', tag).group(1)
+        accepted = {a.strip() for a in accept.split(",") if a.strip().startswith(".")}
+        assert accepted == set(getattr(resume_text, constant))
 
 
 class TestPrefillMerge:

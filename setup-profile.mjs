@@ -4,12 +4,13 @@
  * Career-Ops Profile Setup
  *
  * Auto-generates profile.yml and cv.md from your resume and search.yml config.
- * Reads PDF natively (pdf-parse); DOCX/ODT are read via the shared Python
- * extractor (pipeline/resume_text.py), so no extra npm deps are needed.
+ * Reads PDF natively (pdf-parse); DOCX/ODT/Markdown are read via the shared
+ * Python extractor (pipeline/resume_text.py), so no extra npm deps are needed.
+ * A Markdown resume also seeds cv.md as written (it already is a Markdown CV).
  *
  * Usage:
  *   node setup-profile.mjs                                      # Interactive setup
- *   node setup-profile.mjs --resume path/to/resume.docx         # Use specific resume (DOCX/ODT/PDF)
+ *   node setup-profile.mjs --resume path/to/resume.docx         # Use specific resume (MD/DOCX/ODT/PDF)
  *   node setup-profile.mjs --auto                               # Minimal prompts
  *   node setup-profile.mjs --cli opencode                       # Use local LLM
  *   node setup-profile.mjs --resume resume.txt --cli opencode   # Combine options
@@ -193,10 +194,13 @@ async function findResume(cliPath) {
     }
   }
 
-  // Check default locations. PDF first (historical default), then DOCX/ODT —
-  // matching pipeline/filter.py's probe order so both entry points agree on
-  // which file wins when several exist.
+  // Check default locations. The resumes/ entries are pipeline/resume_text.py's
+  // PROBE_NAMES, in its order (tests/test_resume_text.py holds them together):
+  // Markdown first, then PDF (the historical default), DOCX, ODT, so both entry
+  // points agree on which file wins when several exist.
   const defaultLocations = [
+    path.join(ROOT, 'resumes', 'resume.md'),
+    path.join(ROOT, 'resumes', 'resume.markdown'),
     path.join(ROOT, 'resumes', 'resume.pdf'),
     path.join(ROOT, 'resumes', 'resume.docx'),
     path.join(ROOT, 'resumes', 'resume.odt'),
@@ -213,7 +217,7 @@ async function findResume(cliPath) {
   // Ask user
   log('Resume not found automatically.');
   const resumePath = await prompt(
-    'Enter path to your resume (DOCX, ODT, PDF, or text file): '
+    'Enter path to your resume (Markdown, DOCX, ODT, PDF, or text file): '
   );
   if (!fs.existsSync(resumePath)) {
     error(`File not found: ${resumePath}`);
@@ -227,7 +231,7 @@ async function findResume(cliPath) {
 // Extract Resume Text
 // ============================================================
 
-// Locate the Python interpreter to delegate DOCX/ODT extraction to. Prefer the
+// Locate the Python interpreter to delegate DOCX/ODT/Markdown extraction to. Prefer the
 // project venv (created by setup) so odfpy/python-docx are guaranteed present;
 // fall back to a PATH python.
 function venvPython() {
@@ -242,8 +246,10 @@ function venvPython() {
 }
 
 // DOCX/ODT have no good pure-Node reader without extra deps, so reuse the one
-// Python extractor the rest of the pipeline uses. Returns null on failure so the
-// caller can fall back to AI extraction.
+// Python extractor the rest of the pipeline uses — which is also the one that
+// reads Markdown as plain text, so the contact parser and the scoring text see
+// the same words whichever entry point imported the resume. Returns null on
+// failure so the caller can fall back to AI extraction.
 function extractViaPython(resumePath) {
   try {
     const out = execFileSync(
@@ -260,9 +266,14 @@ function extractViaPython(resumePath) {
     );
     return out || null;
   } catch (e) {
-    warn(`DOCX/ODT extraction failed: ${(e.stderr || e.message || '').toString().trim()}`);
+    warn(`Resume extraction failed: ${(e.stderr || e.message || '').toString().trim()}`);
     return null;
   }
+}
+
+// pipeline/resume_text.py's MARKDOWN_SUFFIXES (tests/test_resume_text.py).
+function isMarkdownResume(resumePath) {
+  return /\.(md|markdown)$/i.test(String(resumePath || ''));
 }
 
 async function extractResumeText(resumePath) {
@@ -282,6 +293,10 @@ async function extractResumeText(resumePath) {
     if (text && text.trim()) return text;
     warn('Falling back to AI extraction...');
     return null; // Signal to use AI extraction
+  } else if (isMarkdownResume(resumePath)) {
+    // Plain text for the contact parser; the file as written still seeds cv.md.
+    const text = extractViaPython(resumePath);
+    return text && text.trim() ? text : fs.readFileSync(resumePath, 'utf-8');
   } else {
     return fs.readFileSync(resumePath, 'utf-8');
   }
@@ -1106,6 +1121,17 @@ function resolveNarrative(narrative, criteria, resumeText) {
 // Generate CV Markdown
 // ============================================================
 
+/**
+ * cv.md for a Markdown resume: the Markdown itself. It already is a Markdown
+ * CV, so its own headings, bullets and emphasis are kept, and nothing is
+ * dropped — generateCV keeps only the five sections extractResumeSections
+ * recognises, rebuilt from plain text, which is right for a PDF or DOCX and a
+ * loss for a document that was structured to begin with.
+ */
+function cvFromMarkdown(markdown) {
+  return String(markdown).replace(/\r\n?/g, '\n').replace(/^\uFEFF/, '').trimEnd() + '\n';
+}
+
 function generateCV(resumeText, info) {
   const sections = extractResumeSections(resumeText);
 
@@ -1238,10 +1264,9 @@ function generateProfile(info, criteria, narrative) {
       timezone: timezone,
       visa_status: info.requiresSponsorship ? 'Requires sponsorship' : 'No sponsorship needed',
     },
-    // Free-text resume-tailoring guidance the apply stage feeds to the tailor prompt.
-    tailoring: {
-      instructions: info.tailoringInstructions || '',
-    },
+    // No tailoring section: the resume-tailoring guidance has its own file,
+    // career-ops/config/tailoring.md (writeTailoringGuidance), since this one is
+    // pasted into every evaluation prompt, where the guidance does nothing.
     work_authorization: {
       citizenship: info.citizenship || '',
       legally_authorized_to_work_in: workAuthRegions,
@@ -1474,6 +1499,43 @@ function updateSearchConfig(targetRoles, negativeRoles, searchSettings) {
   return searchConfigPath;
 }
 
+/**
+ * The resume-tailoring guidance, in career-ops/config/tailoring.md — read by
+ * every tailor through pipeline/tailoring_guidance.py. Blank guidance removes
+ * the file. Returns the path when a file was written, else null.
+ */
+const TAILORING_GUIDANCE_PATH = path.join(CAREER_OPS_PATH, 'config', 'tailoring.md');
+
+function writeTailoringGuidance(text) {
+  const guidance = String(text || '').replace(/\r\n?/g, '\n').trim();
+  if (!guidance) {
+    fs.rmSync(TAILORING_GUIDANCE_PATH, { force: true });
+    return null;
+  }
+  fs.mkdirSync(path.dirname(TAILORING_GUIDANCE_PATH), { recursive: true });
+  fs.writeFileSync(TAILORING_GUIDANCE_PATH, guidance + '\n', 'utf-8');
+  return TAILORING_GUIDANCE_PATH;
+}
+
+/**
+ * For a run that was not told the guidance (the interactive interview, which
+ * never asks, or a payload without the field): an older copy still keeps it in
+ * profile.yml's `tailoring.instructions`, which the profile.yml this run
+ * writes no longer has — so carry it into tailoring.md first, unless that file
+ * already exists. Must run BEFORE writeProfile. Best-effort: an unreadable
+ * profile.yml simply has nothing to carry.
+ */
+function carryLegacyTailoringGuidance() {
+  if (fs.existsSync(TAILORING_GUIDANCE_PATH)) return null;
+  try {
+    const old = YAML.parse(fs.readFileSync(path.join(CAREER_OPS_PATH, 'config', 'profile.yml'), 'utf-8'));
+    const text = old && old.tailoring && old.tailoring.instructions;
+    return typeof text === 'string' && text.trim() ? writeTailoringGuidance(text) : null;
+  } catch {
+    return null;
+  }
+}
+
 function writeCV(cv) {
   const cvPath = path.join(CAREER_OPS_PATH, 'cv.md');
   fs.writeFileSync(cvPath, cv, 'utf-8');
@@ -1504,7 +1566,13 @@ function writeProfileMarkdown(markdown) {
  * generator functions already consume, so no generation logic is duplicated.
  *
  * Shape (all fields optional — sane defaults fill the gaps):
- *   { resumeText, info, criteria, searchSettings, narrative }
+ *   { resumeText, resumeMarkdown, info, criteria, searchSettings, narrative }
+ *
+ * `resumeMarkdown`, when present, is a Markdown resume as written: cv.md is
+ * seeded from it (cvFromMarkdown) rather than rebuilt from `resumeText`.
+ * `info.tailoringInstructions`, when present (the wizard sends it unless the
+ * file could not be read), is written to career-ops/config/tailoring.md, or
+ * removes it when blank; absent, an existing file is left alone.
  *
  * `info` also carries the optional work-authorization answers consumed by
  * generateProfile(): country, citizenship, workAuthRegions (string[]),
@@ -1580,9 +1648,14 @@ async function runFromJson(jsonPath) {
   }
 
   const profile = generateProfile(info, criteria, narrative);
-  const cv = generateCV(resumeText, info);
+  const cv = payload.resumeMarkdown ? cvFromMarkdown(payload.resumeMarkdown) : generateCV(resumeText, info);
   const profileMarkdown = generateProfileMarkdown(info, criteria, narrative);
 
+  // Written only when the payload carries the field (the wizard always does): a
+  // caller that never asked about tailoring must not delete guidance someone set
+  // elsewhere — it carries an older copy's profile.yml key across instead.
+  const tailoringFile = 'tailoringInstructions' in info
+    ? writeTailoringGuidance(info.tailoringInstructions) : carryLegacyTailoringGuidance();
   const profileFile = writeProfile(profile);
   const cvFile = writeCV(cv);
   const profileMdFile = writeProfileMarkdown(profileMarkdown);
@@ -1592,9 +1665,10 @@ async function runFromJson(jsonPath) {
   success(`CV saved: ${cvFile}`);
   success(`Career narrative saved: ${profileMdFile}`);
   if (searchFile) success(`Search config updated: ${searchFile}`);
+  if (tailoringFile) success(`Tailoring guidance saved: ${tailoringFile}`);
 
   // Machine-readable result line for the orchestrator.
-  console.log(JSON.stringify({ ok: true, profileFile, cvFile, profileMdFile, searchFile }));
+  console.log(JSON.stringify({ ok: true, profileFile, cvFile, profileMdFile, searchFile, tailoringFile }));
 }
 
 // ============================================================
@@ -1682,13 +1756,18 @@ async function main() {
   // Prompt for career narrative (for _profile.md)
   const narrative = await promptForCareerNarrative(args.auto, info, criteria, resumeText);
 
-  // Generate files
+  // Generate files.
   log('Generating profile.yml, cv.md, and _profile.md...');
   const profile = generateProfile(info, criteria, narrative);
-  const cv = generateCV(resumeText, info);
+  const cv = isMarkdownResume(resumePath)
+    ? cvFromMarkdown(fs.readFileSync(resumePath, 'utf-8'))
+    : generateCV(resumeText, info);
   const profileMarkdown = generateProfileMarkdown(info, criteria, narrative);
 
-  // Write files
+  // Write files. The interview asks nothing about tailoring guidance, so it
+  // leaves career-ops/config/tailoring.md as it found it — carrying an older
+  // copy's profile.yml key into it before the rewrite below drops the key.
+  carryLegacyTailoringGuidance();
   const profileFile = writeProfile(profile);
   const cvFile = writeCV(cv);
   const profileMdFile = writeProfileMarkdown(profileMarkdown);

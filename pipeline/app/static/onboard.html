@@ -21,21 +21,29 @@
       <!-- 1. Resume -->
       <section class="step" data-step="0">
         <h2>Your resume</h2>
-        <p class="hint">Upload your resume as a <strong>DOCX</strong>, <strong>ODT</strong>,
-          or PDF. DOCX/ODT are recommended — the AI tailors an editable resume per
-          job far more cleanly than a PDF. We extract the text for keyword scoring
-          and the cloud evaluator; it never leaves your machine except as an
+        <p class="hint">Upload your resume as <strong>Markdown</strong> (.md),
+          <strong>DOCX</strong>, <strong>ODT</strong>, or PDF — the first three extract
+          more cleanly than a PDF. A Markdown resume becomes your career-ops CV as
+          written, and a PDF of it is rendered to <code>resumes/rendered/resume.pdf</code> for
+          application uploads (needs LibreOffice). We extract the text for keyword
+          scoring and the cloud evaluator; it never leaves your machine except as an
           encrypted GitHub secret. We'll also auto-fill the About step from it.</p>
-        <label>Resume (DOCX, ODT, or PDF)
+        <label>Resume (Markdown, DOCX, ODT, or PDF)
           <input id="resume" type="file"
-            accept=".docx,.odt,.pdf,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.oasis.opendocument.text"
+            accept=".md,.markdown,.pdf,.docx,.odt,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.oasis.opendocument.text"
             required />
         </label>
         <label style="margin-top:10px">Resume tailoring instructions <span class="muted">(optional)</span>
           <textarea name="tailoring_instructions" rows="3" autocomplete="off"
             placeholder="e.g. Emphasize leadership and cloud architecture; keep bullets to one line; lead with impact, not buzzwords."></textarea>
         </label>
-        <p class="hint">Free-text guidance the AI follows when tailoring your resume for each job — applied within the honesty rules (it can reorder and re-emphasize, never invent experience).</p>
+        <span style="display:flex; gap:8px; align-items:center; margin-top:6px">
+          <button type="button" id="tailoring-import-btn">Import from file…</button>
+          <input id="tailoring-import" type="file" hidden
+            accept=".md,.markdown,.txt,.docx,.odt,.pdf" />
+          <span class="muted">Markdown, text, DOCX, ODT or PDF — its text fills the box above for you to review and edit; nothing is saved until you Save.</span>
+        </span>
+        <p class="hint">Free-text guidance the AI follows when tailoring your resume for each job — applied within the honesty rules (it can reorder and re-emphasize, never invent experience). Saved on this machine to <code>career-ops/config/tailoring.md</code>, which every resume tailor reads; job evaluation never sees it.</p>
       </section>
 
       <!-- 2. About -->

@@ -14,7 +14,7 @@ Scrapes job boards, filters results against your resume, optionally pre-screens 
 
 - Python 3.12 (jobspy pins `numpy==1.26.3`, no 3.13 wheel)
 - Node.js 20+ (career-ops + profile setup — career-ops pins `playwright@1.62.1`, which requires Node 20)
-- A resume — DOCX, ODT, or PDF (DOCX recommended: per-job resume tailoring slot-edits a DOCX, and editable formats extract more cleanly than PDF)
+- A resume — Markdown (`.md`), DOCX, ODT, or PDF (the first three extract more cleanly than a PDF; a Markdown resume becomes your career-ops CV as written, and the wizard renders a PDF of it for application uploads, which needs LibreOffice)
 - At least one of:
   - An agent CLI — for applying (see [Applying to jobs](#applying-to-jobs)) and for `--batch` interactive evaluation. The default, OpenCode, is free and needs no API key; see [Choosing an agent CLI](#choosing-an-agent-cli) for the full list with tiers and install lines. Any of them can be backed by a local [Ollama](https://ollama.com) model via `OLLAMA_MODEL`
   - An LLM API key for `--evaluate-batch` (synchronous parallel evaluation). Free-tier options: `GEMINI_API_KEY`, `GROQ_API_KEY`. Pay-as-you-go open-weight options: `DEEPINFRA_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`. Frontier paid: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`. See the "Which provider should I pick?" section below for choosing among them.
@@ -59,7 +59,7 @@ The wizard generates your profile **and** writes it to your private repo's GitHu
    ```
    Open http://localhost:8000 and click **⚙ Setup**. The status line up top shows the target repo, its visibility, and whether it's already configured.
 4. **Walk through the steps:**
-   - **Resume** — upload your resume as DOCX, ODT, or PDF (DOCX recommended — per-job tailoring slot-edits a DOCX). Text is extracted locally; the About step is auto-filled from it
+   - **Resume** — upload your resume as Markdown, DOCX, ODT, or PDF. Text is extracted locally; the About step is auto-filled from it. Optionally add résumé-tailoring instructions — type them, or **Import from file** (Markdown, text, DOCX, ODT or PDF, capped at 8,000 characters) to fill the box for review before you save
    - **About you** — name, email, location, optional phone / LinkedIn / GitHub / website
    - **Roles & compensation** — target roles, roles to avoid, target / minimum comp, location flexibility
    - **Search settings** — locations (`City, ST` pairs stay together; put "Remote" in a chunk for a remote pass), distance, recency (`hours_old`), max results, job boards, and an optional easy-apply pass (runs in the same once-a-day cloud run as every other pass)
@@ -94,9 +94,10 @@ Either path creates / rewrites:
 - `career-ops/config/profile.yml` — your candidate profile
 - `career-ops/cv.md` — your CV in markdown
 - `career-ops/modes/_profile.md` — your career narrative and deal-breakers
+- `career-ops/config/tailoring.md` — your résumé-tailoring instructions, when you gave any (the wizard only; every résumé tailor reads it, and job evaluation never sees it — a copy set up earlier keeps them in `profile.yml` until its next wizard Save moves them)
 - `config/search.yml` — `searches:` block regenerated from your locations; `filter:` / `screen:` blocks preserved
 
-The wizard (Option A) also saves your uploaded resume under its own extension — `resumes/resume.docx` / `.odt` / `.pdf` — plus `resumes/resume.txt` (the extracted text used for keyword scoring). A saved `resume.docx` doubles as the source resume tailoring slot-edits per job (the `--handoff-tailor` work-order enrichment). Option B reads the resume path you point it at.
+The wizard (Option A) also saves your uploaded resume under its own extension — `resumes/resume.md` / `.docx` / `.odt` / `.pdf` — plus `resumes/resume.txt` (the extracted text used for keyword scoring). A Markdown resume is the source of truth: it seeds `career-ops/cv.md` as written, and a PDF of it is rendered to `resumes/rendered/resume.pdf` — the file the browser agent uploads for a role with no tailored copy, re-rendered on the next Save or handoff run after you edit the Markdown. Without LibreOffice that render fails and the wizard says so; install it, or put your own PDF or DOCX export beside the Markdown as `resumes/resume.pdf` or `resumes/resume.docx`. Option B reads the resume path you point it at.
 
 To re-run profile setup at any time, re-open the wizard or run `node setup-profile.mjs`. Re-running rewrites the `searches:` block from scratch.
 
@@ -502,7 +503,7 @@ Millhand/
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `CAREER_OPS_PATH` | `./career-ops` | Path to career-ops directory |
-| `RESUME_PATH` | auto-detected | Path to your resume (DOCX / ODT / PDF). Unset → auto-discovers `resumes/resume.{pdf,docx,odt}`. A `.txt` sibling, if present, is used directly and skips extraction. |
+| `RESUME_PATH` | auto-detected | Path to your resume (Markdown / DOCX / ODT / PDF). Unset → auto-discovers `resumes/resume.{md,pdf,docx,odt}`, Markdown first. A `.txt` sibling, if present, is used directly and skips extraction. |
 | `SEARCH_CONFIG` | `config/search.yml` | Path to search config |
 | `BATCH_CLI` | `opencode` | The agent CLI that applies for you and runs `--batch`. `python -m pipeline.agent_cli --list` prints the ids, tiers and what's installed. |
 | `AGENT_MODEL` | per-CLI | Model the agent CLI starts with, on both paths. Unset, each CLI uses its own — except `gemini`, which gets one with a workable free-tier quota. |

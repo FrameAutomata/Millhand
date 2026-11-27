@@ -3764,9 +3764,48 @@ def redact_profile_master(text: str) -> str:
     return "".join(out)
 
 
+# An older copy's résumé-tailoring guidance, before the wizard moved it to
+# career-ops/config/tailoring.md (pipeline/tailoring_guidance.py says why).
+_TAILORING_SECTION_RE = re.compile(r"""^["']?tailoring["']?[ \t]*:""")
+
+
+def drop_tailoring_section(text: str) -> str:
+    """`profile.yml` text without a top-level `tailoring:` section: nothing a
+    model is given profile.yml for uses it, and the tailors read it themselves.
+
+    Prompt-side only, never written back — the key is where that copy's
+    guidance lives until its next wizard Save moves it. Not a privacy rule, so
+    a plain line read is enough: the section ends at the next column-0 line
+    shaped like a top-level key (`_TOP_LEVEL_KEY_RE`, the rule the self-ID
+    redaction ends its section by)."""
+    out: list[str] = []
+    skipping = False
+    for line in _real_lines(text or ""):
+        col0 = bool(line[:1].strip())
+        if col0 and _TAILORING_SECTION_RE.match(line):
+            skipping = True
+            continue
+        if skipping:
+            if not (col0 and not line.startswith("#") and _TOP_LEVEL_KEY_RE.match(line)):
+                continue
+            skipping = False
+        out.append(line)
+    return "".join(out)
+
+
+def profile_yml_text_for_prompt(text: str) -> str:
+    """`profile.yml` text as anything a model will see may be given it: the
+    self-ID section redacted (`redact_profile_yml`), and an older copy's
+    `tailoring:` guidance dropped (`drop_tailoring_section` — the tailors read
+    it themselves). Every prompt builder goes through this or the read below,
+    so a filter added here reaches all of them."""
+    return drop_tailoring_section(redact_profile_yml(text))
+
+
 def profile_yml_for_prompt(career_ops) -> str:
-    """The one sanctioned read of `profile.yml` for anything a model will see."""
-    return redact_profile_yml(read_text(Path(career_ops) / "config" / "profile.yml"))
+    """The one sanctioned read of `profile.yml` for a prompt
+    (`profile_yml_text_for_prompt` over the file)."""
+    return profile_yml_text_for_prompt(read_text(Path(career_ops) / "config" / "profile.yml"))
 
 
 # career-ops' batch-runner.sh writes each offer's worker prompt to
@@ -4162,7 +4201,8 @@ def build_system_prompt(cv: str, profile_yml: str, profile_md: str = "", article
             extra += f"\n### Proof Points (article-digest.md)\n{article_digest}\n"
         candidate_profile = (
             f"### CV (read-only)\n{cv}\n\n"
-            f"### Profile (profile.yml)\n{redact_profile_yml(profile_yml)}\n{extra}"
+            f"### Profile (profile.yml)\n"
+            f"{profile_yml_text_for_prompt(profile_yml)}\n{extra}"
         )
 
     return f"""You are a job evaluation expert running in headless batch mode. \

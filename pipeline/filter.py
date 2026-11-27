@@ -86,7 +86,7 @@ def load_config(path: Path) -> dict:
 
 
 def extract_resume_text(resume_path: Path) -> str:
-    """Extract resume text, dispatching on the file's format (PDF/DOCX/ODT/TXT).
+    """Extract resume text, dispatching on the file's format (MD/PDF/DOCX/ODT/TXT).
     Thin delegate to pipeline.resume_text so scoring and the UI share one
     implementation."""
     return _resume_text.extract_resume_text(resume_path)
@@ -450,7 +450,7 @@ def run(config_path: Path) -> Path:
     else:
         raise FileNotFoundError(
             f"Resume not found at {resume_path} (or {resume_txt.name}). "
-            "Drop your resume (PDF, DOCX, or ODT) in resumes/ or set RESUME_PATH "
+            "Drop your resume (Markdown, PDF, DOCX, or ODT) in resumes/ or set RESUME_PATH "
             "in .env."
         )
 

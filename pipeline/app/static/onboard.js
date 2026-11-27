@@ -1,6 +1,6 @@
 "use strict";
 
-// Guided onboarding wizard. Collects a resume PDF + preferences, then POSTs
+// Guided onboarding wizard. Collects a resume + preferences, then POSTs
 // multipart to /api/onboard, which generates the profile artifacts and writes
 // them as GitHub secrets.
 
@@ -287,7 +287,7 @@ function validateStep(i) {
   // A resume is required only when there isn't one already — asked of the disk,
   // not of whether this wizard has been submitted before.
   if (i === 0 && !resumeInput.files[0] && !resumeOnFile) {
-    showAction("Please choose a resume (DOCX, ODT, or PDF) to continue.", "error");
+    showAction("Please choose a resume (Markdown, DOCX, ODT, or PDF) to continue.", "error");
     return false;
   }
   actionMsg.hidden = true;
@@ -338,7 +338,7 @@ function allowExistingResume() {
   const resumeHint = document.querySelector('[data-step="0"] .hint');
   if (resumeHint) {
     resumeHint.textContent =
-      "Resume already on file. Upload a new DOCX, ODT, or PDF to replace it, or skip this step to keep the existing one.";
+      "Resume already on file. Upload a new Markdown, DOCX, ODT, or PDF resume to replace it, or skip this step to keep the existing one.";
   }
 }
 
@@ -430,13 +430,46 @@ resumeInput.addEventListener("change", async () => {
   }
 });
 
+// "Import from file" for the tailoring guidance: the server extracts the text
+// (and caps it), and it lands in the textarea — never straight on disk — so the
+// person reads and edits exactly what every tailoring prompt will be given
+// before Save writes it. The body is the file itself; the name says its format.
+const guidanceBox = form.querySelector('[name="tailoring_instructions"]');
+const guidanceImport = document.getElementById("tailoring-import");
+document.getElementById("tailoring-import-btn").addEventListener("click", () => guidanceImport.click());
+guidanceImport.addEventListener("change", async () => {
+  const file = guidanceImport.files[0];
+  guidanceImport.value = "";            // choosing the same file again re-imports it
+  if (!file) return;
+  if (guidanceBox.value.trim() &&
+      !confirm(`Replace the tailoring instructions in the box with the text of ${file.name}?`)) return;
+  showAction(`Reading ${file.name}…`, "");
+  try {
+    const resp = await fetch(
+      `/api/onboard/extract-text?filename=${encodeURIComponent(file.name)}`,
+      { method: "POST", body: file });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `could not read ${file.name} (${resp.status})`);
+    guidanceBox.value = body.text;
+    showAction(
+      body.truncated
+        ? `Imported the first ${body.text.length.toLocaleString()} of ${body.chars.toLocaleString()} ` +
+          `characters of ${file.name} — the limit is ${body.limit.toLocaleString()}. ` +
+          "Review and trim it in the box, then Save."
+        : `Imported ${file.name} into the tailoring instructions — review it in the box, then Save.`,
+      body.truncated ? "error" : "ok");
+  } catch (e) {
+    showAction(String(e.message || e), "error");
+  }
+});
+
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = collectForm();
   // Each field is optional exactly when the thing it supplies already exists —
   // a resume on disk (the server extracts it), a provider secret on the repo.
   if (!resumeOnFile && !resumeInput.files[0]) {
-    showAction("A resume is required (DOCX, ODT, or PDF).", "error"); showStep(0); return;
+    showAction("A resume is required (Markdown, DOCX, ODT, or PDF).", "error"); showStep(0); return;
   }
   if (apiKeyRequired() && !f.api_key) {
     showAction("An API key is required to evaluate jobs.", "error"); showStep(5); return;
@@ -456,10 +489,15 @@ form.addEventListener("submit", async (e) => {
     const resp = await fetch("/api/onboard", { method: "POST", body: fd });
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(body.detail || `onboarding failed (${resp.status})`);
+    // A Save that worked can still carry something the person must act on —
+    // a Markdown resume whose upload PDF could not be rendered — so it is
+    // shown with the success line rather than lost in the server log.
+    const warnings = (body.warnings || []).join(" ");
     showAction(
       `Done — wrote ${body.secrets_written.length} secrets to ${body.repo}: ` +
-      `${body.secrets_written.join(", ")}. You can now go back and click "Run now".`,
-      "ok"
+      `${body.secrets_written.join(", ")}. You can now go back and click "Run now".` +
+      (warnings ? ` Note: ${warnings}` : ""),
+      warnings ? "error" : "ok"
     );
     submitBtn.hidden = true;
     nextBtn.hidden = true;

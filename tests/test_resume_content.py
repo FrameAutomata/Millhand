@@ -58,6 +58,20 @@ class TestBuildPrompt:
         assert "Senior Python Engineer" in user     # the JD
         assert "PROOF: shipped X to 5M" in user     # eval-report proof-points
 
+    def test_the_candidates_preferences_are_a_trusted_section_before_the_posting(self):
+        """The candidate's own guidance is the one trusted instruction text in
+        the user turn, so it is labelled apart from the untrusted posting and
+        sits ahead of it."""
+        system, user = resume_content.build_prompt(_PROFILE, _JD,
+                                                   guidance="Lead with the latency work.")
+        assert "TAILORING PREFERENCES (trusted" in user
+        assert user.index("Lead with the latency work.") < user.index("=== TARGET JOB (untrusted")
+        assert "TAILORING PREFERENCES" in system    # the rule that says how to treat them
+
+    def test_no_preferences_section_without_guidance(self):
+        _, user = resume_content.build_prompt(_PROFILE, _JD, guidance="  ")
+        assert "TAILORING PREFERENCES" not in user
+
 
 class TestParseContentJson:
     def test_parses_bare_json(self):
@@ -271,6 +285,65 @@ class TestGenerateForJob:
         monkeypatch.setattr(resume_content, "build_for_job", fake_build)
         resume_content.generate_for_job(co, job, profile_dir=pd, caller=lambda s, u: "")
         assert "PROOF POINT: shipped X" in seen["report"]
+
+    def test_the_candidates_tailoring_guidance_reaches_the_build_prompt(self, tmp_path, monkeypatch):
+        """The wizard's tailoring guidance (career-ops/config/tailoring.md) must
+        reach the tailor the work-order actually uses — this one never read it,
+        so `--handoff-tailor` built every résumé without it."""
+        from pipeline import resume_build, resume_fit
+        co, pd = self._dirs(tmp_path)
+        (co / "config").mkdir()
+        (co / "config" / "tailoring.md").write_text("Lead with the cost savings.", encoding="utf-8")
+        one_page = resume_fit.FitResult(ok=True, code=0, verdict="OK", fill=0.95, pages=1, notes=[])
+        monkeypatch.setattr("pipeline.resume_build.fit_to_page",
+                            lambda content, out_dir, **kw: resume_build.BuildResult(
+                                pdf=Path(out_dir) / ".fit.pdf", scale=1.0, fit=one_page))
+        (co / "output" / ".fit.pdf").write_bytes(b"%PDF")
+        prompts = []
+
+        def caller(system, user):
+            prompts.append(user)
+            return json.dumps(_CONTENT)
+
+        resume_content.generate_for_job(co, self._job(), profile_dir=pd, caller=caller)
+        assert prompts and "Lead with the cost savings." in prompts[0]
+        assert "TAILORING PREFERENCES (trusted" in prompts[0]
+
+    def test_a_change_of_preferences_rebuilds_a_cached_resume(self, tmp_path, monkeypatch):
+        """Set, then cleared: both are a change. Clearing removes the file, so a
+        comparison of mtimes would find nothing newer than the cache and keep
+        handing out the résumé built for preferences the person deleted."""
+        from pipeline import resume_build, resume_tailor
+        co, pd = self._dirs(tmp_path)
+        _, pdf_out = resume_tailor.resume_paths(co, "Acme")
+        pdf_out.write_bytes(b"%PDF cached")                   # newer than PROFILE.md,
+        Path(str(pdf_out) + ".role").write_text("Engineer", encoding="utf-8")  # built for this role
+        winner = tmp_path / "w.pdf"
+        built = []
+
+        def build(*a, **k):
+            built.append(k.get("guidance"))
+            winner.write_bytes(b"%PDF fresh")
+            return resume_build.BuildResult(pdf=winner, scale=1.0, fit=None)
+        monkeypatch.setattr(resume_content, "build_for_job", build)
+        guidance = co / "config" / "tailoring.md"
+        guidance.parent.mkdir()
+        guidance.write_text("New preferences.", encoding="utf-8")
+        resume_content.generate_for_job(co, self._job(), profile_dir=pd, caller=lambda s, u: "")
+        resume_content.generate_for_job(co, self._job(), profile_dir=pd, caller=lambda s, u: "")
+        assert built == ["New preferences."]                  # built once, then reused
+        guidance.unlink()                                     # a blank Save removes the file
+        resume_content.generate_for_job(co, self._job(), profile_dir=pd, caller=lambda s, u: "")
+        assert built == ["New preferences.", ""]
+        assert Path(str(pdf_out) + ".role").read_text(encoding="utf-8") == "Engineer"
+
+    def test_a_marker_reads_back_as_written_with_or_without_a_role(self):
+        """The sidecar is read back stripped, so what is written must be too —
+        an empty role used to lead with a newline and never match again."""
+        for role in ("", "Engineer"):
+            for guidance in ("", "Lead with outcomes."):
+                built_for = resume_content._built_for(role, guidance)
+                assert built_for == built_for.strip()
 
     def test_reuses_cached_pdf_newer_than_profile_and_role(self, tmp_path, monkeypatch):
         from pipeline import resume_tailor

@@ -83,8 +83,9 @@ def main() -> int:
                     help="Cap EACH site's session at the top N roles (per-site, not a global total)")
     ap.add_argument("--handoff-tailor", action="store_true",
                     help="With --handoff: pre-tailor a candidate-named resume per "
-                         "work-order row (needs resumes/resume.docx) so the agent "
-                         "gets ready-to-upload files")
+                         "work-order row, built from the handoff PROFILE.md (needs an "
+                         "LLM key, python-docx and LibreOffice) so the agent gets "
+                         "ready-to-upload files")
     ap.add_argument("--handoff-tailor-min-score", type=float, default=None,
                     help="With --handoff-tailor: only pre-tailor rows scoring >= "
                          f"this (default: APPLY_TAILOR_MIN_SCORE env, else {APPLY_MIN_SCORE})")

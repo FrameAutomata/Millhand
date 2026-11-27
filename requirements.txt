@@ -21,10 +21,9 @@ anthropic
 google-genai                       # Gemini (free tier available; default cloud provider)
 openai                             # OpenAI, Groq, DeepInfra, and Ollama (all OpenAI-compatible)
 
-# DOCX text extraction for resume import (scoring) AND per-job tailored resumes
-# for the browser-agent work-order (slot-edits a copy of resumes/resume.docx so
-# the formatting stays exactly yours). Pure-Python and tiny, so installed by
-# default — tailoring is on whenever resume.docx exists. One-page verification
-# additionally uses LibreOffice when installed (optional system dependency;
-# without it the budget-guarded .docx is used instead).
+# DOCX text extraction for resume import (scoring), the per-job tailored resumes
+# --handoff-tailor builds from PROFILE.md, and the base PDF the Setup wizard
+# renders from a Markdown resume (Markdown -> DOCX here, DOCX -> PDF with
+# LibreOffice, an optional system dependency both renders need). Pure-Python and
+# tiny, so installed by default.
 python-docx

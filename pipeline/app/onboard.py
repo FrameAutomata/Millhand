@@ -27,6 +27,7 @@ from pipeline.daily_digest import SECRET_VARS as _DIGEST_SECRET_VARS
 # but two readers of one file must not carry two policies for it.
 from pipeline.handoff import _as_bool, _dsect, _load_yaml_or_empty, target_roles
 from pipeline.sites import SUPPORTED_SITES, keep_supported, normalize_pass, resolve_sites
+from pipeline.tailoring_guidance import guidance_path, read_guidance
 
 # US states (50 + DC) and Canadian provinces — mirror of the sets in
 # setup-profile.mjs, used to keep "City, ST" pairs together and infer country.
@@ -249,13 +250,13 @@ def _put(out: dict, key: str, value) -> None:
 # form field -> profile.yml key, per section. A table rather than 20 near-identical
 # _put lines so this can be read in one screen against build_onboarding_json above,
 # which is the same mapping in the other direction. Only the pairs whose value is
-# free text live here; target_roles and the booleans need their own handling below.
+# free text live here; target_roles and the booleans need their own handling below,
+# and the tailoring guidance is not in profile.yml at all any more (derive_form).
 _PROFILE_TEXT_FIELDS = {
     "candidate": {"name": "full_name", "email": "email", "phone": "phone",
                   "location": "location", "linkedin": "linkedin",
                   "github": "github", "website": "portfolio_url"},
     "location": {"street": "street", "state": "state", "postal_code": "postal_code"},
-    "tailoring": {"tailoring_instructions": "instructions"},
     "compensation": {"comp_target": "target_range", "comp_min": "minimum",
                      "location_flexibility": "location_flexibility"},
     "work_authorization": {"citizenship": "citizenship",
@@ -465,8 +466,24 @@ def derive_form(root: Path, career_ops: Path) -> dict:
     same file — one tolerance policy, not two. Prefill is a nicety: a half-written
     config must degrade to "nothing to prefill", never a 500 that costs the user
     the wizard entirely. The wizard says so out loud when that happens, rather
-    than showing blank fields under a banner claiming they are current."""
-    derived = derive_from_profile(_load_yaml_or_empty(career_ops / "config" / "profile.yml"))
+    than showing blank fields under a banner claiming they are current.
+
+    The tailoring guidance is read the way every tailor reads it
+    (`tailoring_guidance`: career-ops/config/tailoring.md, else an older copy's
+    profile.yml key), so the box shows exactly what the tailors follow — and a
+    Save on an older copy is what moves the key into the file. It is the one
+    field whose blank is an answer: what the tailors follow, blank included,
+    outranks the sidecar's older text, which would otherwise fill the box and be
+    written back by the next Save — once there is a setup to follow (a guidance
+    file or a profile.yml), since a bare checkout prefills nothing. A file that
+    cannot be read is left to the sidecar instead, and `build_onboarding_json`
+    is told to leave it alone."""
+    profile_yml = career_ops / "config" / "profile.yml"
+    derived = derive_from_profile(_load_yaml_or_empty(profile_yml))
+    guidance = read_guidance(career_ops)
+    if guidance is not None and (guidance or guidance_path(career_ops).is_file()
+                                 or profile_yml.is_file()):
+        derived["tailoring_instructions"] = guidance
     derived.update(derive_from_search(_load_yaml_or_empty(root / "config" / "search.yml")))
     return derived
 
@@ -501,7 +518,7 @@ def resume_on_file(root: Path) -> bool:
     Asked in the order onboard_submit falls back through, so the step-0 gate and
     the submit that follows it can't disagree: the resume.txt a previous submit
     extracted, else an explicit RESUME_PATH or a probed
-    resumes/resume.{pdf,docx,odt} (which submit extracts for itself)."""
+    resumes/resume.{md,pdf,docx,odt} (which submit extracts for itself)."""
     from pipeline.resume_text import resolve_resume_path
 
     return (
@@ -587,9 +604,17 @@ def portfolio_urls(form: dict) -> list[str]:
 
 # ── form -> --from-json payload ────────────────────────────────────────────
 
-def build_onboarding_json(form: dict, resume_text: str) -> dict:
+def build_onboarding_json(form: dict, resume_text: str, resume_markdown: str = "", *,
+                          keep_guidance_file: bool = False) -> dict:
     """Map the flat web form into the structure setup-profile.mjs --from-json
-    expects. Empty fields are left for the node side to default."""
+    expects. Empty fields are left for the node side to default.
+
+    `resume_markdown` is the résumé as written when it is Markdown. It rides
+    beside the extracted text rather than replacing it: the generator seeds
+    career-ops/cv.md from the Markdown itself — it already IS a Markdown CV, and
+    rebuilding one from section-matched plain text would drop every section the
+    matcher does not know and every bullet and bold it strips — while the
+    contact autofill and the narrative defaults keep reading plain text."""
     distance = int(form.get("distance") or 50)
     entries = []
     for raw in parse_locations(form.get("locations", "")):
@@ -612,7 +637,7 @@ def build_onboarding_json(form: dict, resume_text: str) -> dict:
     # Home country for work-auth defaults — derived from the candidate's own
     # locations rather than assuming the US, so a non-US user gets sane defaults.
     home_country = infer_remote_location(entries[0]["country"])
-    return {
+    payload = {
         "resumeText": resume_text,
         "info": {
             "name": form.get("name") or "Your Name",
@@ -624,8 +649,14 @@ def build_onboarding_json(form: dict, resume_text: str) -> dict:
             "street": form.get("street") or "",
             "state": form.get("state") or "",
             "postalCode": form.get("postal_code") or "",
-            # Free-text resume-tailoring guidance -> profile.yml tailoring.instructions.
-            "tailoringInstructions": form.get("tailoring_instructions") or "",
+            # Free-text resume-tailoring guidance -> career-ops/config/tailoring.md
+            # (pipeline/tailoring_guidance.py). Sent blank included — the box is
+            # always on screen, so a blank one is an answer and the generator
+            # removes the file for it — except over a file that could not be
+            # read (`keep_guidance_file`): a blank box there means "we could not
+            # show it", and leaving the field out leaves the file alone.
+            **({} if keep_guidance_file and not (form.get("tailoring_instructions") or "").strip()
+               else {"tailoringInstructions": form.get("tailoring_instructions") or ""}),
             "linkedin": form.get("linkedin") or "",
             "github": form.get("github") or "",
             "portfolio_url": form.get("website") or "",
@@ -666,6 +697,9 @@ def build_onboarding_json(form: dict, resume_text: str) -> dict:
             "portfolio": _split_csv(form.get("portfolio")),
         },
     }
+    if resume_markdown.strip():
+        payload["resumeMarkdown"] = resume_markdown
+    return payload
 
 
 # ── resume text extraction ─────────────────────────────────────────────────
@@ -715,12 +749,61 @@ def parse_resume_info(text: str) -> dict:
 
 def extract_resume_text(data: bytes, filename: str) -> str:
     """Extract text from an uploaded resume, dispatching on the upload's filename
-    suffix (PDF/DOCX/ODT). Delegates to pipeline.resume_text so the UI and the
-    keyword-scoring filter share one extraction implementation. Raises ValueError
-    for an unsupported format."""
+    suffix (Markdown/PDF/DOCX/ODT). Delegates to pipeline.resume_text so the UI
+    and the keyword-scoring filter share one extraction implementation. Raises
+    ValueError for an unsupported format."""
     from pipeline import resume_text
 
     return resume_text.extract_resume_bytes(data, filename)
+
+
+# The wizard's "Import from file" for the tailoring guidance. The text is
+# trusted prompt text in every tailoring call from then on, so it is capped —
+# a 30-page document pasted into every prompt is a cost, not guidance — and it
+# goes into the textarea for the person to review and edit before Save, never
+# straight to disk. The byte cap is checked as the body arrives, before any
+# extraction runs.
+GUIDANCE_IMPORT_MAX_CHARS = 8_000
+GUIDANCE_IMPORT_MAX_BYTES = 5 * 1024 * 1024
+
+
+def import_guidance_text(data: bytes, filename: str) -> dict:
+    """The tailoring-guidance text in an uploaded document, capped at
+    GUIDANCE_IMPORT_MAX_CHARS: {"text", "truncated", "chars" (the full length),
+    "limit"}. A cut lands on the last whitespace before the cap when there is
+    one, so the textarea does not end mid-word. Raises ValueError for an
+    unsupported format or undecodable text."""
+    from pipeline import resume_text
+
+    text = resume_text.extract_document_bytes(data, filename)
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    total = len(text)
+    truncated = total > GUIDANCE_IMPORT_MAX_CHARS
+    if truncated:
+        cut = text[:GUIDANCE_IMPORT_MAX_CHARS]
+        space = max(cut.rfind(" "), cut.rfind("\n"))
+        text = (cut[:space] if space > GUIDANCE_IMPORT_MAX_CHARS // 2 else cut).rstrip()
+    return {"text": text, "truncated": truncated, "chars": total,
+            "limit": GUIDANCE_IMPORT_MAX_CHARS}
+
+
+# ── a Markdown résumé, as written ────────────────────────────────────────────
+
+def markdown_resume(path) -> str:
+    """The résumé as written when `path` is a Markdown résumé on disk, else "" —
+    what career-ops' cv.md is seeded from, so a Save keeps the structure the
+    person wrote rather than rebuilding cv.md from the extracted plain text."""
+    from pipeline import resume_text
+
+    path = Path(path)
+    if path.suffix.lower() not in resume_text.MARKDOWN_SUFFIXES or not path.is_file():
+        return ""
+    try:
+        return resume_text.decode_text(path.read_bytes(), path.name)
+    except (OSError, ValueError) as e:
+        print(f"[onboard] could not re-read {path.name} ({e}); "
+              "cv.md is built from the extracted text")
+        return ""
 
 
 # ── generation + collection ────────────────────────────────────────────────

@@ -17,7 +17,9 @@ are CLI-only — the agent does what an API call can't.
 
 Skills read ``cv.md`` + ``config/profile.yml`` from the **local** career-ops
 install (the source of truth — these are not in a downloaded artifact) and use
-the role's evaluation **report** as the JD signal.
+the role's evaluation **report** as the JD signal. The two résumé-tailoring
+skills also get the candidate's own tailoring preferences
+(``config/tailoring.md``, pipeline/tailoring_guidance.py).
 """
 
 import os
@@ -31,8 +33,9 @@ from datetime import date
 from pathlib import Path
 
 from pipeline import agent_cli
-from pipeline._batch_common import redact_profile_yml
+from pipeline._batch_common import profile_yml_text_for_prompt
 from pipeline import batch_evaluate as be
+from pipeline.tailoring_guidance import guidance_section, tailoring_guidance, written_guidance_path
 
 
 class SkillError(RuntimeError):
@@ -236,12 +239,16 @@ _CHROMIUM_NOTE = (
     "`npx playwright install chromium`"
 )
 
+# `tailors: True` marks the skills that tailor a résumé, so the CLI hand-off can
+# point the agent at the candidate's own tailoring preferences (career-ops' modes
+# know nothing of career-ops/config/tailoring.md; it is ours).
 SKILLS: dict[str, dict] = {
     "tailor-resume": {
         "label": "Tailor résumé (Markdown)",
         "mode": "text",
         "verb": "tailor my résumé (markdown output)",
         "api": True,
+        "tailors": True,
         "prereqs": [],
     },
     "tailor-resume-pdf": {
@@ -249,6 +256,7 @@ SKILLS: dict[str, dict] = {
         "mode": "pdf",
         "verb": "generate a tailored ATS-optimized PDF résumé",
         "api": False,  # PDF rendering needs the agent (Playwright)
+        "tailors": True,
         "prereqs": [_CHROMIUM_NOTE],
     },
     "interview-prep": {
@@ -315,7 +323,7 @@ def capabilities() -> dict:
 
 
 def skill_command(skill_id: str, report_path: Path | None,
-                  company: str, role: str) -> str:
+                  company: str, role: str, career_ops: Path | None = None) -> str:
     """Build the CLI hand-off command for any skill. We never spawn it — the
     user runs it in their terminal where the agent's tools/cost are visible.
 
@@ -330,11 +338,23 @@ def skill_command(skill_id: str, report_path: Path | None,
     `<binary> "<prompt>"`, which is one-shot on qwen and a project dir on
     opencode), quoted for this server's shell. Gemini also gets
     `-m <default_model>` (AGENT_MODEL overrides it for every CLI); nothing
-    strips the Google key — an individual runs Gemini CLI on the API key now."""
+    strips the Google key — an individual runs Gemini CLI on the API key now.
+
+    A tailoring skill also names the candidate's tailoring preferences file when
+    `career_ops` has one with guidance in it, by absolute path like the report. Named rather than
+    pasted: the agent reads files anyway, and the guidance can run to thousands
+    of characters that a shell argument would have to quote. An older copy whose
+    guidance is still in profile.yml needs no line — career-ops' skill router
+    has the agent read that file whole."""
     s = SKILLS[skill_id]
     prompt = f"use {s['mode']} mode to {s['verb']} for {company} / {role}"
     if report_path is not None:
         prompt += f" (evaluation report: {report_path.resolve().as_posix()})"
+    if s.get("tailors") and career_ops is not None:
+        # The same "is there guidance to follow" answer the work-order prompts use.
+        if guidance := written_guidance_path(career_ops):
+            prompt += (f". Follow the candidate's own tailoring preferences in "
+                       f"{guidance.as_posix()} within the mode's rules")
     return agent_cli.shell_command(agent_cli.resolve_cli(), prompt)
 
 
@@ -381,8 +401,9 @@ def build_tailor_messages(local: Path, role_context: str) -> tuple[str, str]:
     # Redacted read: this string lands in a system prompt below, and a
     # profile.yml nothing has scrubbed yet may still carry an older setup's
     # self-ID answers (#165, #227).
-    profile = redact_profile_yml(_read(local / "config" / "profile.yml"))
+    profile = profile_yml_text_for_prompt(_read(local / "config" / "profile.yml"))
     rules = _read(local / "modes" / "text.md").strip() or _FALLBACK_RULES
+    guidance = guidance_section(tailoring_guidance(local))
     system = (
         "You tailor resumes. Follow these mode rules exactly:\n\n"
         f"{rules}\n\n"
@@ -390,6 +411,7 @@ def build_tailor_messages(local: Path, role_context: str) -> tuple[str, str]:
         f"{cv}\n\n"
         "=== CANDIDATE PROFILE (identity / contact) ===\n"
         f"{profile}\n"
+        + (f"\n{guidance}\n" if guidance else "")
     )
     user = (
         "Tailor the resume for the role below. The text is the evaluation report "
